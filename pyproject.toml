@@ -15,8 +15,5 @@ dependencies = [
   "meteor_py  @ git+https://github.com/cja119/meteor_py.git",
   "geopandas==1.0.1",
   "pyogrio==0.10.0",
-  "geopandas==1.0.1",
-  ""
-  
-  
+  "shapely==2.0.6",
 ]
