@@ -1,0 +1,6 @@
+# Ignoreing ipynb checkpoit directoris
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+
