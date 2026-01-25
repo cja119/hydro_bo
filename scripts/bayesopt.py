@@ -2,8 +2,9 @@ from hydro_bo.algs import BayesianOptimizer
 import sys
 import os
 
+
 def run_planning(vector_type: str):
-    
+
     # Optimizer setup
     optimizer = BayesianOptimizer("../src/hydro_bo/tmp")
     with optimizer as config:
@@ -13,14 +14,21 @@ def run_planning(vector_type: str):
         config["use_planning_bounds"] = True
 
     # Run optimization
-    results = optimizer.optimize(num_samples=int(sys.argv[2]), experiment_name=f"{vector_type}_bayesopt", n_cores=8)
+    results = optimizer.optimize(
+        num_samples=int(sys.argv[2]),
+        experiment_name=f"{vector_type}_bayesopt",
+        n_cores=8,
+    )
 
     return optimizer.get_best_result()
 
+
 if __name__ == "__main__":
-    assert sys.argv[1] in ["NH3", "LH2"], "Please provide a valid vector type: NH3 or LH2"
+    assert sys.argv[1] in [
+        "NH3",
+        "LH2",
+    ], "Please provide a valid vector type: NH3 or LH2"
 
     print("Running Bayesian Optimization for vector type:", sys.argv[1])
     best = run_planning(sys.argv[1])
     print("Best configuration found:", best)
-

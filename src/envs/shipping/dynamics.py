@@ -26,13 +26,10 @@ class Dynamics:
         self.expected_arrivals = {s: [] for s in fast_data["sets"]["ships"]}
         self.expected_destinations = {s: [] for s in fast_data["sets"]["ships"]}
 
-
     def _init_weather_data(self):
         weather_file = self._args["weather_data"]["weather_file"]
         self._weather_data = GetData([weather_file]).data()
-        self._weather_data = temporal_align(
-            self._weather_data, randomise=True
-        )
+        self._weather_data = temporal_align(self._weather_data, randomise=True)
 
     def _init_state_variables(self):
         p = self._fast_data["params"]

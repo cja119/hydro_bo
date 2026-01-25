@@ -37,6 +37,7 @@ def suppress_output(supress: bool = True):
         yield
         pass
 
+
 def ext_visualise_output(
     solve,
     axs,
@@ -80,7 +81,9 @@ def ext_visualise_output(
 
     ships = getattr(solve, "ships", None)
     daily_shifted = range(0, time_step + 1, 24)
-    daily_steps = list(range(run_count * time_step, (run_count + 1) * time_step + 1, 24))
+    daily_steps = list(
+        range(run_count * time_step, (run_count + 1) * time_step + 1, 24)
+    )
 
     n_ordered = {
         s: [value(getattr(solve, "n_ship_ordered")[s, t]) for t in daily_shifted]
@@ -160,7 +163,8 @@ def ext_visualise_output(
     # net hydrogen change per hour (model should satisfy balance with removed/stored etc.)
     # NOTE: first element uses nan because we don't have t-1 in shifted start
     hydrogen_storage_delta = [float("nan")] + [
-        hydrogen_storage[i] - hydrogen_storage[i - 1] for i in range(1, len(hydrogen_storage))
+        hydrogen_storage[i] - hydrogen_storage[i - 1]
+        for i in range(1, len(hydrogen_storage))
     ]
 
     # -------------------------------------------------------
@@ -202,7 +206,9 @@ def ext_visualise_output(
         joined_data["vector_storage"].extend(vector_storage)
         joined_data["cumulative_charge"].extend(cumulative_charge)
         joined_data.setdefault("energy_turbine", []).extend(energy_turbine)
-        joined_data.setdefault("n_active_trains_conversion", []).extend(n_active_trains_conversion)
+        joined_data.setdefault("n_active_trains_conversion", []).extend(
+            n_active_trains_conversion
+        )
         joined_data.setdefault("vector_flux", []).extend(vector_flux)
 
         # --- Energy diagnostics ---
@@ -213,8 +219,12 @@ def ext_visualise_output(
         joined_data.setdefault("energy_fuelcell", []).extend(energy_fuelcell)
         joined_data.setdefault("energy_wind_profile", []).extend(energy_wind_profile)
         joined_data.setdefault("energy_solar_profile", []).extend(energy_solar_profile)
-        joined_data.setdefault("renewable_supply_wind", []).extend(renewable_supply_wind)
-        joined_data.setdefault("renewable_supply_solar", []).extend(renewable_supply_solar)
+        joined_data.setdefault("renewable_supply_wind", []).extend(
+            renewable_supply_wind
+        )
+        joined_data.setdefault("renewable_supply_solar", []).extend(
+            renewable_supply_solar
+        )
 
         # --- Hydrogen diagnostics ---
         joined_data.setdefault("hydrogen_storage", []).extend(hydrogen_storage)
@@ -222,8 +232,12 @@ def ext_visualise_output(
         joined_data.setdefault("hydrogen_used", []).extend(hydrogen_used)
         joined_data.setdefault("hydrogen_stored", []).extend(hydrogen_stored)
         joined_data.setdefault("hydrogen_removed", []).extend(hydrogen_removed)
-        joined_data.setdefault("hydrogen_consumed_fuelcell", []).extend(hydrogen_consumed_fuelcell)
-        joined_data.setdefault("hydrogen_storage_delta", []).extend(hydrogen_storage_delta)
+        joined_data.setdefault("hydrogen_consumed_fuelcell", []).extend(
+            hydrogen_consumed_fuelcell
+        )
+        joined_data.setdefault("hydrogen_storage_delta", []).extend(
+            hydrogen_storage_delta
+        )
 
         for s in ships:
             joined_data["n_ordered"][s].extend(n_ordered[s])
@@ -390,4 +404,3 @@ def ext_visualise_output(
         fig.canvas.draw()
 
     return joined_data
-

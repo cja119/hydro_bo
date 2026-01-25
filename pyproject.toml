@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hydro-bo"
 version = "0.1"
-description = "RL environments for graph-structured value chain problems"
+description = "Bayesian Optimisation of MPC Controlled Hydrogen Infrastructure"
 authors = [
   { name = "Cameron Aldren", email = "cameronaldren@icloud.com" }]
 readme = "README.md"

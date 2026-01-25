@@ -68,7 +68,9 @@ class ShippingEnv:
             self._controller.update(mpc_args, self._dynamics.results)
 
             # Solve the mpc controller
-            results, self._dynamics.states, stored_val, sent_vol = self._controller.solve(True, solver = self._args["mpc"]["solver"])
+            results, self._dynamics.states, stored_val, sent_vol = (
+                self._controller.solve(True, solver=self._args["mpc"]["solver"])
+            )
 
             self._dynamics.set_results(results)
 
@@ -77,7 +79,6 @@ class ShippingEnv:
                 for s in self._controller_data["sets"]["ships"]
             )
             t_sent_vol += sent_vol
-            
 
             # Print the curent iteration and the total ships sent
             if verbose:
@@ -91,11 +92,11 @@ class ShippingEnv:
             # Update the observation with the current state
             observation["destination_storage"] = self._dynamics.destination_storage
             observation["ship_destination"] = self._dynamics.ship_destination
-            
+
         # k$ + t * 5 k$/t / (t) = k$ / t or $/kg <- This is the profit per/kg
-        profit_inc = results.get(("actual_profit", 0), 0) -  prev_profit
-        reward = (profit_inc*1000) + stored_val * 5
-        observation['total_tonnes'] = stored_val +  t_sent_vol
+        profit_inc = results.get(("actual_profit", 0), 0) - prev_profit
+        reward = (profit_inc * 1000) + stored_val * 5
+        observation["total_tonnes"] = stored_val + t_sent_vol
 
         if self._dynamics.iter_count // n_steps >= self._args["months"]:
             if verbose:
@@ -107,6 +108,7 @@ class ShippingEnv:
             if verbose:
                 print(f"\r[REWARD] M$ {reward:.4f}", end="" * 50)
             return observation, reward, False, {}
+
 
 class ShippingEnvPlot:
     """
@@ -197,9 +199,11 @@ class ShippingEnvPlot:
             self._controller.update(mpc_args, self._dynamics.results)
 
             # Solve the mpc controller (match ShippingEnvV2 signature/behavior)
-            results, self._dynamics.states, stored_val, sent_vol = self._controller.solve(
-                True,
-                solver=self._args["mpc"]["solver"],
+            results, self._dynamics.states, stored_val, sent_vol = (
+                self._controller.solve(
+                    True,
+                    solver=self._args["mpc"]["solver"],
+                )
             )
 
             self._dynamics.set_results(results)
