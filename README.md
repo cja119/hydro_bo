@@ -23,7 +23,7 @@ pip install -e .
 Run the following shell commands to clone onto your local system (not as robust):
 ```sh
 # Install via git clone 
-pip install git+https://github.com/cja119/h2-gym.git
+pip install git+https://github.com/cja119/hydro_bo.git
 ```
 
 ## Recreating Publication Results
