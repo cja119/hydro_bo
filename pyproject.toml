@@ -3,17 +3,52 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hydro_bo"
+name = "hydro-bo"
 version = "0.1"
-description = "Bayesian optimisation for energy system infrastructure planning"
+description = "RL environments for graph-structured value chain problems"
 authors = [
-  { name = "Cameron Aldren", email = "cameronaldren@icloud.com" }
-]
+  { name = "Cameron Aldren", email = "cameronaldren@icloud.com" }]
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
-  "meteor_py  @ git+https://github.com/cja119/meteor_py.git",
-  "geopandas==1.0.1",
-  "pyogrio==0.10.0",
-  "shapely==2.0.6",
+    "meteor_py  @ git+https://github.com/cja119/meteor_py.git",
+    "h2-plan @ git+https://github.com/cja119/stochasticmodel.git",
+    "certifi>=2024.12.14",
+    "charset-normalizer>=3.4.1",
+    "et_xmlfile>=2.0.0",
+    "eurostat>=1.1.1",
+    "gurobipy>=12,<13",
+    "idna>=3.10",
+    "jax",
+    "numpy>=1.26",
+    "openpyxl>=3.1.5",
+    "optuna",
+    "pandas>=2.2.3",
+    "pycountry",
+    "pyomo>=6.9.2",
+    "python-dateutil>=2.9.0.post0",
+    "pytz>=2024.2",
+    "PyYAML>=6.0.2",
+    "ray[tune]",
+    "requests>=2.32.3",
+    "scikit-optimize>=0.10.2",
+    "selenium",
+    "seaborn",
+    "six>=1.17.0",
+    "statsmodels",
+    "tzdata>=2024.2",
+    "urllib3>=2.3.0",
+    "webdriver_manager"
 ]
+
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["*"]
+
+[tool.setuptools.package-data]
+"h2_gym" = [
+    "data/**/*.yml",
+    "data/**/*.csv"
+            ]
