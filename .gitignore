@@ -9,3 +9,5 @@ src/tmp/bayesopt/*
 src/tmp/ray_results/*
 src/tmp/planning/*
 !**/*/.gitkeep
+
+**/*.DS_Store
