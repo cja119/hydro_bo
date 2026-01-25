@@ -12,7 +12,7 @@ from pyomo.environ import (
     NonNegativeIntegers,
     NonNegativeReals,
     Reals,
-    Binary
+    Binary,
 )
 from numpy.random import rand
 from numpy import ones, mean
@@ -22,7 +22,8 @@ from glob import glob
 import yaml
 
 
-def import_mpc_data(planning_model: str, vector: str, random_param: bool = False
+def import_mpc_data(
+    planning_model: str, vector: str, random_param: bool = False
 ) -> dict:
     """
     This function is used to import the data from the config file.
@@ -33,19 +34,13 @@ def import_mpc_data(planning_model: str, vector: str, random_param: bool = False
     vars = {}
     forms = {}
 
-    config_file = (
-        Path(__file__).parent.parent.parent
-        / "data/shipping"
-        / "config.yml"
-    )
+    config_file = Path(__file__).parent.parent.parent / "data/shipping" / "config.yml"
     if isinstance(planning_model, str):
         planning_model = (
             Path(__file__).parent.parent.parent / "tmp/planning" / planning_model
         )
     variable_file = (
-        Path(__file__).parent.parent.parent
-        / "data/shipping"
-        / "variables.yml"
+        Path(__file__).parent.parent.parent / "data/shipping" / "variables.yml"
     )
 
     default_parameters = DefaultParams("default")
@@ -112,11 +107,7 @@ def import_mpc_data(planning_model: str, vector: str, random_param: bool = False
                 else (
                     NonNegativeIntegers
                     if value["domain"] == "positive_integer"
-                    else (
-                        Binary
-                        if value["domain"] == "binary"
-                        else Reals
-                    )
+                    else (Binary if value["domain"] == "binary" else Reals)
                 )
             ),
         }
@@ -140,15 +131,11 @@ def import_mpc_functions(data_folder: str, sets: dict) -> dict:
     }
 
     equations_path = (
-        Path(__file__).parent.parent.parent
-        / "data/shipping"
-        / "equations.py"
+        Path(__file__).parent.parent.parent / "data/shipping" / "equations.py"
     )
 
     functions_path = (
-        Path(__file__).parent.parent.parent
-        / "data/shipping"
-        / "functions.yml"
+        Path(__file__).parent.parent.parent / "data/shipping" / "functions.yml"
     )
 
     if not equations_path.exists():
@@ -237,7 +224,6 @@ def temporal_align(weather, randomise: Optional[bool] = False):
         random_start = 0
 
     weather_data = weather[random_start:] + weather[:random_start]
-
 
     return weather_data
 

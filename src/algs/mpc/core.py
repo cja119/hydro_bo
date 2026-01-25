@@ -26,7 +26,7 @@ from h2_plan.data import DefaultParams
 import logging
 import matplotlib
 
-#matplotlib.use("TkAgg")
+# matplotlib.use("TkAgg")
 
 
 def find_equivalent_set(model, values):
@@ -161,15 +161,19 @@ class MPCController:
 
         pass
 
-    def solve(self, supress=False, solver='gurobi',):
+    def solve(
+        self,
+        supress=False,
+        solver="gurobi",
+    ):
         """
         This function solves the MPC problem with optimized instance reuse
         """
         # Create instances only once
-        #if not self._instances_created:
+        # if not self._instances_created:
         self.instance1 = self.model1.create_instance()
         self.instance2 = self.model2.create_instance()
-            #self._instances_created = True
+        # self._instances_created = True
 
         # Configure solver only once with performance optimizations
 
@@ -189,7 +193,7 @@ class MPCController:
             self._solver_configured = True
 
         # Apply cached solution as warm start if available
-        #if self._cache_enabled and self._solution_cache:
+        # if self._cache_enabled and self._solution_cache:
         #    self._apply_warm_start(self.instance1)
 
         with suppress_output(supress):
@@ -250,18 +254,18 @@ class MPCController:
                         var[index], start_values[key]
                     )
                     var[index].fix(cleaned_value)
-        
+
         self.stochastic_update(data=stochastic_values)
 
         return None
 
     def output(self, time_step: int = 24):
         solve = self.instance1 if self.lexicographic == 1 else self.instance2
-    
+
         end_states = {}
         stochastic_output = {}
         stored_val = 0.0  # make it explicitly float
-    
+
         # Extract ships sent / ordered
         stochastic_output["ordered_ship"] = {
             s: sum(
@@ -277,20 +281,20 @@ class MPCController:
             )
             for s in getattr(solve, "ships", [])
         }
-    
+
         # Total sent volume (scalar)
         sent_vol_by_ship = {
             s: sum(
                 value(getattr(solve, "n_ship_sent")[s, t])
                 for t in range(0, time_step, 24)
-            ) * value(getattr(solve, "ship_capacity")[s])
+            )
+            * value(getattr(solve, "ship_capacity")[s])
             for s in getattr(solve, "ships", [])
         }
-        
-    
+
         # Use last time index instead of hardcoding 23
         last_t = time_step
-    
+
         # Get numeric values for all terms
         hs = value(getattr(solve, "hydrogen_storage")[last_t])
         vs = value(getattr(solve, "vector_storage")[last_t])
@@ -299,15 +303,19 @@ class MPCController:
         hs0 = value(getattr(solve, "hydrogen_storage")[0])
         vs0 = value(getattr(solve, "vector_storage")[0])
         cc0 = value(getattr(solve, "cumulative_charge")[0])
-    
+
         # Build excess storage into long term rewards mechanis
-        stored_val += (hs - hs0) / 120.0  # GJ / GJ/t(h2) = t(H2) 
-        stored_val += (vs - vs0) * 1000.0 * cv / 120.0  # kt * t/kt * GJ/t / (GJ/t) = t(H2)
-        stored_val += (cc - cc0) * cv / 120.0 # t * GJ/t) / (GJ/t) = t(H2)
-    
+        stored_val += (hs - hs0) / 120.0  # GJ / GJ/t(h2) = t(H2)
+        stored_val += (
+            (vs - vs0) * 1000.0 * cv / 120.0
+        )  # kt * t/kt * GJ/t / (GJ/t) = t(H2)
+        stored_val += (cc - cc0) * cv / 120.0  # t * GJ/t) / (GJ/t) = t(H2)
+
         # Adjusting sent vol to tonnes of h2 eq from t(vect)
-        sent_vol = sum(sent_vol_by_ship.values())  * cv /120 # t(vect) * GJ/t(vect) * t(h2) / GJ = t(H2)
-        
+        sent_vol = (
+            sum(sent_vol_by_ship.values()) * cv / 120
+        )  # t(vect) * GJ/t(vect) * t(h2) / GJ = t(H2)
+
         for var in solve.component_objects(Var):
             for index in var:
                 if isinstance(index, tuple):

@@ -32,7 +32,6 @@ from plotly.subplots import make_subplots
 from hydro_bo.envs.shipping.version2.utils import calculate_capex_opex
 
 
-
 class BayesianOptimizer:
     """
     Ray-based Bayesian Optimization wrapper for shipping environment
@@ -84,7 +83,7 @@ class BayesianOptimizer:
             "scale": (0.5, 2.0),  # (lower_multiplier, upper_multiplier)
             "use_planning_bounds": False,
             "search_space": None,  # Will be set in __exit__
-            "solver": "gurobi"
+            "solver": "gurobi",
         }
 
         # Default search space (will be created lazily to avoid import-time issues)
@@ -252,33 +251,39 @@ class BayesianOptimizer:
             Dictionary containing checkpoint state
         """
         checkpoint_path = Path(checkpoint_path)
-        
+
         # Check if it's a directory
         if checkpoint_path.is_dir():
             # Find all .pkl files in the directory
             pkl_files = list(checkpoint_path.glob("*.pkl"))
-            
+
             if not pkl_files:
-                raise FileNotFoundError(f"No checkpoint files found in directory: {checkpoint_path}")
-            
+                raise FileNotFoundError(
+                    f"No checkpoint files found in directory: {checkpoint_path}"
+                )
+
             # Sort by modification time and get the most recent
             # Exclude 'latest.pkl' from the search to get the actual timestamped checkpoint
             timestamped_files = [f for f in pkl_files if f.name != "latest.pkl"]
-            
+
             if timestamped_files:
                 # Get the most recent timestamped checkpoint
-                checkpoint_file = max(timestamped_files, key=lambda f: f.stat().st_mtime)
+                checkpoint_file = max(
+                    timestamped_files, key=lambda f: f.stat().st_mtime
+                )
             else:
                 # If no timestamped files, try latest.pkl
                 latest_file = checkpoint_path / "latest.pkl"
                 if latest_file.exists():
                     checkpoint_file = latest_file
                 else:
-                    raise FileNotFoundError(f"No valid checkpoint files found in directory: {checkpoint_path}")
-            
+                    raise FileNotFoundError(
+                        f"No valid checkpoint files found in directory: {checkpoint_path}"
+                    )
+
             print(f"Loading checkpoint from directory: {checkpoint_file.name}")
             checkpoint_path = checkpoint_file
-        
+
         # Handle file path
         elif not checkpoint_path.exists():
             # Try in checkpoint directory
@@ -290,14 +295,14 @@ class BayesianOptimizer:
             self._checkpoint_state = pickle.load(f)
 
         return self._checkpoint_state
-    
+
     def list_checkpoints(self, checkpoint_dir: Optional[str] = None) -> List[Dict]:
         """
         List all available checkpoints in a directory
-        
+
         Args:
             checkpoint_dir: Directory to search for checkpoints (default: self.checkpoint_dir)
-            
+
         Returns:
             List of dictionaries with checkpoint information
         """
@@ -305,10 +310,10 @@ class BayesianOptimizer:
             search_dir = self.checkpoint_dir
         else:
             search_dir = Path(checkpoint_dir)
-            
+
         if not search_dir.exists():
             return []
-            
+
         checkpoints = []
         for pkl_file in search_dir.glob("*.pkl"):
             try:
@@ -316,19 +321,21 @@ class BayesianOptimizer:
                     "name": pkl_file.name,
                     "path": str(pkl_file),
                     "size": pkl_file.stat().st_size,
-                    "modified": datetime.fromtimestamp(pkl_file.stat().st_mtime).isoformat(),
-                    "is_latest": pkl_file.name == "latest.pkl"
+                    "modified": datetime.fromtimestamp(
+                        pkl_file.stat().st_mtime
+                    ).isoformat(),
+                    "is_latest": pkl_file.name == "latest.pkl",
                 }
                 checkpoints.append(file_info)
             except Exception as e:
                 print(f"Error reading checkpoint {pkl_file}: {e}")
-                
+
         # Sort by modification time, newest first
         checkpoints.sort(key=lambda x: x["modified"], reverse=True)
         return checkpoints
 
     def resume_optimization(
-        self, checkpoint_path: str, additional_samples: int, n_cores = None, num_gpus = None
+        self, checkpoint_path: str, additional_samples: int, n_cores=None, num_gpus=None
     ) -> ray.tune.ExperimentAnalysis:
         """
         Resume optimization from a checkpoint with additional samples
@@ -367,15 +374,15 @@ class BayesianOptimizer:
         # Create OptunaSearch with previous results for warm-start
         from optuna import create_study, trial as optuna_trial
         import pandas as pd
-        
+
         # Create an Optuna study
         study = create_study(direction="maximise")
-        
+
         # Restore previous trials if available
         if previous_trials and len(previous_trials.get("score", [])) > 0:
             # Convert trial results back to DataFrame
             df = pd.DataFrame(previous_trials)
-            
+
             # Add each previous trial to the study
             for idx, row in df.iterrows():
                 # Extract parameter values
@@ -384,37 +391,33 @@ class BayesianOptimizer:
                     if col.startswith("config/"):
                         param_name = col.replace("config/", "")
                         params[param_name] = row[col]
-                
+
                 # Create a trial and tell Optuna about it
                 trial = study.ask()
                 for param_name, param_value in params.items():
                     # Suggest the historical value
                     trial._suggest(param_name, param_value)
-                
+
                 # Tell the study about the result
                 study.tell(trial, row["score"])
-            
+
             print(f"Restored {len(df)} previous trials to Optuna study")
 
         # Create OptunaSearch with the warm-started study
-        algo = OptunaSearch(
-            metric="score",
-            mode="max",
-            study=study
-        )
-        
+        algo = OptunaSearch(metric="score", mode="max", study=study)
+
         # Set concurrency limit
         max_concurrent = self._resource_config["max_concurrent_trials"]
         algo = ConcurrencyLimiter(algo, max_concurrent=62)
 
         # Setup scheduler
         scheduler = ASHAScheduler(
-            time_attr="training_iteration", 
-            metric="score", 
+            time_attr="training_iteration",
+            metric="score",
             mode="max",
             max_t=100,
             grace_period=1,
-            reduction_factor=3
+            reduction_factor=3,
         )
 
         # Run additional optimization with warm-started search
@@ -433,7 +436,10 @@ class BayesianOptimizer:
         return self.results
 
     def setup_distributed(
-        self, n_cores: Optional[int] = None, memory_per_trial: str = "2GB", gpu_per_trial: float = 0.0
+        self,
+        n_cores: Optional[int] = None,
+        memory_per_trial: str = "2GB",
+        gpu_per_trial: float = 0.0,
     ) -> Dict:
         """
         Configure distributed computing resources
@@ -448,11 +454,13 @@ class BayesianOptimizer:
         """
         # Auto-detect cores if not specified
         if n_cores is None:
-            total_cores = 62,
+            total_cores = (62,)
             # Use all cores minus 2, but at least 1
             n_cores = max(1, total_cores - 2)
-            print(f"Auto-detected {total_cores} CPU cores, using {n_cores} for optimization")
-        
+            print(
+                f"Auto-detected {total_cores} CPU cores, using {n_cores} for optimization"
+            )
+
         # Parse memory string
         memory_bytes = self._parse_memory_string(memory_per_trial)
 
@@ -599,6 +607,7 @@ class BayesianOptimizer:
 
         # Run shipping environment
         from hydro_bo.envs import ShippingEnv
+
         environment = ShippingEnv(self._config["env_version"])
 
         with environment as env:
@@ -614,7 +623,7 @@ class BayesianOptimizer:
         while True:
             observation, reward, done, _ = environment.step(action=None, verbose=False)
             total_reward += reward
-            total_tonnes += observation['total_tonnes']
+            total_tonnes += observation["total_tonnes"]
             if done:
                 break
 
@@ -670,12 +679,12 @@ class BayesianOptimizer:
 
         # Setup scheduler
         scheduler = ASHAScheduler(
-            time_attr="training_iteration", 
-            metric="score", 
+            time_attr="training_iteration",
+            metric="score",
             mode="max",
             max_t=100,  # Maximum iterations per trial
             grace_period=1,  # Minimum iterations before early stopping
-            reduction_factor=3  # Factor by which to reduce tber of trials
+            reduction_factor=3,  # Factor by which to reduce tber of trials
         )
 
         if not self._configured:

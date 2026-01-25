@@ -15,17 +15,17 @@ def energy_balance(m, t):
 
     eqn = 0
 
-    eqn -= m.energy_curtailed[t] 
-    eqn -= m.energy_compression[t] 
+    eqn -= m.energy_curtailed[t]
+    eqn -= m.energy_compression[t]
     eqn -= m.energy_electrolysis[t]
-    eqn -= m.energy_conversion[t] 
+    eqn -= m.energy_conversion[t]
 
-    eqn += m.energy_fuelcell[t] 
+    eqn += m.energy_fuelcell[t]
 
     if m.renewables.value == "wind":
         eqn += m.energy_wind[t] * m.renewable_energy_capacity
     if m.renewables.value == "solar":
-        eqn += m.energy_solar[t] * m.renewable_energy_capacity 
+        eqn += m.energy_solar[t] * m.renewable_energy_capacity
     return eqn == 0
 
 
@@ -179,7 +179,7 @@ def shipping_balance(m, t):
         eqn -= m.cumulative_charge[0]
 
     eqn += m.cumulative_charge[t]
-    
+
     eqn -= sum(m.ship_charge_rate[_t] for _t in range(t + 1))
 
     if t % 24 == 0:
@@ -233,6 +233,7 @@ def lower_hydrogen_storage_limit(m, t):
 
     return cons <= 0
 
+
 def electrolyser_production_limit(m, t):
     """
     Upper limit on the production capacity of the electrolyser
@@ -246,18 +247,20 @@ def electrolyser_production_limit(m, t):
 
     return cons <= 0
 
+
 def fuelcell_production_limit(m, t):
     """
     Upper limit on the capacity of the hydrogen fuel cell
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
-        
+
     cons = 0
     cons += m.energy_fuelcell[t]
     cons -= m.fuelcell_capacity
 
     return cons <= 0
+
 
 def compression_upper_limit(m, t):
     """
@@ -265,13 +268,14 @@ def compression_upper_limit(m, t):
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
-        
+
     cons = 0
     cons += m.energy_compression[t]
     cons -= m.compression_capacity
 
     return cons <= 0
-    
+
+
 def upper_hydrogen_storage_limit(m, t):
     """
     Upper hydrogen storage limit equation for the lower production problem.
@@ -362,7 +366,7 @@ def ship_send_limit(m, t):
         return Constraint.Skip
     cons = 0
 
-    cons -= sum(m.ship_capacity[s] * m.waiting_ships[s, t]  for s in m.ships)
+    cons -= sum(m.ship_capacity[s] * m.waiting_ships[s, t] for s in m.ships)
     cons += m.cumulative_charge[t]
 
     return cons <= 0
@@ -487,6 +491,7 @@ def active_trains_limit(m, t):
 
     return cons <= 0
 
+
 def storage_addition_limit(m, t):
     """
     Prevents model from adding to and removing from storage simultaneously.
@@ -497,7 +502,8 @@ def storage_addition_limit(m, t):
     cons -= m.hydrogen_storage_capacity * m.storage_bool[t]
     return cons <= 0
 
-def storage_removal_limit(m,t):
+
+def storage_removal_limit(m, t):
     """
     Prevents model from adding to and removing from storage simultaneously.
     This avoids loops that exploit numerical noise by blowing up these values.
@@ -507,6 +513,7 @@ def storage_removal_limit(m,t):
     cons -= m.hydrogen_storage_capacity * (1 - m.storage_bool[t])
     return cons <= 0
 
+
 def hydrogen_production_maximisation(m):
     """
     Hydrogen production maximisation equation for the lower production problem.
@@ -514,6 +521,7 @@ def hydrogen_production_maximisation(m):
     obj = 0
     obj += sum(m.vector_flux[t] for t in m.grid0)
     return obj
+
 
 def hourly_profit(m, t):
 
