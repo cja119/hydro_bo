@@ -1,6 +1,6 @@
 """
-This module contains the shipping environment which performs a bilevel model predictive
-control optimisation for the shipping problem.
+This module contains the shipping environment which interacts with the model predictive
+control optimiser for the shipping problem.
 """
 
 from __future__ import annotations
