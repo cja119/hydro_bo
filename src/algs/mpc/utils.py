@@ -1,37 +1,29 @@
 """
-Utils file for the inner loop of the model predictive control (MPC) algorithm.
+Utility functions for MPC algorithm.
 """
 
-import yaml
-from pathlib import Path
-from pyomo.environ import value
-import sys, os
 import contextlib
+import os
+import sys
+from pathlib import Path
+
 import numpy as np
+from pyomo.environ import value
 
-def add_equations(model, environment_name: str) -> None:
-    """
-    Adds the equations to the model.
-    """
 
-    current_path = Path(__file__).parent
-    data_path = (
-        current_path.parent.parent / "data/shipping/" + environment_name + "/fast_loop"
-    )
-    
 @contextlib.contextmanager
 def suppress_output(supress: bool = True):
-    if supress:
-        with open(os.devnull, "w") as devnull:
-            old_out, old_err = sys.stdout, sys.stderr
-            sys.stdout, sys.stderr = devnull, devnull
-            try:
-                yield
-            finally:
-                sys.stdout, sys.stderr = old_out, old_err
-    else:
+    if not supress:
         yield
-        pass
+        return
+
+    with open(os.devnull, "w") as devnull:
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = devnull, devnull
+        try:
+            yield
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
 
 
 def ext_visualise_output(
@@ -42,45 +34,42 @@ def ext_visualise_output(
     joined_data=None,
     fig=None,
 ):
-    import numpy as np
     import matplotlib.pyplot as plt
 
-    plt.rcParams["font.family"] = "serif"
+    """
+    Output visualisation for external use with provided axes.
+    """
 
-    NAVY = "#001f3f"
-    BURGUNDY = "#800020"
+    plt.rcParams["font.family"] = "serif"
 
     axs = np.asarray(axs, dtype=object).ravel()
     if len(axs) < 4:
         raise ValueError(f"ext_visualise_output needs 4 axes, got {len(axs)}")
     axs = axs[:4]
 
+    # Define colors
+    NAVY = "#001f3f"
+    BURGUNDY = "#800020"
     TITLE_PAD = 10
 
-    def plot_style(ax, x, y, title, ylabel, ylim=None, scatter=True):
-        if scatter:
-            ax.scatter(x, y, color=NAVY, s=18, alpha=0.25, zorder=2, label="Value")
+    # Helper to style each plot
+    def plot_style(ax, x, y, title, ylabel):
+        ax.scatter(x, y, color=NAVY, s=18, alpha=0.25, zorder=2, label="Value")
         ax.plot(x, y, color=BURGUNDY, linewidth=2, alpha=0.9, zorder=3, label="Value")
         ax.set_title(title, pad=TITLE_PAD)
         ax.set_ylabel(ylabel)
         ax.grid(True)
-        if ylim is not None:
-            ax.set_ylim(*ylim)
 
-    try:
-        value 
-    except NameError:
-        from pyomo.environ import value 
-
+    # Helpers for time series contiguity
     steps = list(range(run_count * time_step, (run_count + 1) * time_step + 1))
     shifted = range(0, time_step + 1)
-
-    ships = getattr(solve, "ships", None)
     daily_shifted = range(0, time_step + 1, 24)
     daily_steps = list(
         range(run_count * time_step, (run_count + 1) * time_step + 1, 24)
     )
 
+    # Extract data from solve
+    ships = getattr(solve, "ships", [])
     n_ordered = {
         s: [value(getattr(solve, "n_ship_ordered")[s, t]) for t in daily_shifted]
         for s in ships
@@ -93,21 +82,20 @@ def ext_visualise_output(
     vector_storage = [value(getattr(solve, "vector_storage")[t]) for t in shifted]
     cumulative_charge = [value(getattr(solve, "cumulative_charge")[t]) for t in shifted]
 
+    # Helper functions to extract series and scalars
     def series(name, default=float("nan")):
-        """Get a time series [t in shifted] from solve.<name>[t], else NaNs."""
-        try:
-            _var = getattr(solve, name)
-            return [value(_var[t]) for t in shifted]
-        except Exception:
+        var = getattr(solve, name, None)
+        if var is None:
             return [default for _ in shifted]
+        return [value(var[t]) for t in shifted]
 
     def scalar(name, default=float("nan")):
-        """Get a scalar value from solve.<name>, else NaN."""
-        try:
-            return float(value(getattr(solve, name)))
-        except Exception:
+        var = getattr(solve, name, None)
+        if var is None:
             return default
+        return float(value(var))
 
+    # Extract series
     energy_turbine = series("energy_wind")
     vector_flux = series("vector_flux")
     n_active_trains_conversion = series("n_active_trains_conversion")
@@ -119,8 +107,8 @@ def ext_visualise_output(
     energy_wind_profile = series("energy_wind")
     energy_solar_profile = series("energy_solar")
 
-    ren_cap = scalar("renewable_energy_capacity", default=float("nan"))
-    
+    # Compute renewable supply
+    ren_cap = scalar("renewable_energy_capacity")
     if np.isfinite(ren_cap):
         renewable_supply_wind = [x * ren_cap for x in energy_wind_profile]
         renewable_supply_solar = [x * ren_cap for x in energy_solar_profile]
@@ -128,6 +116,7 @@ def ext_visualise_output(
         renewable_supply_wind = [float("nan") for _ in shifted]
         renewable_supply_solar = [float("nan") for _ in shifted]
 
+    # Extract hydrogen series
     hydrogen_storage = series("hydrogen_storage")
     hydrogen_produced = series("hydrogen_produced")
     hydrogen_used = series("hydrogen_used")
@@ -139,6 +128,7 @@ def ext_visualise_output(
         for i in range(1, len(hydrogen_storage))
     ]
 
+    # Combine with previous runs unless first run
     if joined_data is None or run_count == 0:
         joined_data = {
             "steps": steps[:],
@@ -206,28 +196,30 @@ def ext_visualise_output(
             joined_data["n_ordered"][s].extend(n_ordered[s])
             joined_data["n_ship_sent"][s].extend(n_ship_sent[s])
 
+    # Clear axes
     for ax in axs:
         ax.cla()
 
+    # Plot ships ordered / sent by capacity
     ax_ships, ax_vec, ax_fill, ax_energy = axs
 
     ship_list = list(joined_data["n_ordered"].keys())
-
-    cap = {}
+    caps = {}
     for s in ship_list:
         try:
-            cap[s] = float(value(getattr(solve, "ship_capacity")[s]))
+            caps[s] = float(value(getattr(solve, "ship_capacity")[s]))
         except Exception:
-            cap[s] = np.nan
+            caps[s] = np.nan
 
-    caps = np.array([cap[s] for s in ship_list if np.isfinite(cap[s])], dtype=float)
-    if caps.size == 0:
+    # Bin ships by capacity tertiles
+    cap_vals = np.array([v for v in caps.values() if np.isfinite(v)], dtype=float)
+    if cap_vals.size == 0:
         bins = {"Small": [], "Medium": ship_list, "Large": []}
     else:
-        q1, q2 = np.quantile(caps, [1 / 3, 2 / 3])
+        q1, q2 = np.quantile(cap_vals, [1 / 3, 2 / 3])
         bins = {"Small": [], "Medium": [], "Large": []}
         for s in ship_list:
-            c = cap.get(s, np.nan)
+            c = caps.get(s, np.nan)
             if not np.isfinite(c):
                 bins["Medium"].append(s)
             elif c <= q1:
@@ -237,22 +229,22 @@ def ext_visualise_output(
             else:
                 bins["Large"].append(s)
 
+    # Plot ships ordered / sent by capacity
     size_marker = {"Small": "o", "Medium": "^", "Large": "s"}
     ship_marker_size = {"Small": 55, "Medium": 75, "Large": 95}
     ordered_alpha = {"Small": 0.45, "Medium": 0.55, "Large": 0.65}
     sent_alpha = {"Small": 0.45, "Medium": 0.55, "Large": 0.65}
-    scatter_alpha = 0.25
-    lw = 2.0
     ordered_color = {"Small": "#b85a72", "Medium": BURGUNDY, "Large": "#4d0010"}
     sent_color = {"Small": "#4c6a86", "Medium": NAVY, "Large": "#001022"}
 
+    # Plot each bin
     for size_name, ships_in_bin in bins.items():
-        if len(ships_in_bin) == 0:
+        if not ships_in_bin:
             continue
 
-        L = len(joined_data["daily_steps"])
-        y_ord = np.zeros(L, dtype=float)
-        y_sent = np.zeros(L, dtype=float)
+        length = len(joined_data["daily_steps"])
+        y_ord = np.zeros(length, dtype=float)
+        y_sent = np.zeros(length, dtype=float)
 
         for s in ships_in_bin:
             y_ord += np.asarray(joined_data["n_ordered"][s], dtype=float)
@@ -263,7 +255,7 @@ def ext_visualise_output(
             y_ord,
             color=ordered_color[size_name],
             s=ship_marker_size[size_name],
-            alpha=scatter_alpha,
+            alpha=0.25,
             marker=size_marker[size_name],
             edgecolors="none",
             zorder=2,
@@ -273,7 +265,7 @@ def ext_visualise_output(
             y_sent,
             color=sent_color[size_name],
             s=ship_marker_size[size_name],
-            alpha=scatter_alpha,
+            alpha=0.25,
             marker=size_marker[size_name],
             edgecolors="none",
             zorder=2,
@@ -284,7 +276,7 @@ def ext_visualise_output(
             y_ord,
             color=ordered_color[size_name],
             linestyle="-",
-            linewidth=lw,
+            linewidth=2.0,
             alpha=ordered_alpha[size_name],
             zorder=3,
             label=f"Ordered ({size_name})",
@@ -294,21 +286,21 @@ def ext_visualise_output(
             y_sent,
             color=sent_color[size_name],
             linestyle="--",
-            linewidth=lw,
+            linewidth=2.0,
             alpha=sent_alpha[size_name],
             zorder=3,
             label=f"Sent ({size_name})",
         )
-
+    # Final plot styling
     ax_ships.set_title("Ships Ordered / Sent (by Capacity)", pad=TITLE_PAD)
     ax_ships.set_ylabel("Count")
     ax_ships.grid(True)
 
     handles, labels = ax_ships.get_legend_handles_labels()
     uniq = {}
-    for h, l in zip(handles, labels):
-        if l not in uniq:
-            uniq[l] = h
+    for handle, label in zip(handles, labels):
+        if label not in uniq:
+            uniq[label] = handle
     ax_ships.legend(
         list(uniq.values()),
         list(uniq.keys()),
@@ -318,46 +310,46 @@ def ext_visualise_output(
         frameon=False,
     )
 
+    # Plot vector storage
     plot_style(
         ax_vec,
         joined_data["steps"],
         joined_data["vector_storage"],
-        title="Stored Vector",
-        ylabel="[kt]",
-        scatter=True,
+        "Stored Vector",
+        "[kt]",
     )
     ax_vec.legend(loc="upper left", fontsize=8, frameon=False)
 
+    # Plot ship fill level
     plot_style(
         ax_fill,
         joined_data["steps"],
         [x / 1000 for x in joined_data["cumulative_charge"]],
-        title="Ship Fill",
-        ylabel="Mass (H2-eq) [kt]",
-        scatter=True,
+        "Ship Fill",
+        "Mass (H2-eq) [kt]",
     )
     ax_fill.legend(loc="upper left", fontsize=8, frameon=False)
 
+    # Plot energy turbine output
     plot_style(
         ax_energy,
         joined_data["steps"],
         joined_data["energy_turbine"],
-        title="Single Turbine Energy",
-        ylabel="Energy [GJ/h]",
-        scatter=True,
+        "Single Turbine Energy",
+        "Energy [GJ/h]",
     )
     ax_energy.legend(loc="upper left", fontsize=8, frameon=False)
 
+    # Final axis adjustments
     ax_energy.set_xlabel("Time [h]")
     for ax in (ax_ships, ax_vec, ax_fill):
         ax.tick_params(labelbottom=False)
 
-    max_ticks = 10
     xs = joined_data["steps"]
-    if len(xs) > max_ticks:
-        xticks = list(np.linspace(xs[0], xs[-1], max_ticks, dtype=int))
-        ax_energy.set_xticks(xticks)
+    if len(xs) > 10:
+        ax_energy.set_xticks(list(np.linspace(xs[0], xs[-1], 10, dtype=int)))
 
+    # Adjust layout
     if fig is not None:
         fig.tight_layout(rect=[0, 0, 1, 0.98])
         fig.subplots_adjust(hspace=0.45)

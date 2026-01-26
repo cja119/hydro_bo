@@ -3,7 +3,7 @@
 Bayesian Optimisation of Hydrogen Export Infrastructure
 
 <p align="center">
-  <img src="png/hydro_logo.png" alt="Centered Image" width="400"/>
+  <img src="png/hydro_bo.png" alt="Centered Image" width="400"/>
 </p>
 
 ## Installation
