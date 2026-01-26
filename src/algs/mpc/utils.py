@@ -9,9 +9,6 @@ import sys, os
 import contextlib
 import numpy as np
 
-# matplotlib import moved to function level to avoid import issues
-
-
 def add_equations(model, environment_name: str) -> None:
     """
     Adds the equations to the model.
@@ -21,8 +18,7 @@ def add_equations(model, environment_name: str) -> None:
     data_path = (
         current_path.parent.parent / "data/shipping/" + environment_name + "/fast_loop"
     )
-
-
+    
 @contextlib.contextmanager
 def suppress_output(supress: bool = True):
     if supress:
@@ -72,9 +68,9 @@ def ext_visualise_output(
             ax.set_ylim(*ylim)
 
     try:
-        value  # noqa: F821
+        value 
     except NameError:
-        from pyomo.environ import value  # type: ignore
+        from pyomo.environ import value 
 
     steps = list(range(run_count * time_step, (run_count + 1) * time_step + 1))
     shifted = range(0, time_step + 1)
@@ -97,9 +93,6 @@ def ext_visualise_output(
     vector_storage = [value(getattr(solve, "vector_storage")[t]) for t in shifted]
     cumulative_charge = [value(getattr(solve, "cumulative_charge")[t]) for t in shifted]
 
-    # -----------------------------
-    # Helpers for diagnostic series
-    # -----------------------------
     def series(name, default=float("nan")):
         """Get a time series [t in shifted] from solve.<name>[t], else NaNs."""
         try:
@@ -115,33 +108,19 @@ def ext_visualise_output(
         except Exception:
             return default
 
-    # -----------------------------
-    # Core plotted series (existing)
-    # -----------------------------
-    # Default plot remains "Single Turbine Energy" using wind profile if present
     energy_turbine = series("energy_wind")
-
-    # vector_flux (graceful fallback if missing)
     vector_flux = series("vector_flux")
-
-    # n_active_trains_conversion (graceful fallback if missing)
     n_active_trains_conversion = series("n_active_trains_conversion")
-
-    # -----------------------------------------
-    # NEW: Energy-related series (all relevant)
-    # -----------------------------------------
     energy_curtailed = series("energy_curtailed")
     energy_compression = series("energy_compression")
     energy_electrolysis = series("energy_electrolysis")
     energy_conversion = series("energy_conversion")
     energy_fuelcell = series("energy_fuelcell")
-
-    # Renewable profiles (Params) - keep both even if only one used
     energy_wind_profile = series("energy_wind")
     energy_solar_profile = series("energy_solar")
 
-    # Optional: compute renewable supply in same units as balance term
     ren_cap = scalar("renewable_energy_capacity", default=float("nan"))
+    
     if np.isfinite(ren_cap):
         renewable_supply_wind = [x * ren_cap for x in energy_wind_profile]
         renewable_supply_solar = [x * ren_cap for x in energy_solar_profile]
@@ -149,27 +128,17 @@ def ext_visualise_output(
         renewable_supply_wind = [float("nan") for _ in shifted]
         renewable_supply_solar = [float("nan") for _ in shifted]
 
-    # --------------------------------------------
-    # NEW: Hydrogen-flow-related series (all flows)
-    # --------------------------------------------
     hydrogen_storage = series("hydrogen_storage")
     hydrogen_produced = series("hydrogen_produced")
     hydrogen_used = series("hydrogen_used")
     hydrogen_stored = series("hydrogen_stored")
     hydrogen_removed = series("hydrogen_removed")
     hydrogen_consumed_fuelcell = series("hydrogen_consumed_fuelcell")
-
-    # Handy derived diagnostics (optional, but useful)
-    # net hydrogen change per hour (model should satisfy balance with removed/stored etc.)
-    # NOTE: first element uses nan because we don't have t-1 in shifted start
     hydrogen_storage_delta = [float("nan")] + [
         hydrogen_storage[i] - hydrogen_storage[i - 1]
         for i in range(1, len(hydrogen_storage))
     ]
 
-    # -------------------------------------------------------
-    # Build / extend joined_data (append across rolling runs)
-    # -------------------------------------------------------
     if joined_data is None or run_count == 0:
         joined_data = {
             "steps": steps[:],
@@ -181,7 +150,6 @@ def ext_visualise_output(
             "energy_turbine": energy_turbine[:],
             "n_active_trains_conversion": n_active_trains_conversion[:],
             "vector_flux": vector_flux[:],
-            # --- Energy diagnostics ---
             "energy_curtailed": energy_curtailed[:],
             "energy_compression": energy_compression[:],
             "energy_electrolysis": energy_electrolysis[:],
@@ -191,7 +159,6 @@ def ext_visualise_output(
             "energy_solar_profile": energy_solar_profile[:],
             "renewable_supply_wind": renewable_supply_wind[:],
             "renewable_supply_solar": renewable_supply_solar[:],
-            # --- Hydrogen diagnostics ---
             "hydrogen_storage": hydrogen_storage[:],
             "hydrogen_produced": hydrogen_produced[:],
             "hydrogen_used": hydrogen_used[:],
@@ -210,8 +177,6 @@ def ext_visualise_output(
             n_active_trains_conversion
         )
         joined_data.setdefault("vector_flux", []).extend(vector_flux)
-
-        # --- Energy diagnostics ---
         joined_data.setdefault("energy_curtailed", []).extend(energy_curtailed)
         joined_data.setdefault("energy_compression", []).extend(energy_compression)
         joined_data.setdefault("energy_electrolysis", []).extend(energy_electrolysis)
@@ -225,8 +190,6 @@ def ext_visualise_output(
         joined_data.setdefault("renewable_supply_solar", []).extend(
             renewable_supply_solar
         )
-
-        # --- Hydrogen diagnostics ---
         joined_data.setdefault("hydrogen_storage", []).extend(hydrogen_storage)
         joined_data.setdefault("hydrogen_produced", []).extend(hydrogen_produced)
         joined_data.setdefault("hydrogen_used", []).extend(hydrogen_used)
@@ -243,9 +206,6 @@ def ext_visualise_output(
             joined_data["n_ordered"][s].extend(n_ordered[s])
             joined_data["n_ship_sent"][s].extend(n_ship_sent[s])
 
-    # -----------------------------
-    # Plotting (unchanged)
-    # -----------------------------
     for ax in axs:
         ax.cla()
 
