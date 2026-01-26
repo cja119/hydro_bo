@@ -56,3 +56,6 @@ The following software were used in the creation of this repository:
 }
 
 ```
+## Use of Generative AI
+
+This repository's code was developed using GitHub's Co-pilot generative AI tool, which utilises on OpenAi's CODEX assistant. 
