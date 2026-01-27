@@ -1,6 +1,6 @@
 from sys import argv
 
-from hydro_bo.envs import Planning
+from hydro_bo import Planning
 
 
 def run_planning(vector_type: str):
@@ -23,6 +23,6 @@ def run_planning(vector_type: str):
 if __name__ == "__main__":
     assert argv[1] in ["NH3", "LH2"], "Please provide a valid vector type: NH3 or LH2"
 
-    print(f"Planning completed for vector type: {argv[1]}")
+    print(f"[INFO] Running planning model for: {argv[1]}")
     run_planning(argv[1])
-    print(f"Planning completed, results saved to src/tmp/planning/{argv[1]}-Chile.yml")
+    print(f"[INFO] Planning completed, results saved to src/tmp/planning/{argv[1]}-Chile.yml")

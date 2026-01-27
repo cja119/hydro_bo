@@ -8,6 +8,7 @@
 src/tmp/bayesopt/*
 src/tmp/ray_results/*
 src/tmp/planning/*
+src/tmp/shipping_plots/*
 !**/*/.gitkeep
 
 **/*.DS_Store

@@ -1,12 +1,15 @@
-from hydro_bo.algs import BayesianOptimizer
+from pathlib import Path
 import sys
 import os
+
+from hydro_bo import BayesianOptimizer
 
 
 def run_planning(vector_type: str):
 
     # Optimizer setup
-    optimizer = BayesianOptimizer("../src/hydro_bo/tmp")
+    optimizer = BayesianOptimizer(Path(__file__).parent.parent / "src/hydro_bo/tmp")
+    
     with optimizer as config:
         config["vector_type"] = vector_type
         config["planning_results_file"] = f"{vector_type}-Chile.yml"
@@ -14,7 +17,7 @@ def run_planning(vector_type: str):
         config["use_planning_bounds"] = True
 
     # Run optimization
-    results = optimizer.optimize(
+    _ = optimizer.optimize(
         num_samples=int(sys.argv[2]),
         experiment_name=f"{vector_type}_bayesopt",
         n_cores=8,
@@ -29,6 +32,6 @@ if __name__ == "__main__":
         "LH2",
     ], "Please provide a valid vector type: NH3 or LH2"
 
-    print("Running Bayesian Optimization for vector type:", sys.argv[1])
+    print(f"[INFO] Running Bayesian Optimization for vector type: {sys.argv[1]}")
     best = run_planning(sys.argv[1])
-    print("Best configuration found:", best)
+    print(f"[INFO] Best configuration found: {best}")

@@ -18,7 +18,7 @@ from ray.tune.search import ConcurrencyLimiter
 from ray.tune.search.optuna import OptunaSearch
 
 from envs.shipping.utils import calculate_capex_opex
-from .utils import ensure_dirs, parse_memory_string
+from algs.utils import ensure_dirs, parse_memory_string
 
 
 
@@ -494,10 +494,15 @@ class BayesianOptimizer:
         total_reward = 0
         total_tonnes = 0
         while True:
-            observation, reward, done, _ = environment.step(action=None, verbose=False)
+            observation, reward, done, info = environment.step(action=None, verbose=False)
             total_reward += reward
             total_tonnes += observation["total_tonnes"]
-            if done:
+
+            call_count = None
+            if isinstance(info, dict):
+                call_count = info.get("call_count")
+
+            if done or (call_count is not None and call_count >= 12):
                 break
 
         # Report result to Ray (negative because Ray minimizes)
