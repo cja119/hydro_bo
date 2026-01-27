@@ -5,8 +5,17 @@ control optimiser for the shipping problem.
 
 from __future__ import annotations
 
-from algs.mpc.core import MPCController
-from .utils import import_mpc_data, import_mpc_functions, args_dict, status_message
+from algs.mpc import MPCController, MPCSolveError
+from .utils import (
+    PlotTheme,
+    apply_theme,
+    args_dict,
+    import_mpc_data,
+    import_mpc_functions,
+    plot_energy_management_figure,
+    plot_scheduling_figure,
+    status_message,
+)
 from .dynamics import Dynamics
 
 
@@ -28,6 +37,11 @@ class ShippingEnv:
         return self._args
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self._build_env()
+
+    def _build_env(self) -> None:
+        # rebuild controller/dynamics from current args
+        self._controller = MPCController()
         self._controller_data = import_mpc_data(
             self._args["mpc"]["data_folder"],
             self._args["mpc"]["planning_model"],
@@ -49,65 +63,77 @@ class ShippingEnv:
         return self._controller.render()
 
     def reset(self) -> None:
-        with self as slf:
-            pass
+        self._build_env()
 
     def step(self, action, verbose=False):
-        observation = {}
-        n_steps = self._dynamics.get_forecasts()
-        total_sent = 0
-        t_sent_vol = 0
-        prev_profit = 0
-        if self._dynamics.results is not None:
-            prev_profit = self._dynamics.results.get(("actual_profit", 0), 0)
+        max_retries = 1
+        attempt = 0
 
-        for i in range(n_steps):
+        while attempt <= max_retries:
+            try:
+                observation = {}
+                n_steps = self._dynamics.get_forecasts()
+                total_sent = 0
+                t_sent_vol = 0
+                prev_profit = 0
+                if self._dynamics.results is not None:
+                    prev_profit = self._dynamics.results.get(("actual_profit", 0), 0)
 
-            # Update the state with the new demand
-            mpc_args = self._dynamics.get_mpc_args()
-            self._controller.update(mpc_args, self._dynamics.results)
+                for i in range(n_steps):
 
-            # Solve the mpc controller
-            results, self._dynamics.states, stored_val, sent_vol = (
-                self._controller.solve(True, solver=self._args["mpc"]["solver"])
-            )
+                    # Update the state with the new demand
+                    mpc_args = self._dynamics.get_mpc_args()
+                    self._controller.update(mpc_args, self._dynamics.results)
 
-            self._dynamics.set_results(results)
+                    # Solve the mpc controller
+                    results, self._dynamics.states, stored_val, sent_vol = (
+                        self._controller.solve(True, solver=self._args["mpc"]["solver"])
+                    )
 
-            total_sent += sum(
-                self._dynamics.states["sent_ship"][s]
-                for s in self._controller_data["sets"]["ships"]
-            )
-            t_sent_vol += sent_vol
+                    self._dynamics.set_results(results)
 
-            # Print the curent iteration and the total ships sent
-            if verbose:
-                status_message(i, self._dynamics.iter_count // n_steps)
+                    total_sent += sum(
+                        self._dynamics.states["sent_ship"][s]
+                        for s in self._controller_data["sets"]["ships"]
+                    )
+                    t_sent_vol += sent_vol
 
-            # Simulate the shipping dynamics with the new demand
-            self._dynamics.simulate_shipping_dynamics(new_demand)
+                    # Print the current iteration and the total ships sent
+                    if verbose:
+                        status_message(i, self._dynamics.iter_count // n_steps)
 
-            self._state = self._dynamics.get_state()
+                    # Simulate the shipping dynamics with the new demand
+                    self._dynamics.simulate_shipping_dynamics()
 
-            # Update the observation with the current state
-            observation["destination_storage"] = self._dynamics.destination_storage
-            observation["ship_destination"] = self._dynamics.ship_destination
+                    self._state = self._dynamics.get_state()
 
-        # k$ + t * 5 k$/t / (t) = k$ / t or $/kg <- This is the profit per/kg
-        profit_inc = results.get(("actual_profit", 0), 0) - prev_profit
-        reward = (profit_inc * 1000) + stored_val * 5
-        observation["total_tonnes"] = stored_val + t_sent_vol
+                    # Update the observation with the current state
+                    observation["destination_storage"] = self._dynamics.destination_storage
+                    observation["ship_destination"] = self._dynamics.ship_destination
 
-        if self._dynamics.iter_count // n_steps >= self._args["months"]:
-            if verbose:
-                print(
-                    "\r[INFO] Maximum iterations reached. Total reward: ", end=" " * 20
-                )
-            return observation, reward, True, {}
-        else:
-            if verbose:
-                print(f"\r[REWARD] M$ {reward:.4f}", end="" * 50)
-            return observation, reward, False, {}
+                # k$ + t * 5 k$/t / (t) = k$ / t or $/kg <- This is the profit per/kg
+                profit_inc = results.get(("actual_profit", 0), 0) - prev_profit
+                reward = (profit_inc * 1000) + stored_val * 5
+                observation["total_tonnes"] = stored_val + t_sent_vol
+
+                call_count = getattr(self._dynamics, "_call_count", None)
+
+                if self._dynamics.iter_count // n_steps >= self._args["months"]:
+                    if verbose:
+                        print(
+                            "\r[INFO] Maximum iterations reached. Total reward: ", end=" " * 20
+                        )
+                    return observation, reward, True, {"call_count": call_count}
+                else:
+                    if verbose:
+                        print(f"\r[REWARD] M$ {reward:.4f}", end="" * 50)
+                    return observation, reward, False, {"call_count": call_count}
+
+            except MPCSolveError:
+                attempt += 1
+                if attempt > max_retries:
+                    raise
+                self._build_env()
 
 
 class ShippingEnvPlot:
@@ -159,11 +185,42 @@ class ShippingEnvPlot:
         return self._controller.render()
 
     def reset(self) -> None:
-        with self as slf:
-            pass
+        self._build_env()
 
     def plot_data(self):
         return self._controller._joined_data
+
+    def plot_figures(
+        self,
+        *,
+        theme: PlotTheme | None = None,
+        schedule_figsize=(12, 14),
+        energy_figsize=(12, 12),
+        max_ticks: int = 10,
+    ):
+        """Render scheduling and energy management figures from collected plot data."""
+
+        if not hasattr(self._controller, "_joined_data") or self._controller._joined_data is None:
+            raise ValueError("No plot data available; run step() with plot_horizon first to populate joined_data.")
+
+        theme_to_use = theme or PlotTheme()
+        apply_theme(theme_to_use)
+
+        joined_data = self._controller._joined_data
+        fig_sched, _ = plot_scheduling_figure(
+            joined_data,
+            figsize=schedule_figsize,
+            max_ticks=max_ticks,
+            theme=theme_to_use,
+        )
+        fig_energy, _ = plot_energy_management_figure(
+            joined_data,
+            figsize=energy_figsize,
+            max_ticks=max_ticks,
+            theme=theme_to_use,
+        )
+
+        return fig_sched, fig_energy
 
     def step(self, action, verbose: bool = False, plot_horizon: int = 24):
         """
@@ -178,69 +235,77 @@ class ShippingEnvPlot:
         plot_horizon : int
             Horizon passed to self._controller.visualise_output(plot_horizon)
         """
-        observation = {}
+        max_retries = 1
+        attempt = 0
 
-        n_steps = self._dynamics.get_forecasts()
+        while attempt <= max_retries:
+            try:
+                observation = {}
 
-        total_sent = 0
-        t_sent_vol = 0
-        prev_profit = 0
+                n_steps = self._dynamics.get_forecasts()
 
-        if self._dynamics.results is not None:
-            prev_profit = self._dynamics.results.get(("actual_profit", 0), 0)
+                total_sent = 0
+                t_sent_vol = 0
+                prev_profit = 0
 
-        results = None
-        stored_val = 0
-        sent_vol = 0
+                if self._dynamics.results is not None:
+                    prev_profit = self._dynamics.results.get(("actual_profit", 0), 0)
 
-        for i in range(n_steps):
-            # Update the state with the new demand
-            mpc_args = self._dynamics.get_mpc_args()
-            self._controller.update(mpc_args, self._dynamics.results)
+                results = None
+                stored_val = 0
+                sent_vol = 0
 
-            # Solve the mpc controller (match ShippingEnvV2 signature/behavior)
-            results, self._dynamics.states, stored_val, sent_vol = (
-                self._controller.solve(
-                    True,
-                    solver=self._args["mpc"]["solver"],
-                )
-            )
+                for i in range(n_steps):
+                    # Update the state with the new demand
+                    mpc_args = self._dynamics.get_mpc_args()
+                    self._controller.update(mpc_args, self._dynamics.results)
 
-            self._dynamics.set_results(results)
+                    # Solve the mpc controller (match ShippingEnvV2 signature/behavior)
+                    results, self._dynamics.states, stored_val, sent_vol = (
+                        self._controller.solve(
+                            True,
+                            solver=self._args["mpc"]["solver"],
+                        )
+                    )
 
-            total_sent += sum(
-                self._dynamics.states["sent_ship"][s]
-                for s in self._controller_data["sets"]["ships"]
-            )
-            t_sent_vol += sent_vol
+                    self._dynamics.set_results(results)
 
-            if verbose:
-                status_message(i, self._dynamics.iter_count // n_steps)
+                    total_sent += sum(
+                        self._dynamics.states["sent_ship"][s]
+                        for s in self._controller_data["sets"]["ships"]
+                    )
+                    t_sent_vol += sent_vol
 
-            # Plotting overhead
-            # (Assumes .visualise_output internally updates matplotlib state.)
-            self._controller.visualise_output(plot_horizon)
+                    if verbose:
+                        status_message(i, self._dynamics.iter_count // n_steps)
 
-            # Simulate the shipping dynamics with the new demand
-            self._dynamics.simulate_shipping_dynamics()
-            self._state = self._dynamics.get_state()
+                    # Plotting overhead
+                    self._controller.visualise_output(plot_horizon)
 
-            # Update the observation with the current state
-            observation["destination_storage"] = self._dynamics.destination_storage
-            observation["ship_destination"] = self._dynamics.ship_destination
+                    # Simulate the shipping dynamics with the new demand
+                    self._dynamics.simulate_shipping_dynamics()
+                    self._state = self._dynamics.get_state()
 
-            # Yield a figure each internal step for notebook animation
-            yield self._controller.render()
+                    observation["destination_storage"] = self._dynamics.destination_storage
+                    observation["ship_destination"] = self._dynamics.ship_destination
 
-        # Final reward/termination logic (match ShippingEnvV2)
-        profit_inc = 0
-        if results is not None:
-            profit_inc = results.get(("actual_profit", 0), 0) - prev_profit
+                    yield self._controller.render()
 
-        reward = (profit_inc * 1000) + stored_val * 5
-        observation["total_tonnes"] = stored_val + t_sent_vol
+                profit_inc = 0
+                if results is not None:
+                    profit_inc = results.get(("actual_profit", 0), 0) - prev_profit
 
-        done = self._dynamics.iter_count // n_steps >= self._args["months"]
-        info = {}
+                reward = (profit_inc * 1000) + stored_val * 5
+                observation["total_tonnes"] = stored_val + t_sent_vol
 
-        self.last_transition = (observation, reward, done, info)
+                done = self._dynamics.iter_count // n_steps >= self._args["months"]
+                info = {"call_count": getattr(self._dynamics, "_call_count", None)}
+
+                self.last_transition = (observation, reward, done, info)
+                return
+
+            except MPCSolveError:
+                attempt += 1
+                if attempt > max_retries:
+                    raise
+                self._build_env()

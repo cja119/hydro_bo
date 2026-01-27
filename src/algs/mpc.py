@@ -19,8 +19,18 @@ from pyomo.environ import (
     Var,
     value,
 )
+from pyomo.opt import TerminationCondition
 
-from .utils import ext_visualise_output, suppress_output
+from algs.utils import ext_visualise_output, suppress_output
+
+
+class MPCSolveError(RuntimeError):
+    def __init__(self, termination_condition, message=None):
+        self.termination_condition = termination_condition
+        self.message = message
+        super().__init__(
+            f"MPC solve failed: {termination_condition}{' - ' + message if message else ''}"
+        )
 
 
 def find_equivalent_set(model, values):
@@ -87,7 +97,7 @@ class MPCController:
         # Solve primary objective
         with suppress_output(supress):
             self.results = self.solver.solve(
-                self.instance1, tee=supress, warmstart=True
+                self.instance1, tee=supress, warmstart=False
             )
 
         # Set lexicographic flag
@@ -96,19 +106,25 @@ class MPCController:
         # Lexicographic is just a re-solve of the same problem, there is a
         # functionality to set a secondary objective
         # ( see src/data/config.yaml -> formulations/secondary))
-        if self.results.solver.termination_condition != "optimal":
-            print("[INFO] Infeasible problem, solving lexicographically")
+        if self.results.solver.termination_condition != TerminationCondition.optimal:
             if self._cache_enabled and self._solution_cache:
                 self._apply_warm_start(self.instance2)
             self.results = self.solver.solve(
-                self.instance2, tee=supress, warmstart=True
+                self.instance2, tee=supress, warmstart=False
             )
             self.lexicographic = 2
+
+        # If still not optimal after lexicographic fallback, raise so caller can handle/restart
+        if self.results.solver.termination_condition != TerminationCondition.optimal:
+            raise MPCSolveError(
+                termination_condition=self.results.solver.termination_condition,
+                message=getattr(self.results.solver, "message", None),
+            )
 
         # Cache solution if enabled
         if (
             self._cache_enabled
-            and self.results.solver.termination_condition == "optimal"
+            and self.results.solver.termination_condition == TerminationCondition.optimal
         ):
             self._cache_solution()
 
