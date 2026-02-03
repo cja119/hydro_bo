@@ -58,4 +58,4 @@ python mpc.py "NH3" # Or LH2
 
 ## Acknowledgements
 
-Read CITATIONS.md to see software acknowledgements for this research. 
+Read SOFTWARE.md to see software acknowledgements for this research. 
