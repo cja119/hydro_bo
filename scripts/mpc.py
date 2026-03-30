@@ -3,6 +3,10 @@ from pathlib import Path
 import sys
 
 from hydro_bo import ShippingEnv
+from hydro_bo import configure_logging
+
+# Configure structured logging
+configure_logging()
 
 PLOT_DIR = Path(__file__).parent.parent / "src/tmp/shipping_plots"
 

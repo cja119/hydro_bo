@@ -1,6 +1,6 @@
 parameters:
   mean_ship_arrival_time: 7
-  std_ship_arrival_time: 1.417
+  std_ship_arrival_time: 0.25
 
 variables:
   var1:
