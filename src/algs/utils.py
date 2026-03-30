@@ -3,6 +3,7 @@ Utility functions for algorithms
 """
 
 import contextlib
+import logging
 import os
 import sys
 from pathlib import Path
@@ -51,11 +52,18 @@ def suppress_output(supress: bool = True):
 
     with open(os.devnull, "w") as devnull:
         old_out, old_err = sys.stdout, sys.stderr
+        gurobi_logger = logging.getLogger("gurobipy")
+        old_gurobi_disabled = gurobi_logger.disabled
+        old_gurobi_level = gurobi_logger.level
         sys.stdout, sys.stderr = devnull, devnull
+        gurobi_logger.disabled = True
+        gurobi_logger.setLevel(logging.CRITICAL + 1)
         try:
             yield
         finally:
             sys.stdout, sys.stderr = old_out, old_err
+            gurobi_logger.disabled = old_gurobi_disabled
+            gurobi_logger.setLevel(old_gurobi_level)
 
 
 def ext_visualise_output(

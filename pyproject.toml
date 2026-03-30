@@ -36,6 +36,7 @@ dependencies = [
     "seaborn",
     "six>=1.17.0",
     "statsmodels",
+    "structlog>=24.1.0",
     "tzdata>=2024.2",
     "urllib3>=2.3.0",
     "webdriver_manager"

@@ -364,10 +364,35 @@ def count_and_shift_arrivals(
     ship_origin: MutableMapping[int, list[int]],
     expected_arrivals: MutableMapping[int, list[int]],
     size: int,
+    ship_origin_latent: MutableMapping[int, list[float]] | None = None,
+    ship_origin_baseline: MutableMapping[int, list[int]] | None = None,
 ) -> int:
-    arrived = ship_origin[size].count(0)
-    ship_origin[size][:] = [x for x in ship_origin[size] if x > 0]
-    expected_arrivals[size][:] = expected_arrivals[size][arrived:]
+    origin = ship_origin[size]
+    expected = expected_arrivals[size]
+
+    # Keep actual and expected lists index-aligned so a realised arrival removes
+    # the matching expected ship. This avoids dropping/duplicating expectations.
+    if len(origin) == len(expected):
+        keep_idx = [i for i, remaining in enumerate(origin) if remaining > 0]
+        arrived = len(origin) - len(keep_idx)
+        ship_origin[size][:] = [origin[i] for i in keep_idx]
+        expected_arrivals[size][:] = [expected[i] for i in keep_idx]
+        if ship_origin_latent is not None and size in ship_origin_latent:
+            latent = ship_origin_latent[size]
+            ship_origin_latent[size][:] = [latent[i] for i in keep_idx]
+        if ship_origin_baseline is not None and size in ship_origin_baseline:
+            baseline = ship_origin_baseline[size]
+            ship_origin_baseline[size][:] = [baseline[i] for i in keep_idx]
+        return arrived
+
+    # Fallback for legacy/misaligned state: any nonpositive ETA means arrived.
+    arrived = sum(1 for remaining in origin if remaining <= 0)
+    ship_origin[size][:] = [x for x in origin if x > 0]
+    expected_arrivals[size][:] = expected[arrived:]
+    if ship_origin_latent is not None and size in ship_origin_latent:
+        ship_origin_latent[size][:] = ship_origin_latent[size][arrived:]
+    if ship_origin_baseline is not None and size in ship_origin_baseline:
+        ship_origin_baseline[size][:] = ship_origin_baseline[size][arrived:]
     return arrived
 
 

@@ -312,8 +312,12 @@ def upper_vector_storage_limit(m, t):
         return Constraint.Skip
     cons = 0
 
-    cons += m.vector_storage[t]
-    cons -= m.vector_storage_capacity
+    if t <= 24:
+        cons += m.vector_storage[t]
+        cons -= m.vector_storage_capacity
+    else:
+        cons += m.vector_storage[t]
+        cons -= m.vector_storage_capacity * 0.8
 
     return cons <= 0
 
