@@ -29,7 +29,13 @@ from algs.utils import ext_visualise_output, suppress_output
 logger = get_logger(__name__)
 
 def ms(x):
-    return round(x * 1000, 1)
+    return int(x * 1000)
+
+def minute_second(x):
+    hours = int(x // 3600)
+    minutes = int(x // 60)
+    seconds = int(x % 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 class MPCSolveError(RuntimeError):
     def __init__(self, termination_condition, message=None):
@@ -63,6 +69,8 @@ class MPCController:
         self._needs_instance_rebuild = False
         self._solution_cache = {}
         self._cache_enabled = True
+        self._call_count = 0
+        self._start_time = time.perf_counter()
 
     # --- Public Interface Methods --- #
 
@@ -106,7 +114,7 @@ class MPCController:
         solver_init_time = time.perf_counter() - solver_init_start
 
         if solver_init_time > 0.001:
-            logger.info("solver_initialization", duration_ms=solver_init_time * 1000)
+            logger.info("solver_initialization", duration_ms=ms(solver_init_time))
 
         if not supress:
             print(
@@ -128,15 +136,18 @@ class MPCController:
 
             logger.info(
                 "first_solve_setup",
-                instance_creation_ms=instance_time * 1000,
-                solver_binding_ms=bind_time * 1000,
-                total_setup_ms=(instance_time + bind_time) * 1000
+                instance_creation_ms=ms(instance_time),
+                solver_binding_ms=ms(bind_time),
+                total_setup_ms=ms(instance_time + bind_time)
             )
 
         # Solve model (persistent solver doesn't need instance parameter)
         solve_call_start = time.perf_counter()
         with suppress_output(supress):
-            self.results = self.solver.solve(tee=not supress, warmstart=False)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="Setting Var.*not in domain")
+                self.results = self.solver.solve(tee=not supress, warmstart=False)
         solve_call_time = time.perf_counter() - solve_call_start
 
         # Check if optimal
@@ -157,18 +168,20 @@ class MPCController:
                 message=getattr(self.results.solver, "message", None),
             )
         # Extract output
-        output_start = time.perf_counter()
         result = self.output()
-        output_time = time.perf_counter() - output_start
 
         total_time = time.perf_counter() - solve_start
+        elapsed_seconds = time.perf_counter() - self._start_time
+
+        self._call_count += 1
 
         logger.info(
             "solve_complete",
-            solve_call_ms=round(solve_call_time * 1000, 1),
-            output_ms=round(output_time * 1000, 1),
-            total_ms=round(total_time * 1000, 1),
-            is_first_solve=not self._instance_bound or solve_call_time > 1.0
+            call_count=self._call_count,
+            solve_call_ms=ms(solve_call_time),
+            total_ms=ms(total_time),
+            is_first_solve=not self._instance_bound,
+            time_elapsed=minute_second(elapsed_seconds)
         )
 
         return result
@@ -197,7 +210,7 @@ class MPCController:
             rebuild_time = time.perf_counter() - rebuild_start
             logger.info(
                 "instance_rebuilt_for_fixed_mode",
-                rebuild_ms=rebuild_time * 1000,
+                rebuild_ms=ms(rebuild_time)
             )
 
         # If no start values, just do stochastic update
@@ -212,22 +225,18 @@ class MPCController:
 
             logger.info(
                 "parameter_update",
-                stochastic_update_ms=stochastic_time * 1000,
-                refresh_ms=refresh_time * 1000,
-                rebuild_ms=rebuild_time * 1000,
+                refresh_ms=ms(refresh_time),
                 has_start_values=False
             )
             return None
 
-        # CRITICAL ORDER for gurobi_persistent compatibility:
-        # 1. Unfix all previously fixed variables
-        # 2. Update stochastic parameters (changes constraints)
-        # 3. Fix initial conditions with new parameter values
+        # Order for gurobi_persistent:
+        # 1 unfix all previously fixed variables
+        # 2 update stochastic parameters 
+        # 3 fix initial conditions
 
-        unfix_start = time.perf_counter()
         if self.instance is not None:
             self._unfix_all_variables(self.instance)
-        unfix_time = time.perf_counter() - unfix_start
 
         stochastic_start = time.perf_counter()
         self.stochastic_update(data=stochastic_values)
@@ -248,13 +257,10 @@ class MPCController:
         logger.info(
             "parameter_update",
             rebuild_ms=ms(rebuild_time),
-            unfix_ms=ms(unfix_time),
-            stochastic_update_ms=ms(stochastic_time),
-            start_values_ms=ms(start_values_time),
             refresh_ms=ms(refresh_time),
             total_update_ms=ms(total_time),
             has_start_values=True,
-            num_start_values=len(start_values)
+            start_vals=len(start_values)
         )
 
         return None
@@ -321,10 +327,13 @@ class MPCController:
     # --- Internal Helper Methods --- #
 
     def _clean_variable_value(self, var, value):
-        from pyomo.environ import Integers, NonNegativeIntegers, NonNegativeReals
+        from pyomo.environ import Binary, Integers, NonNegativeIntegers, NonNegativeReals
 
         if value is None:
             return 0.0
+
+        if var.domain == Binary:
+            return 1 if value >= 0.5 else 0
 
         if var.domain in [NonNegativeIntegers, Integers]:
             cleaned_value = 0 if abs(value) < 1e-12 else int(round(value))
@@ -494,11 +503,6 @@ class MPCController:
                     if var.name not in fixed_by_name:
                         fixed_by_name[var.name] = 0
                     fixed_by_name[var.name] += 1
-
-        # Log what we fixed
-        logger.info("fixed_initial_conditions",
-                   total_vars_fixed=len(fixed_vars),
-                   vars_by_name=fixed_by_name)
 
         # Notify persistent solver of fixed variables if instance is bound
         if self._instance_bound and hasattr(self.solver, 'update_var'):
@@ -925,3 +929,4 @@ class MPCController:
                     )
         except Exception as e:
             logger.warning("feasibility_relaxation_report_failed", error=str(e))
+

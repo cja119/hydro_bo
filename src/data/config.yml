@@ -1,7 +1,7 @@
 Time:
   grid0: 1
   grid1: 24  
-  total_duration: 504
+  total_duration: 336
 
 Sets:
   ships: ["small", "medium", "large"]

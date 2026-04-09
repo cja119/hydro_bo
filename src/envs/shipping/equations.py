@@ -162,6 +162,7 @@ def vector_storage_balance(m, t):
     eqn += (m.vector_storage[t] - m.vector_storage[t - 1]) * 1000
     eqn -= m.vector_flux[t] * m.conversion_fugitive_efficiency / m.calorific_value
     eqn += m.ship_charge_rate[t]
+    eqn += m.vector_flared[t]
 
     return eqn == 0
 

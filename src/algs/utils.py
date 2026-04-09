@@ -88,17 +88,16 @@ def ext_visualise_output(
     axs = axs[:4]
 
     # Define colors
-    NAVY = "#001f3f"
-    BURGUNDY = "#800020"
+    NAVY = "r"
+    BURGUNDY = "b"
     TITLE_PAD = 10
 
     # Helper to style each plot
     def plot_style(ax, x, y, title, ylabel):
-        ax.scatter(x, y, color=NAVY, s=18, alpha=0.25, zorder=2, label="Value")
-        ax.plot(x, y, color=BURGUNDY, linewidth=2, alpha=0.9, zorder=3, label="Value")
-        ax.set_title(title, pad=TITLE_PAD)
-        ax.set_ylabel(ylabel)
-        ax.grid(True)
+        ax.plot(x, y, color=BURGUNDY, linewidth=1.8, label="Value")
+        ax.set_title(title, fontsize=9, loc="left", pad=2)
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.grid(True, linewidth=0.4, alpha=0.5)
 
     # Helpers for time series contiguity
     steps = list(range(run_count * time_step, (run_count + 1) * time_step + 1))
@@ -274,8 +273,8 @@ def ext_visualise_output(
     ship_marker_size = {"Small": 55, "Medium": 75, "Large": 95}
     ordered_alpha = {"Small": 0.45, "Medium": 0.55, "Large": 0.65}
     sent_alpha = {"Small": 0.45, "Medium": 0.55, "Large": 0.65}
-    ordered_color = {"Small": "#b85a72", "Medium": BURGUNDY, "Large": "#4d0010"}
-    sent_color = {"Small": "#4c6a86", "Medium": NAVY, "Large": "#001022"}
+    ordered_color = {"Small": "#7fbfff", "Medium": "b", "Large": "#003d99"}
+    sent_color = {"Small": "#ff9999", "Medium": "r", "Large": "#990000"}
 
     # Plot each bin
     for size_name, ships_in_bin in bins.items():
@@ -290,33 +289,14 @@ def ext_visualise_output(
             y_ord += np.asarray(joined_data["n_ordered"][s], dtype=float)
             y_sent += np.asarray(joined_data["n_ship_sent"][s], dtype=float)
 
-        ax_ships.scatter(
-            joined_data["daily_steps"],
-            y_ord,
-            color=ordered_color[size_name],
-            s=ship_marker_size[size_name],
-            alpha=0.25,
-            marker=size_marker[size_name],
-            edgecolors="none",
-            zorder=2,
-        )
-        ax_ships.scatter(
-            joined_data["daily_steps"],
-            y_sent,
-            color=sent_color[size_name],
-            s=ship_marker_size[size_name],
-            alpha=0.25,
-            marker=size_marker[size_name],
-            edgecolors="none",
-            zorder=2,
-        )
-
         ax_ships.plot(
             joined_data["daily_steps"],
             y_ord,
             color=ordered_color[size_name],
             linestyle="-",
-            linewidth=2.0,
+            linewidth=1.8,
+            marker="o",
+            markersize=4,
             alpha=ordered_alpha[size_name],
             zorder=3,
             label=f"Ordered ({size_name})",
@@ -326,15 +306,17 @@ def ext_visualise_output(
             y_sent,
             color=sent_color[size_name],
             linestyle="--",
-            linewidth=2.0,
+            linewidth=1.8,
+            marker="s",
+            markersize=4,
             alpha=sent_alpha[size_name],
             zorder=3,
             label=f"Sent ({size_name})",
         )
     # Final plot styling
-    ax_ships.set_title("Ships Ordered / Sent (by Capacity)", pad=TITLE_PAD)
-    ax_ships.set_ylabel("Count")
-    ax_ships.grid(True)
+    ax_ships.set_title("Ships Ordered / Sent (by Capacity)", fontsize=9, loc="left", pad=2)
+    ax_ships.set_ylabel("Count", fontsize=9)
+    ax_ships.grid(True, linewidth=0.4, alpha=0.5)
 
     handles, labels = ax_ships.get_legend_handles_labels()
     uniq = {}
@@ -344,8 +326,8 @@ def ext_visualise_output(
     ax_ships.legend(
         list(uniq.values()),
         list(uniq.keys()),
-        loc="upper left",
-        fontsize=8,
+        loc="best",
+        fontsize=7,
         ncols=2,
         frameon=False,
     )
@@ -358,7 +340,7 @@ def ext_visualise_output(
         "Stored Vector",
         "[kt]",
     )
-    ax_vec.legend(loc="upper left", fontsize=8, frameon=False)
+    ax_vec.legend(loc="best", fontsize=7, frameon=False)
 
     # Plot ship fill level
     plot_style(
@@ -368,7 +350,7 @@ def ext_visualise_output(
         "Ship Fill",
         "Mass (H2-eq) [kt]",
     )
-    ax_fill.legend(loc="upper left", fontsize=8, frameon=False)
+    ax_fill.legend(loc="best", fontsize=7, frameon=False)
 
     # Plot energy turbine output
     plot_style(
@@ -378,10 +360,10 @@ def ext_visualise_output(
         "Single Turbine Energy",
         "Energy [GJ/h]",
     )
-    ax_energy.legend(loc="upper left", fontsize=8, frameon=False)
+    ax_energy.legend(loc="best", fontsize=7, frameon=False)
 
     # Final axis adjustments
-    ax_energy.set_xlabel("Time [h]")
+    ax_energy.set_xlabel("Time [h]", fontsize=9)
     for ax in (ax_ships, ax_vec, ax_fill):
         ax.tick_params(labelbottom=False)
 
