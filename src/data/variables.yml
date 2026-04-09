@@ -99,3 +99,7 @@ variables:
     name: storage_bool
     domain: binary
     time_duration: [grid0]
+  var26:
+    name: vector_flared
+    domain: positive_real
+    time_duration: [grid0]

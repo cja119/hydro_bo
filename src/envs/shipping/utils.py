@@ -68,7 +68,7 @@ def _traverse(mapping: Mapping[str, Any], keys: Iterable[str]) -> Any:
 
 
 def import_mpc_data(
-    planning_model: str | Path, vector: str, random_param: bool = False
+    planning_model: str | Path | dict, vector: str, random_param: bool = False
 ) -> Dict[str, Dict[str, Any]]:
     """Import MPC input data from config, variables, and planning model files."""
 
@@ -79,10 +79,15 @@ def import_mpc_data(
 
     config = _load_yaml(CONFIG_PATH)
     variables = _load_yaml(VARIABLES_PATH)
-    planning_model_path = _resolve_planning_model(planning_model)
 
-    if not planning_model_path.exists():
-        raise FileNotFoundError(f"Planning model {planning_model_path} does not exist.")
+    planning_model_path = None
+    if isinstance(planning_model, dict):
+        planning_model_data = planning_model
+    else:
+        planning_model_path = _resolve_planning_model(planning_model)
+
+        if not planning_model_path.exists():
+            raise FileNotFoundError(f"Planning model {planning_model_path} does not exist.")
 
     default_parameters = DefaultParams("default")
     default_parameters.filter_params(vector)
@@ -116,7 +121,8 @@ def import_mpc_data(
         else:
             params[key] = param
 
-    planning_model_data = _load_yaml(planning_model_path)
+    if planning_model_path is not None:
+        planning_model_data = _load_yaml(planning_model_path)
     for item in config.get("param_source", {}).get("planning_model", []):
         if item in planning_model_data:
             params[item] = planning_model_data[item]
@@ -222,12 +228,14 @@ def args_dict() -> Dict[str, Any]:
             "mean_ship_arrival_time": 168,
             "std_ship_arrival_time": 34,
         },
+        "seed": 42,
     }
 
 
-def temporal_align(weather: Sequence[Any], randomise: bool = False) -> list[Any]:
+def temporal_align(weather: Sequence[Any], randomise: bool = False, seed: int = 42) -> list[Any]:
     """Align weather data to a random or zero offset."""
-
+    if randomise:
+        np.random.seed(seed)
     random_start = randint(0, len(weather) - 1) if randomise else 0
     return list(weather[random_start:]) + list(weather[:random_start])
 
@@ -407,8 +415,8 @@ def status_message(day: int, month: int) -> None:
 # Plotting utilities for ShippingEnv.plot_data() outputs
 # ---------------------------------------------------------------------------
 
-BURGUNDY = "#7a003c"
-NAVY = "#0b2d4d"
+BURGUNDY = "b"
+NAVY = "r"
 TITLE_PAD = 10
 
 
@@ -547,29 +555,17 @@ def plot_style(
     *,
     title: str,
     ylabel: str,
-    scatter: bool = False,
     line_color: str = BURGUNDY,
-    scat_color: Optional[str] = None,
-    theme: PlotTheme = PlotTheme(),
 ):
     x_arr = _as_1d_float_array(x, name="x")
     y_arr = _as_1d_float_array(y, name="y")
     _ensure_same_length(x_arr, y_arr, name_x="x", name_y="y")
 
-    if scatter:
-        ax.scatter(
-            x_arr,
-            y_arr,
-            color=(scat_color or line_color),
-            s=theme.scatter_s,
-            alpha=theme.scatter_alpha,
-            zorder=2,
-        )
-    ax.plot(x_arr, y_arr, color=line_color, linewidth=theme.lw, alpha=0.95, zorder=3)
+    ax.plot(x_arr, y_arr, color=line_color, linewidth=1.8, zorder=3)
 
-    ax.set_title(title, pad=theme.title_pad)
-    ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=theme.grid_alpha)
+    ax.set_title(title, fontsize=9, loc="left", pad=2)
+    ax.set_ylabel(ylabel, fontsize=9)
+    ax.grid(True, linewidth=0.4, alpha=0.5)
     return ax
 
 
@@ -618,8 +614,8 @@ def plot_scheduling_figure(
 
     ordered_alpha = {"Small": 0.65, "Medium": 0.65, "Large": 0.65}
     sent_alpha = {"Small": 0.65, "Medium": 0.65, "Large": 0.65}
-    ordered_color = {"Small": "#b85a72", "Medium": BURGUNDY, "Large": "#4d0010"}
-    sent_color = {"Small": "#4c6a86", "Medium": NAVY, "Large": "#001022"}
+    ordered_color = {"Small": "#7fbfff", "Medium": "b", "Large": "#003d99"}
+    sent_color = {"Small": "#ff9999", "Medium": "r", "Large": "#990000"}
 
     x_mid = (x_daily[:-1] + x_daily[1:]) / 2.0
     totals = {sz: {"ordered": 0.0, "sent": 0.0} for sz in ["Small", "Medium", "Large"]}
@@ -722,8 +718,8 @@ def plot_scheduling_figure(
     if ordered_handles or sent_handles:
         ax_ships.legend(
             handles=ordered_handles + sent_handles,
-            loc="upper left",
-            fontsize=14,
+            loc="best",
+            fontsize=7,
             ncols=2,
             frameon=False,
             handlelength=2.2,
@@ -731,9 +727,9 @@ def plot_scheduling_figure(
             columnspacing=1.2,
         )
 
-    ax_ships.set_title("Ships Ordered / Sent", pad=theme.title_pad)
-    ax_ships.set_ylabel("Count")
-    ax_ships.grid(True, alpha=theme.grid_alpha)
+    ax_ships.set_title("Ships Ordered / Sent", fontsize=9, loc="left", pad=2)
+    ax_ships.set_ylabel("Count", fontsize=9)
+    ax_ships.grid(True, linewidth=0.4, alpha=0.5)
     ax_ships.set_ylim(theme.ships_ylim)
 
     plot_style(
@@ -742,9 +738,7 @@ def plot_scheduling_figure(
         jd["vector_storage"],
         title="Stored Vector",
         ylabel="Mass Stored [kt]",
-        scatter=False,
         line_color=BURGUNDY,
-        theme=theme,
     )
 
     ship_fill_kt = [float(v) / 1000.0 for v in jd["cumulative_charge"]]
@@ -754,13 +748,10 @@ def plot_scheduling_figure(
         ship_fill_kt,
         title="Ship Fill",
         ylabel="Mass on Ships [kt]",
-        scatter=True,
         line_color=BURGUNDY,
-        scat_color=NAVY,
-        theme=theme,
     )
 
-    ax_fill.set_xlabel("Time [h]")
+    ax_fill.set_xlabel("Time [h]", fontsize=9)
     for ax in (ax_ships, ax_vec):
         ax.tick_params(labelbottom=False)
     _set_max_ticks(ax_fill, x_steps, max_ticks)
@@ -776,7 +767,6 @@ def plot_energy_management_figure(
     *,
     figsize: Tuple[float, float] = (12, 12),
     max_ticks: int = 10,
-    theme: PlotTheme = PlotTheme(),
 ):
     required = [
         "steps",
@@ -800,44 +790,24 @@ def plot_energy_management_figure(
     y_flux = _as_1d_float_array(jd["vector_flux"], name="vector_flux")
     _ensure_same_length(x_steps, y_flux, name_x="steps", name_y="vector_flux")
 
-    ax_trains_r.scatter(
-        x_steps,
-        y_flux,
-        color=NAVY,
-        s=theme.scatter_s,
-        alpha=theme.scatter_alpha,
-        zorder=2,
-    )
-    ax_trains_r.plot(x_steps, y_flux, color=NAVY, linewidth=theme.lw, alpha=0.9, zorder=3)
-    ax_trains_r.set_ylabel("Vector Flux [GJ/h]")
+    ax_trains_r.plot(x_steps, y_flux, color=NAVY, linewidth=1.8, zorder=3)
+    ax_trains_r.set_ylabel("Vector Flux [GJ/h]", fontsize=9)
 
     y_trains = _as_1d_float_array(jd["n_active_trains_conversion"], name="n_active_trains_conversion")
     _ensure_same_length(x_steps, y_trains, name_x="steps", name_y="n_active_trains_conversion")
 
-    ax_trains.scatter(
-        x_steps,
-        y_trains,
-        color=BURGUNDY,
-        s=theme.scatter_s,
-        alpha=theme.scatter_alpha,
-        zorder=2,
-    )
-    ax_trains.plot(x_steps, y_trains, color=BURGUNDY, linewidth=theme.lw, alpha=0.9, zorder=3)
+    ax_trains.plot(x_steps, y_trains, color=BURGUNDY, linewidth=1.8, zorder=3)
 
-    ax_trains.set_title("Conversion Process Throughput", pad=theme.title_pad)
-    ax_trains.set_ylabel("Active Trains [count]")
-    ax_trains.grid(True, alpha=theme.grid_alpha)
+    ax_trains.set_title("Conversion Process Throughput", fontsize=9, loc="left", pad=2)
+    ax_trains.set_ylabel("Active Trains [count]", fontsize=9)
+    ax_trains.grid(True, linewidth=0.4, alpha=0.5)
 
     h1 = plt.Line2D(
         [0],
         [0],
         color=BURGUNDY,
         linestyle="-",
-        linewidth=theme.lw,
-        marker="o",
-        markersize=4,
-        markerfacecolor=BURGUNDY,
-        markeredgewidth=0,
+        linewidth=1.8,
         label="Number Active Trains",
     )
     h2 = plt.Line2D(
@@ -845,14 +815,10 @@ def plot_energy_management_figure(
         [0],
         color=NAVY,
         linestyle="-",
-        linewidth=theme.lw,
-        marker="o",
-        markersize=4,
-        markerfacecolor=NAVY,
-        markeredgewidth=0,
+        linewidth=1.8,
         label="Vector Flux",
     )
-    ax_trains.legend(handles=[h1, h2], loc="lower center", fontsize=14, frameon=False)
+    ax_trains.legend(handles=[h1, h2], loc="best", fontsize=7, frameon=False)
 
     plot_style(
         ax_turb,
@@ -860,9 +826,7 @@ def plot_energy_management_figure(
         jd["energy_turbine"],
         title="Single Turbine Energy",
         ylabel="Energy [GJ/h]",
-        scatter=False,
         line_color=BURGUNDY,
-        theme=theme,
     )
 
     plot_style(
@@ -871,9 +835,7 @@ def plot_energy_management_figure(
         jd["energy_fuelcell"],
         title="Fuel Cell Energy",
         ylabel="Energy [GJ/h]",
-        scatter=False,
         line_color=BURGUNDY,
-        theme=theme,
     )
 
     h2_storage_t = [float(v) / 120.0 for v in jd["hydrogen_storage"]]
@@ -883,12 +845,10 @@ def plot_energy_management_figure(
         h2_storage_t,
         title="Hydrogen Storage",
         ylabel="Hydrogen Storage [t]",
-        scatter=False,
         line_color=BURGUNDY,
-        theme=theme,
     )
 
-    ax_h2.set_xlabel("Time [h]")
+    ax_h2.set_xlabel("Time [h]", fontsize=9)
     for ax in (ax_trains, ax_turb, ax_fc):
         ax.tick_params(labelbottom=False)
     _set_max_ticks(ax_h2, x_steps, max_ticks)

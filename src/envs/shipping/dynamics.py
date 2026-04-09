@@ -4,6 +4,7 @@ from meteor_py import GetData
 from math import ceil
 from .utils import temporal_align, generate_weather_forecast, count_and_shift_arrivals
 
+import numpy as np
 
 class Dynamics:
     def __init__(self, fast_data, slow_data, args):
@@ -12,7 +13,9 @@ class Dynamics:
         self._call_count = 0
         self._args = args
 
-        self._init_weather_data()
+        np.random.seed(args["seed"])
+
+        self._init_weather_data(args["seed"])
 
         self.new_states = None
         self.iter_count = 0
@@ -29,10 +32,10 @@ class Dynamics:
         self.expected_arrivals = {s: [] for s in fast_data["sets"]["ships"]}
         self.expected_destinations = {s: [] for s in fast_data["sets"]["ships"]}
 
-    def _init_weather_data(self):
+    def _init_weather_data(self, seed):
         weather_file = self._args["weather_data"]["weather_file"]
         self._weather_data = GetData([weather_file]).data()
-        self._weather_data = temporal_align(self._weather_data, randomise=True)
+        self._weather_data = temporal_align(self._weather_data, randomise=True, seed=seed)
 
     def _init_state_variables(self):
         p = self._fast_data["params"]
