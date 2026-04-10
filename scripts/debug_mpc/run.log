@@ -1,3 +1,0 @@
-[2m2026-04-09T14:32:34.563665Z[0m [[32m[1minfo     [0m] [1mmultisim_progress             [0m [36melapsed_seconds[0m=[35m3401.1294460000063[0m [36mn_success[0m=[35m43[0m [36mn_total[0m=[35m48[0m
-ar 'n_ship_ordered[small,0]' to a value `3.0213003910371553e-07` (float) not in domain Binary.
-WARNING:pyomo.core:Setting Var 'n_ship_ordered[small,0]' to a value `8.477845099534579e-07` (float) not in domain Binary.

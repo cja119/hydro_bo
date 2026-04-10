@@ -39,6 +39,8 @@ class RayMultiMPC:
         self._timeout = timeout
         self._exit_fraction = exit_fraction
 
+        if ray.is_initialized():
+            ray.shutdown()
         ray.init(num_cpus=num_devices, runtime_env={"env_vars": {"PYTHONPATH": _PROJECT_ROOT}})
 
     def run_multisim(self):
