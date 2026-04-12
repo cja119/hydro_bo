@@ -12,10 +12,16 @@ from pathlib import Path
 
 class Planning:
     def __init__(
-        self, uniqe_idx: str, weather_file: str, parameters: Optional[str] = None
+        self, uniqe_idx: str, weather_file: str, parameters: Optional[str] = None, tmp_dir: Optional[Path] = None
     ):
         """
         Initializes the planning model.
+
+        Args:
+            uniqe_idx: Unique identifier for this planning instance
+            weather_file: Path to weather data file
+            parameters: Optional parameters string
+            tmp_dir: Optional directory for tmp files. If None, uses caller's directory / tmp
         """
         self._weather_file = weather_file
         self._model = None
@@ -23,6 +29,7 @@ class Planning:
         self._outputs = None
         self._props = None
         self._idx = uniqe_idx
+        self._tmp_dir = tmp_dir
 
         if parameters is None:
             self._parameters = DefaultParams("default").formulation_parameters
@@ -74,8 +81,11 @@ class Planning:
         """
         Exits the planning model context.
         """
-
-        filepath = Path(__file__).parent.parent.parent / "tmp/planning"
+        if self._tmp_dir is None:
+            # Default to repository root / tmp / planning for backward compatibility
+            filepath = Path(__file__).parent.parent.parent / "tmp" / "planning"
+        else:
+            filepath = Path(self._tmp_dir) / "planning"
 
         if not filepath.exists():
             filepath.mkdir(parents=True, exist_ok=True)
@@ -125,8 +135,12 @@ class Planning:
         Returns the results of the planning model.
         """
         if target is None:
-            target = Path(__file__).parent.parent.parent / "tmp/planning"
-        print(target)
+            if self._tmp_dir is None:
+                # Default to repository root / tmp / planning for backward compatibility
+                target = Path(__file__).parent.parent.parent / "tmp" / "planning"
+            else:
+                target = Path(self._tmp_dir) / "planning"
+
         self._res = PlanningResults(self._model)
 
         return self._res.extract_results(target)

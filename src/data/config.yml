@@ -47,12 +47,12 @@ formulations:
     "eqn2",
     "eqn3",
     "eqn4",
-    "eqn5", 
+    "eqn5",
     "eqn6",
     "eqn7",
     "eqn8",
     "eqn9",
-    "eqn10",  
+    "eqn10",
     "eqn11",
     "eqn12",
     "eqn13",
@@ -72,6 +72,7 @@ formulations:
     "cons16",
     "cons17",
     "cons18",
+    "cons19",
     "obj1"
     ]
   secondary: [
@@ -104,5 +105,6 @@ formulations:
     "cons16",
     "cons17",
     "cons18",
+    "cons19",
     "obj1"
     ]

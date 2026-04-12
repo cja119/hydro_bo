@@ -1,6 +1,8 @@
 parameters:
   mean_ship_arrival_time: 7
   std_ship_arrival_time: 0.25
+  hydrogen_storage_lower_fraction: 0.2
+  flare_allowed: 0
 
 variables:
   var1:

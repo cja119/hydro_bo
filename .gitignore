@@ -5,12 +5,12 @@
 **/__pycache__/
 /build/
 **/*.egg*
-src/tmp/bayesopt/*
-src/tmp/ray_results/*
-src/tmp/planning/*
-src/tmp/shipping_plots/*
+scripts/tmp/
 **/*.DS_Store
 .*
 !**/*/.gitkeep
 !**/*/.gitignore
 **/debug*
+test*.py
+**/*.png
+**/tmp

@@ -93,6 +93,9 @@ constraints:
   cons18:
     name: "storage_removal_limit"
     domain: ["grid0"]
+  cons19:
+    name: "vector_flare_bigm_constraint"
+    domain: ["grid0"]
 objectives:
   obj1: 
     name: "profit_target"

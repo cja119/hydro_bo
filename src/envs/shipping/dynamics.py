@@ -1,7 +1,7 @@
 from numpy.random import normal
 from pyomo.environ import value
 from meteor_py import GetData
-from math import ceil
+from math import floor
 from .utils import temporal_align, generate_weather_forecast, count_and_shift_arrivals
 
 import numpy as np
@@ -181,7 +181,7 @@ class Dynamics:
                 if new_remaining_latent < 1.0:
                     discrete_remaining = 0
                 else:
-                    discrete_remaining = max(0, int(ceil(new_remaining_latent)))
+                    discrete_remaining = max(0, int(floor(new_remaining_latent)))
                 updated_origin.append(discrete_remaining)
 
             for remaining_days in self.ship_origin_baseline[size]:
@@ -189,7 +189,7 @@ class Dynamics:
                 if new_remaining < 1.0:
                     discrete_remaining = 0
                 else:
-                    discrete_remaining = max(0, int(ceil(new_remaining)))
+                    discrete_remaining = max(0, int(floor(new_remaining)))
                 updated_baseline.append(discrete_remaining)
 
             # Keep expected arrivals aligned with perturbed ship ETAs so

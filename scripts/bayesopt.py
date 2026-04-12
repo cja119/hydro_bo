@@ -13,15 +13,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import os
 import yaml
 import numpy as np
+import csv
+from datetime import datetime
 
 from hydro_bo import configure_logging
+from src.algs.logging_config import get_logger
 from src.algs.dispatcher import RayMultiMPC
 from src.algs.bayesopt import BayesianOptimizer
 from src.envs.shipping.utils import calculate_capex_opex
 
 configure_logging()
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -31,14 +36,14 @@ PLANNING_MODEL   = "NH3-Chile.yml"
 VECTOR           = "NH3"
 RENEWABLES       = "wind"
 WEATHER_FILE     = "CoastalChile_15-20_Wind.csv"
-REFERENCE_PATH   = Path(__file__).parent.parent / "src/tmp/planning" / PLANNING_MODEL
+REFERENCE_PATH   = Path(__file__).parent / "tmp/planning" / PLANNING_MODEL
 
-BOUNDS_EXPANSION = 0.5        # ±50 % around reference values
+BOUNDS_EXPANSION = 0.5         # ±50 % around reference values
 VARIANCE_PENALTY = 0.5         # λ in: mean - λ * var
 N_INITIAL_POINTS = 8           # Sobol evaluations before BO starts
 BO_ITER_LIMIT    = 20          # BO iterations
-N_INSTANCES      = 8           # total MPC runs per BO evaluation (parallelised across NUM_DEVICES)
-NUM_DEVICES      = 4           # simultaneous instances
+N_INSTANCES      = 15           # total MPC runs per BO evaluation (parallelised across NUM_DEVICES)
+NUM_DEVICES      = os.cpu_count() - 1  # simultaneous instances
 TIMEOUT          = 900         # seconds per evaluation
 
 ENV_ARGS = {
@@ -121,8 +126,15 @@ def params_from_x(x: np.ndarray, ref: dict) -> dict:
 # Objective
 # ---------------------------------------------------------------------------
 
+# Global counter and results storage for logging
+_eval_counter = 0
+_results_log = []
+
 def objective(x: np.ndarray, ref: dict) -> float:
     """Evaluate mean - λ·var over N_INSTANCES MPC runs for parameter vector x."""
+    global _eval_counter
+    _eval_counter += 1
+
     params = params_from_x(x, ref)
 
     dispatcher = RayMultiMPC(
@@ -137,23 +149,105 @@ def objective(x: np.ndarray, ref: dict) -> float:
     scores = dispatcher.run_multisim()
 
     if not scores:
-        return -np.inf
+        objective_value = -np.inf
+    else:
+        scores_arr = np.array(scores, dtype=float)
+        mean_score = float(scores_arr.mean())
+        var_score = float(scores_arr.var())
+        objective_value = mean_score - VARIANCE_PENALTY * var_score
 
-    scores_arr = np.array(scores, dtype=float)
-    return float(scores_arr.mean() - VARIANCE_PENALTY * scores_arr.var())
+        # Log this evaluation with individual worker scores
+        result_entry = {
+            'eval_id': _eval_counter,
+            'timestamp': datetime.now().isoformat(),
+            'objective': objective_value,
+            'mean_score': mean_score,
+            'var_score': var_score,
+            'num_workers': len(scores),
+            'worker_scores': scores,
+        }
+
+        # Add all parameters to the log entry
+        for i, key in enumerate(PARAM_KEYS):
+            result_entry[key] = params[key]
+
+        result_entry['capex'] = params['capex']
+        result_entry['opex'] = params['opex']
+
+        _results_log.append(result_entry)
+
+        logger.info("bayesopt.evaluation",
+                   eval_id=_eval_counter,
+                   objective=objective_value,
+                   mean=mean_score,
+                   variance=var_score,
+                   n_workers=len(scores))
+
+    return objective_value
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+def save_results_to_files(results_log: list, bayesopt_dir: Path, run_timestamp: str):
+    """Save results to both CSV and JSON files."""
+    # Create the bayesopt directory
+    bayesopt_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save summary CSV (one row per evaluation)
+    csv_path = bayesopt_dir / f"bo_results_{run_timestamp}.csv"
+    with open(csv_path, 'w', newline='') as f:
+        if not results_log:
+            return
+
+        # Define CSV columns
+        fieldnames = ['eval_id', 'timestamp', 'objective', 'mean_score', 'var_score', 'num_workers']
+        fieldnames.extend(PARAM_KEYS)
+        fieldnames.extend(['capex', 'opex'])
+
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+        writer.writeheader()
+
+        for entry in results_log:
+            # Create a copy without worker_scores for CSV
+            csv_entry = {k: v for k, v in entry.items() if k != 'worker_scores'}
+            writer.writerow(csv_entry)
+
+    logger.info("bayesopt.csv_saved", path=str(csv_path), n_evaluations=len(results_log))
+
+    # Save detailed JSON (includes individual worker scores)
+    json_path = bayesopt_dir / f"bo_results_detailed_{run_timestamp}.json"
+    import json
+    with open(json_path, 'w') as f:
+        json.dump(results_log, f, indent=2)
+
+    logger.info("bayesopt.json_saved", path=str(json_path))
+
+
 def run_bayesopt():
-    ref = load_reference(REFERENCE_PATH)
+    global _eval_counter, _results_log
+    _eval_counter = 0
+    _results_log = []
+
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bayesopt_dir = Path(__file__).parent / "tmp" / "bayesopt"
+
+    try:
+        ref = load_reference(REFERENCE_PATH)
+    except FileNotFoundError:
+        logger.error(
+            "bayesopt.missing_planning_model",
+            path=str(REFERENCE_PATH),
+            message=f"Planning model file not found. Please run the planning model first: python scripts/planning.py {VECTOR}"
+        )
+        return None, None
+
     bounds = build_bounds(ref, BOUNDS_EXPANSION)
 
-    print(f"[BO] Search space ({len(PARAM_KEYS)} dims):")
+    logger.info("bayesopt.search_space", dims=len(PARAM_KEYS))
     for key, (lo, hi) in zip(PARAM_KEYS, bounds):
-        print(f"  {key:35s}  [{lo:.3g}, {hi:.3g}]")
+        logger.info("bayesopt.parameter_bounds", parameter=key, lower=lo, upper=hi)
 
     bo = BayesianOptimizer(
         f=lambda x: objective(x, ref),
@@ -167,16 +261,19 @@ def run_bayesopt():
     best_x, best_score = bo.run()
 
     best_params = params_from_x(best_x, ref)
-    print("\n[BO] Optimisation complete.")
-    print(f"[BO] Best score: {best_score:.4f}")
-    print("[BO] Best parameters:")
+    logger.info("bayesopt.complete")
+    logger.info("bayesopt.best_score", score=best_score)
+    logger.info("bayesopt.best_parameters")
     for k, v in best_params.items():
-        print(f"  {k:35s}: {v}")
+        logger.info("bayesopt.parameter", name=k, value=v)
 
-    out_path = Path(__file__).parent.parent / "src/tmp/planning/NH3-Chile-bo.yml"
+    out_path = Path(__file__).parent / "tmp/planning/NH3-Chile-bo.yml"
     with open(out_path, "w") as f:
         yaml.dump(best_params, f, default_flow_style=False)
-    print(f"[BO] Best parameters saved to {out_path}")
+    logger.info("bayesopt.saved", path=str(out_path))
+
+    # Save all evaluation results
+    save_results_to_files(_results_log, bayesopt_dir, run_timestamp)
 
     return best_params, best_score
 

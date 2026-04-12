@@ -11,14 +11,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import yaml
 
 from hydro_bo import configure_logging
+from src.algs.logging_config import get_logger
 from src.algs.dispatcher import RayMultiMPC
 
 configure_logging()
+logger = get_logger(__name__)
 
-PLANNING_MODEL = "NH3-Chile.yml"
-VECTOR = "NH3"
+VECTOR = "LH2"
+PLANNING_MODEL = "{vector}-Chile.yml".format(vector=VECTOR)
 WEATHER_FILE = "CoastalChile_15-20_Wind.csv"
-PLANNING_MODEL_PATH = Path(__file__).parent.parent / "src/tmp/planning" / PLANNING_MODEL
+PLANNING_MODEL_PATH = Path(__file__).parent / "tmp/planning" / PLANNING_MODEL
+
+# Set to True to dump ILP/LP files on failure and exit early
+DUMP_DIAGNOSTICS_ON_FAILURE = True
 
 
 def load_planning_model(path: Path) -> dict:
@@ -37,23 +42,25 @@ ENV_ARGS = {
 
 def main():
     params = load_planning_model(PLANNING_MODEL_PATH)
-    print(f"[INFO] Loaded planning model: {PLANNING_MODEL_PATH}")
-    print(f"[INFO] Parameters: {params}")
+    logger.info("multi_mpc.loaded_model", path=str(PLANNING_MODEL_PATH))
+    logger.info("multi_mpc.parameters", params=params)
 
     dispatcher = RayMultiMPC(
         env_args=ENV_ARGS,
         param_overrides=params,
-        num_instances=48,
-        num_devices=8,
+        num_instances=144,
+        num_devices=12,
         timeout=900,
         exit_fraction=1.0,
+        dump_diagnostics_on_failure=DUMP_DIAGNOSTICS_ON_FAILURE,
     )
 
-    print("[INFO] RayMultiMPC initialised successfully.")
-    print(f"[INFO] num_instances={dispatcher._num_instances}, timeout={dispatcher._timeout}")
+    logger.info("multi_mpc.initialized",
+                num_instances=dispatcher._num_instances,
+                timeout=dispatcher._timeout)
 
     scores = dispatcher.run_multisim()
-    print(f"[INFO] run_multisim complete. Scores: {scores}")
+    logger.info("multi_mpc.simulation_complete", scores=scores)
 
     import matplotlib.pyplot as plt
 
@@ -61,8 +68,8 @@ def main():
     plt.title("Distribution of MPC Scores")
     plt.xlabel("Score")
     plt.ylabel("Frequency")
-    plt.savefig(Path(__file__).parent.parent / "src/tmp/multi_mpc_scores.png")
-    print(f"[INFO] Score distribution plot saved to src/tmp/multi_mpc_scores.png")
+    plt.savefig(Path(__file__).parent / "tmp/multi_mpc_scores.png")
+    logger.info("multi_mpc.plot_saved", path="scripts/tmp/multi_mpc_scores.png")
 
 
 if __name__ == "__main__":

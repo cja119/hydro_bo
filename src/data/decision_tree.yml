@@ -1,0 +1,21 @@
+
+presidence_order:
+  - vector_flare
+  - hydrogen_storage_zero_bound
+  - flare_with_storage_zero_bound
+  - storage_violation
+
+
+vector_flare:
+  - flare_allowed = 1
+
+hydrogen_storage_zero_bound:
+  - hydrogen_storage_lower_fraction = 0
+
+flare_with_storage_zero_bound:
+  - flare_allowed = 1
+  - hydrogen_storage_lower_fraction = 0
+
+storage_violation:
+  - hydrogen_storage_lower_fraction = -inf
+  - flare_allowed = 1
