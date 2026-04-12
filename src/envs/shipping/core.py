@@ -424,6 +424,9 @@ class ShippingEnvPlot(ShippingEnv):
 
                 yield self._controller.render()
 
+            # Log per-type relaxation usage for this simulation run
+            self._controller.log_relaxation_summary()
+
             profit_inc = 0
             if results is not None:
                 profit_inc = results.get(("actual_profit", 0), 0) - prev_profit

@@ -38,7 +38,7 @@ Navigate to ./scripts/ and run the following:
 python planning.py "NH3" # Or LH2
 ```
 
-This will generate a results file in ./src/tmp/planning that will then be accessed by your optimisation run.
+This will generate a results file in ./scripts/tmp/planning that will then be accessed by your optimisation run.
 
 ## Run the Bayesian Optimisation
 
@@ -46,7 +46,7 @@ This will generate a results file in ./src/tmp/planning that will then be access
 python bayesopt.py "NH3" # Or LH2
 ```
 
-This will save results in ./src/tmp/ray_results.
+This will save results in ./scripts/tmp/ray_results.
 
 ## Visualising Trajectories
 

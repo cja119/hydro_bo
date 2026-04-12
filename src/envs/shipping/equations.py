@@ -152,6 +152,9 @@ def vector_production(m, t):
 def vector_storage_balance(m, t):
     """
     Vector storage balance equation for the lower production problem.
+
+    Storage balance: storage_change = production - shipping - flaring
+    Rearranged: storage_change - production + shipping + flaring = 0
     """
     if t == 0:
         if m.fixed.value is True:
@@ -159,10 +162,10 @@ def vector_storage_balance(m, t):
         else:
             return m.vector_storage[t] == 0.5 * m.vector_storage_capacity
     eqn = 0
-    eqn += (m.vector_storage[t] - m.vector_storage[t - 1]) * 1000
-    eqn -= m.vector_flux[t] * m.conversion_fugitive_efficiency / m.calorific_value
-    eqn += m.ship_charge_rate[t]
-    eqn += m.vector_flared[t]
+    eqn += (m.vector_storage[t] - m.vector_storage[t - 1]) * 1000  # storage change
+    eqn -= m.vector_flux[t] * m.conversion_fugitive_efficiency / m.calorific_value  # - production
+    eqn += m.ship_charge_rate[t]  # + shipping (outflow)
+    eqn += m.vector_flared[t]  # + flaring (outflow)
 
     return eqn == 0
 
@@ -171,22 +174,22 @@ def shipping_balance(m, t):
     """
     Shipping balance equation for the lower production problem.
     """
-    if t == 0 and m.fixed.value is True:
-        return Constraint.Skip
+    if t == 0:
+        if m.fixed.value is True:
+            return Constraint.Skip
+        else:
+            return m.cumulative_charge[t] == 0
 
     eqn = 0
-
-    if m.fixed.value is True:
-        eqn -= m.cumulative_charge[0]
-
+        
     eqn += m.cumulative_charge[t]
+    eqn -= m.cumulative_charge[t-1]
 
-    eqn -= sum(m.ship_charge_rate[_t] for _t in range(t + 1))
+    eqn -= m.ship_charge_rate[t]
 
     if t % 24 == 0:
         eqn += sum(
-            m.n_ship_sent[s, _t] * m.ship_capacity[s]
-            for _t in range(24, t + 1, 24)
+            m.n_ship_sent[s, t] * m.ship_capacity[s]
             for s in m.ships
         )
 
@@ -229,7 +232,7 @@ def lower_hydrogen_storage_limit(m, t):
         return Constraint.Skip
     cons = 0
 
-    cons += m.hydrogen_storage_capacity * 0.2
+    cons += m.hydrogen_storage_capacity * m.hydrogen_storage_lower_fraction
     cons -= m.hydrogen_storage[t]
 
     return cons <= 0
@@ -618,6 +621,19 @@ def actual_profit_eq(m, t):
     eqn += (m.capex + m.opex) * crf
 
     return eqn == 0
+
+
+def vector_flare_bigm_constraint(m, t):
+    """
+    Big-M constraint to force vector_flared to 0 when flare_allowed = 0.
+    When flare_allowed = 1, this constraint is non-binding (M is large).
+    """
+    if t == 0 and m.fixed.value is True:
+        return Constraint.Skip
+
+    M = m.vector_storage_capacity * 1000  
+
+    return m.vector_flared[t] <= M * m.flare_allowed
 
 
 def profit_target(m):

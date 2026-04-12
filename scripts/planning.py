@@ -1,11 +1,19 @@
-from sys import argv
 
-from hydro_bo import Planning
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from hydro_bo import Planning, configure_logging
+from src.algs.logging_config import get_logger
+
+configure_logging()
+logger = get_logger(__name__)
 
 
 def run_planning(vector_type: str):
+    tmp_dir = Path(__file__).parent / "tmp"
     environment = Planning(
-        f"{vector_type}-Chile", weather_file="CoastalChile_15-20_Wind.csv"
+        f"{vector_type}-Chile", weather_file="CoastalChile_15-20_Wind.csv", tmp_dir=tmp_dir
     )
 
     with environment as env:
@@ -21,8 +29,8 @@ def run_planning(vector_type: str):
 
 
 if __name__ == "__main__":
-    assert argv[1] in ["NH3", "LH2"], "Please provide a valid vector type: NH3 or LH2"
+    assert sys.argv[1] in ["NH3", "LH2"], "Please provide a valid vector type: NH3 or LH2"
 
-    print(f"[INFO] Running planning model for: {argv[1]}")
-    run_planning(argv[1])
-    print(f"[INFO] Planning completed, results saved to src/tmp/planning/{argv[1]}-Chile.yml")
+    logger.info("planning.start", vector=sys.argv[1])
+    run_planning(sys.argv[1])
+    logger.info("planning.complete", vector=sys.argv[1], results_path=f"scripts/tmp/planning/{sys.argv[1]}-Chile.yml")

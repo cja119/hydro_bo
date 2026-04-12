@@ -4,10 +4,13 @@ MPC Controller Core Module
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import sys
 import time
-from typing import Optional
+from datetime import datetime
+from typing import Optional, Dict, Any
 
 from pyomo.environ import (
     AbstractModel,
@@ -24,6 +27,7 @@ from pyomo.opt import TerminationCondition
 
 from algs.logging_config import get_logger
 from algs.utils import ext_visualise_output, suppress_output
+from algs.relaxation import ContiguityHandler, RelaxationTree
 
 # Configure structured logger
 logger = get_logger(__name__)
@@ -71,6 +75,18 @@ class MPCController:
         self._cache_enabled = True
         self._call_count = 0
         self._start_time = time.perf_counter()
+        self.contiguity = ContiguityHandler()
+        self.relaxation_tree = RelaxationTree()
+        self._relaxation_stats = {"total_relaxations": 0, "relaxations_per_solve": [], "relaxations_by_type": {}}
+        # Cached initial conditions from the most recent update() call.
+        # Overwritten each window; dumped to JSON on solve failure.
+        self._last_handoff_cache = None
+        # Uncertain-vector caches: current window and the one before it.
+        # Rotated each update(); both dumped to JSON on solve failure.
+        self._current_uncertain_cache = None
+        self._prev_uncertain_cache = None
+        # First solve includes t=0 ship orders (no previous window to inherit them).
+        self._first_solve = True
 
     # --- Public Interface Methods --- #
 
@@ -141,32 +157,51 @@ class MPCController:
                 total_setup_ms=ms(instance_time + bind_time)
             )
 
-        # Solve model (persistent solver doesn't need instance parameter)
-        solve_call_start = time.perf_counter()
-        with suppress_output(supress):
-            import warnings
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message="Setting Var.*not in domain")
-                self.results = self.solver.solve(tee=not supress, warmstart=False)
-        solve_call_time = time.perf_counter() - solve_call_start
+        # Reset relaxation tree to root for this solve iteration
+        self.relaxation_tree.reset()
+        relaxation_count = 0
+        done = False
 
-        # Check if optimal
-        if self.results.solver.termination_condition != TerminationCondition.optimal:
-            logger.warning(
-                "solve_failed",
-                termination_condition=str(self.results.solver.termination_condition),
-                solve_time_ms=solve_call_time * 1000
-            )
+        while not done:
+            # Solve model (persistent solver doesn't need instance parameter)
+            solve_call_time, termination_condition = self._execute_solve_call(supress)
 
-            # If infeasible, write LP file and compute IIS for debugging
-            tc = self.results.solver.termination_condition
-            if tc == TerminationCondition.infeasible or tc == TerminationCondition.infeasibleOrUnbounded:
-                self._diagnose_infeasibility()
+            # Check if optimal
+            if termination_condition != TerminationCondition.optimal:
+                # Try to apply next relaxation from decision tree
+                relaxation_params = self.relaxation_tree.get_next_relaxation(str(termination_condition))
 
-            raise MPCSolveError(
-                termination_condition=self.results.solver.termination_condition,
-                message=getattr(self.results.solver, "message", None),
-            )
+                if relaxation_params is None:
+                    # Decision tree exhausted, save diagnostic files
+                    print(f"[MPC] Relaxation tree exhausted after {relaxation_count} attempts, termination: {termination_condition}", file=sys.stderr, flush=True)
+
+                    # Dump cached initial conditions from the previous window handoff.
+                    self._dump_failed_initial_conditions(termination_condition)
+
+                    # Save diagnostic ILP/LP files for debugging
+                    self._diagnose_infeasibility()
+
+                    raise MPCSolveError(
+                        termination_condition=termination_condition,
+                        message=getattr(self.results.solver, "message", None),
+                    )
+
+                # Apply relaxation parameters to the model
+                self._apply_relaxation_params(relaxation_params)
+                relaxation_count += 1
+
+                # Continue loop to retry solve with relaxed constraints
+                continue
+
+            # Solve succeeded
+            done = True
+
+        # Track which relaxation type actually succeeded (if any)
+        if relaxation_count > 0 and self.relaxation_tree.last_applied is not None:
+            successful_relaxation = self.relaxation_tree.last_applied["name"]
+            by_type = self._relaxation_stats["relaxations_by_type"]
+            by_type[successful_relaxation] = by_type.get(successful_relaxation, 0) + 1
+
         # Extract output
         result = self.output()
 
@@ -175,13 +210,19 @@ class MPCController:
 
         self._call_count += 1
 
+        # Track relaxation statistics
+        self._relaxation_stats["relaxations_per_solve"].append(relaxation_count)
+        self._relaxation_stats["total_relaxations"] += relaxation_count
+
         logger.info(
             "solve_complete",
             call_count=self._call_count,
             solve_call_ms=ms(solve_call_time),
             total_ms=ms(total_time),
             is_first_solve=not self._instance_bound,
-            time_elapsed=minute_second(elapsed_seconds)
+            time_elapsed=minute_second(elapsed_seconds),
+            relaxations_applied=relaxation_count,
+            total_relaxations=self._relaxation_stats["total_relaxations"]
         )
 
         return result
@@ -232,20 +273,39 @@ class MPCController:
 
         # Order for gurobi_persistent:
         # 1 unfix all previously fixed variables
-        # 2 update stochastic parameters 
+        # 2 update stochastic parameters
         # 3 fix initial conditions
 
         if self.instance is not None:
-            self._unfix_all_variables(self.instance)
+            num_unfixed = self.contiguity.unfix_all_variables(
+                self.instance, self.solver, self._instance_bound
+            )
 
         stochastic_start = time.perf_counter()
         self.stochastic_update(data=stochastic_values)
         stochastic_time = time.perf_counter() - stochastic_start
 
+        # Cache the handoff values being applied; overwrite previous cache each window.
+        self._last_handoff_cache = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "window_index": self._call_count,
+            "start_values": {
+                str(k): (v if isinstance(v, (int, float, bool, str, type(None))) else repr(v))
+                for k, v in start_values.items()
+            },
+        }
+
+        # Rotate uncertain-vector caches before overwriting with this window's values.
+        self._prev_uncertain_cache = self._current_uncertain_cache
+        self._current_uncertain_cache = self._extract_uncertain_vectors(stochastic_values)
+
         start_values_apply_start = time.perf_counter()
         # Only apply start values if instance exists (after first solve)
         if self.instance is not None:
-            self._apply_start_values(self.instance, start_values)
+            fixed_by_name = self.contiguity.apply_start_values(
+                self.instance, self.solver, start_values,
+                self._instance_bound, self._clean_variable_value
+            )
         start_values_time = time.perf_counter() - start_values_apply_start
 
         refresh_start = time.perf_counter()
@@ -281,9 +341,12 @@ class MPCController:
         stochastic_output = {}
         stored_val = 0.0
 
-        # Extract ships sent / ordered
-        ordered_ship, sent_ship = self._ship_orders(solve, time_step)
-        sent_vol_by_ship = self._sent_volumes(solve, time_step)
+        # Extract ships sent / ordered.
+        # t=0 is only counted on the first window (no prior window to inherit from).
+        t_start = 0 if self._first_solve else 24
+        self._first_solve = False
+        ordered_ship, sent_ship = self._ship_orders(solve, time_step, t_start)
+        sent_vol_by_ship = self._sent_volumes(solve, time_step, t_start)
 
         # Setting these in outputs
         stochastic_output["ordered_ship"] = ordered_ship
@@ -378,91 +441,65 @@ class MPCController:
         if not enabled:
             self.clear_cache()
 
-    def stochastic_update(self, data: Optional[dict] = None):
-        # If instance doesn't exist yet, we can't update parameters
-        # The first solve will create the instance with current parameter values
-        if self.instance is None:
-            logger.info("stochastic_update_skipped", reason="instance_not_created")
+    def get_relaxation_stats(self) -> Dict[str, Any]:
+        """Get relaxation statistics for reporting.
+
+        Returns:
+            Dictionary with relaxation statistics including:
+            - total_relaxations: Total relaxations across all solves
+            - relaxations_per_solve: List of relaxation counts per solve
+            - avg_relaxations: Average relaxations per solve
+            - max_relaxations: Maximum relaxations in a single solve
+        """
+        stats = dict(self._relaxation_stats)
+        if stats["relaxations_per_solve"]:
+            stats["avg_relaxations"] = sum(stats["relaxations_per_solve"]) / len(stats["relaxations_per_solve"])
+            stats["max_relaxations"] = max(stats["relaxations_per_solve"])
+        else:
+            stats["avg_relaxations"] = 0.0
+            stats["max_relaxations"] = 0
+
+        return stats
+
+    def log_relaxation_summary(self):
+        """Log per-type relaxation usage as % of solve windows.
+
+        Only counts relaxations that were applied AND led to a successful solve.
+        Called at the end of a simulation run.
+        """
+        total_windows = self._call_count
+        if total_windows == 0:
             return
 
-        # Update parameters on the instance
-        target = self.instance
-        params_updated = {}
+        by_type = self._relaxation_stats["relaxations_by_type"]
+        if not by_type:
+            logger.info("relaxation_summary", total_windows=total_windows,
+                        message="no relaxations used")
+            return
 
-        for key, param in data.items():
-            if param["param"]["initialize"] is not None:
-                try:
-                    param_obj = getattr(target, key, None)
+        summary = {}
+        for rtype, count in by_type.items():
+            pct = (count / total_windows) * 100
+            summary[rtype] = {"count": count, "pct": round(pct, 1)}
 
-                    if param_obj is None:
-                        raise RuntimeError(
-                            f"Parameter '{key}' not found on instance. "
-                            f"This indicates a structural change which is incompatible with gurobi_persistent."
-                        )
+        logger.info("relaxation_summary",
+                    total_windows=total_windows,
+                    by_type=summary)
 
-                    if param["param"]["set"] is not None:
-                        # For indexed parameters, update each index individually
-                        init_data = param["param"]["initialize"]
-                        param_set = param["param"]["set"]
+        # Human-readable stderr output
+        print(f"[MPC] Relaxation summary ({total_windows} windows):", file=sys.stderr, flush=True)
+        for rtype, info in summary.items():
+            print(f"  {rtype}: {info['count']}/{total_windows} windows ({info['pct']}%)",
+                  file=sys.stderr, flush=True)
 
-                        if isinstance(init_data, dict):
-                            # Dict format: keys are indices
-                            for idx, val in init_data.items():
-                                if idx in param_obj:
-                                    param_obj[idx] = val
-                        elif isinstance(init_data, (list, tuple)):
-                            # List/tuple format: indices come from the set
-                            if isinstance(param_set, (list, tuple)):
-                                for idx, val in zip(param_set, init_data):
-                                    if idx in param_obj:
-                                        param_obj[idx] = val
-                            else:
-                                raise RuntimeError(
-                                    f"Parameter '{key}' has list/tuple initialize but set is not a list/tuple. "
-                                    f"This indicates a structural change which is incompatible with gurobi_persistent."
-                                )
-                        else:
-                            raise RuntimeError(
-                                f"Parameter '{key}' has a set but initialize is not a dict/list/tuple. "
-                                f"This indicates a structural change which is incompatible with gurobi_persistent."
-                            )
-                    else:
-                        # For scalar parameters, use set_value
-                        if hasattr(param_obj, "set_value"):
-                            param_obj.set_value(param["param"]["initialize"])
-                        else:
-                            # Scalar parameter, direct assignment
-                            param_obj.value = param["param"]["initialize"]
+    def stochastic_update(self, data: Optional[dict] = None):
+        """Update stochastic parameters using the ContiguityHandler handler."""
+        params_updated = self.contiguity.apply_parameter_updates(
+            self.instance, self.solver, data, self._instance_bound
+        )
 
-                    # Track parameter updates
-                    signature = self._parameter_signature(init_data)
-                    params_updated[key] = {
-                        "type": "indexed" if param["param"]["set"] is not None else "scalar",
-                        "num_values": len(init_data) if isinstance(init_data, (dict, list, tuple)) else 1,
-                        "signature": signature,
-                    }
-
-                except (AttributeError, KeyError) as e:
-                    raise RuntimeError(
-                        f"Failed to update parameter '{key}': {e}. "
-                        f"This indicates a structural change which is incompatible with gurobi_persistent. "
-                        f"All parameter updates must be in-place (no structural changes)."
-                    ) from e
-
-                # These keys will be used to grab the output
-                if param["loc"] == "endogenous":
-                    if self._update_keys is None:
-                        self._update_keys = {key: param["name"]}
-                    elif key not in self._update_keys:
-                        self._update_keys[key] = param["name"]
-
-        if self._instance_bound and hasattr(self.solver, '_solver_model'):
-            try:
-                gurobi_model = self.solver._solver_model
-                gurobi_model.update()
-                logger.info("gurobi_model_updated_after_params")
-            except Exception as e:
-                logger.warning("failed_to_update_gurobi_model", error=str(e))
+        # Sync update keys from relaxation handler
+        self._update_keys = self.contiguity.get_update_keys()
 
     def visualise_output(self, time_step: int = 24):
         if self._fig is None:
@@ -483,47 +520,6 @@ class MPCController:
 
         self._run_count += 1
 
-    def _apply_start_values(self, model, start_values):
-        # Fix variables at t=0 to ensure continuity between MPC solves
-        # These represent the end state from the previous solve's horizon
-        fixed_vars = []
-        fixed_by_name = {}
-
-        for var in model.component_objects(Var, active=True):
-            if var.name == "cumulative_profit":
-                continue
-            for index in var:
-                key = (var.name, index)
-                if key in start_values:
-                    cleaned = self._clean_variable_value(var[index], start_values[key])
-                    var[index].fix(cleaned)
-                    fixed_vars.append(var[index])
-
-                    # Track for logging
-                    if var.name not in fixed_by_name:
-                        fixed_by_name[var.name] = 0
-                    fixed_by_name[var.name] += 1
-
-        # Notify persistent solver of fixed variables if instance is bound
-        if self._instance_bound and hasattr(self.solver, 'update_var'):
-            for var_obj in fixed_vars:
-                self.solver.update_var(var_obj)
-
-    def _unfix_all_variables(self, model):
-        # Unfix all previously fixed variables before updating parameters
-        # This prevents conflicts when parameters change between solves
-        unfixed_vars = []
-        for var in model.component_objects(Var, active=True):
-            for index in var:
-                if var[index].fixed:
-                    var[index].unfix()
-                    unfixed_vars.append(var[index])
-
-        # Notify persistent solver of unfixed variables if instance is bound
-        if self._instance_bound and hasattr(self.solver, 'update_var'):
-            for var_obj in unfixed_vars:
-                self.solver.update_var(var_obj)
-
 
     def _refresh_persistent_solver_from_instance(self):
         """Rebuild persistent solver view from current instance state.
@@ -538,29 +534,74 @@ class MPCController:
 
         self.solver.set_instance(self.instance)
 
-    def _parameter_signature(self, init_data):
-        """Return a compact numeric signature for update diagnostics."""
-        if isinstance(init_data, dict):
-            vals = [v for v in init_data.values() if isinstance(v, (int, float))]
-            if not vals:
-                return "non_numeric_dict"
-            return {
-                "min": float(min(vals)),
-                "max": float(max(vals)),
-                "sum": float(sum(vals)),
-            }
-        if isinstance(init_data, (list, tuple)):
-            vals = [v for v in init_data if isinstance(v, (int, float))]
-            if not vals:
-                return "non_numeric_sequence"
-            return {
-                "min": float(min(vals)),
-                "max": float(max(vals)),
-                "sum": float(sum(vals)),
-            }
-        if isinstance(init_data, (int, float)):
-            return float(init_data)
-        return "non_numeric"
+    def _execute_solve_call(self, supress: bool = True):
+        """Execute the solver call with suppressed output and warning handling.
+
+        Args:
+            supress: Whether to suppress solver output
+
+        Returns:
+            Tuple of (solve_time_seconds, termination_condition)
+        """
+        solve_call_start = time.perf_counter()
+        with suppress_output(supress):
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="Setting Var.*not in domain")
+                warnings.filterwarnings("ignore", message="Loading a SolverResults object with a warning status")
+                warnings.filterwarnings("ignore", category=UserWarning, module="pyomo.core")
+                self.results = self.solver.solve(tee=not supress, warmstart=False)
+        solve_call_time = time.perf_counter() - solve_call_start
+
+        return solve_call_time, self.results.solver.termination_condition
+
+    def _apply_relaxation_params(self, relaxation_params: Dict[str, Any]):
+        """Apply relaxation parameters to the model instance.
+
+        Args:
+            relaxation_params: Dictionary of parameter names to new values
+        """
+        if self.instance is None:
+            logger.warning("cannot_apply_relaxation", reason="instance_not_created")
+            return
+
+        for param_name, new_value in relaxation_params.items():
+            try:
+                param_obj = getattr(self.instance, param_name, None)
+
+                if param_obj is None:
+                    logger.warning(
+                        "relaxation_param_not_found",
+                        param=param_name,
+                        value=new_value
+                    )
+                    continue
+
+                # Update parameter value
+                if hasattr(param_obj, "set_value"):
+                    param_obj.set_value(new_value)
+                else:
+                    param_obj.value = new_value
+
+                logger.info(
+                    "relaxation_param_applied",
+                    param=param_name,
+                    value=new_value
+                )
+
+            except Exception as e:
+                logger.error(
+                    "relaxation_param_failed",
+                    param=param_name,
+                    value=new_value,
+                    error=str(e)
+                )
+
+        # Rebuild persistent solver from updated Pyomo instance so Gurobi
+        # picks up the new param values (set_value alone doesn't propagate
+        # to the persistent solver's constraint matrix).
+        self._refresh_persistent_solver_from_instance()
+        logger.info("persistent_solver_refreshed_after_relaxation")
 
     def _build_sets(self, sets_def):
         for key, set_ in sets_def.items():
@@ -685,28 +726,28 @@ class MPCController:
         opts["Method"] = 2
         self._solver_configured = True
 
-    def _ship_orders(self, solve, time_step):
+    def _ship_orders(self, solve, time_step, t_start):
         ordered_ship = {
             s: sum(
                 value(getattr(solve, "n_ship_ordered")[s, t])
-                for t in range(0, time_step, 24)
+                for t in range(t_start, time_step + 1, 24)
             )
             for s in getattr(solve, "ships", [])
         }
         sent_ship = {
             s: sum(
                 value(getattr(solve, "n_ship_sent")[s, t])
-                for t in range(0, time_step, 24)
+                for t in range(t_start, time_step + 1, 24)
             )
             for s in getattr(solve, "ships", [])
         }
         return ordered_ship, sent_ship
 
-    def _sent_volumes(self, solve, time_step):
+    def _sent_volumes(self, solve, time_step, t_start):
         return {
             s: sum(
                 value(getattr(solve, "n_ship_sent")[s, t])
-                for t in range(0, time_step, 24)
+                for t in range(t_start, time_step + 1, 24)
             )
             * value(getattr(solve, "ship_capacity")[s])
             for s in getattr(solve, "ships", [])
@@ -721,6 +762,50 @@ class MPCController:
         vs0 = value(getattr(solve, "vector_storage")[0])
         cc0 = value(getattr(solve, "cumulative_charge")[0])
         return hs, vs, cc, cv, hs0, vs0, cc0
+
+    def _extract_uncertain_vectors(self, stochastic_values):
+        """Serialise a stochastic-values dict for JSON storage.
+
+        Handles nested dicts (e.g. {(ship, t): val}) and plain scalars.
+        Returns a dict with timestamp/window_index metadata plus the vectors.
+        """
+        def _safe(v):
+            return v if isinstance(v, (int, float, bool, str, type(None))) else repr(v)
+
+        serialised = {}
+        for k, v in stochastic_values.items():
+            if isinstance(v, dict):
+                serialised[str(k)] = {str(ki): _safe(vi) for ki, vi in v.items()}
+            else:
+                serialised[str(k)] = _safe(v)
+
+        return {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "window_index": self._call_count,
+            "uncertain_vectors": serialised,
+        }
+
+    def _dump_failed_initial_conditions(self, termination_condition):
+        """Write the cached handoff initial conditions and uncertain vectors to JSON for debugging."""
+        out_dir = os.path.join("debug_mpc")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "failed_initial_conditions.json")
+
+        payload = {
+            "termination_condition": str(termination_condition),
+            "failed_at_timestamp": datetime.utcnow().isoformat() + "Z",
+            "failed_at_window_index": self._call_count,
+            "handoff_from_previous_window": self._last_handoff_cache,
+            "current_window_uncertain_vectors": self._current_uncertain_cache,
+            "previous_window_uncertain_vectors": self._prev_uncertain_cache,
+        }
+
+        try:
+            with open(out_path, "w") as fh:
+                json.dump(payload, fh, indent=2)
+            print(f"[MPC] Failed initial conditions written to {out_path}", file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f"[MPC] Could not write failed_initial_conditions.json: {exc}", file=sys.stderr, flush=True)
 
     def _diagnose_infeasibility(self):
         """
