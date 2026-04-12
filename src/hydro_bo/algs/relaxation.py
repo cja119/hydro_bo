@@ -8,7 +8,7 @@ constraint relaxation strategies for handling infeasible solves.
 
 from typing import Optional, Dict, Any
 from pyomo.environ import Var
-from algs.logging_config import get_logger
+from hydro_bo.algs.logging_config import get_logger
 
 logger = get_logger(__name__)
 

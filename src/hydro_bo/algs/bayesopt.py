@@ -6,17 +6,19 @@ and Sobol quasi-random initial sampling.
 from abc import ABC, abstractmethod
 from typing import Callable, Sequence
 
+import os
+os.environ.setdefault("JAX_ENABLE_X64", "1")
+
 import numpy as np
 from scipy.stats.qmc import Sobol
 
-from algs.logging_config import get_logger
+from hydro_bo.algs.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 def _jax():
     """Lazy accessor for jax — import on first call."""
     import jax
-    jax.config.update("jax_enable_x64", True)
     return jax
 
 def _jnp():
@@ -48,7 +50,7 @@ class GaussianProcessRegressor:
         self.data = gpx.Dataset(X=X, y=y)
         likelihood = gpx.likelihoods.Gaussian(num_datapoints=X.shape[0])
         posterior = self._prior * likelihood
-        objective = gpx.objectives.ConjugateMLL(negative=True)
+        objective = gpx.objectives.conjugate_mll
         posterior, loss = gpx.fit_lbfgs(
             model=posterior,
             objective=objective,

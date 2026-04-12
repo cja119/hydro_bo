@@ -25,9 +25,9 @@ from pyomo.environ import (
 )
 from pyomo.opt import TerminationCondition
 
-from algs.logging_config import get_logger
-from algs.utils import ext_visualise_output, suppress_output
-from algs.relaxation import ContiguityHandler, RelaxationTree
+from hydro_bo.algs.logging_config import get_logger
+from hydro_bo.algs.utils import ext_visualise_output, suppress_output
+from hydro_bo.algs.relaxation import ContiguityHandler, RelaxationTree
 
 # Configure structured logger
 logger = get_logger(__name__)

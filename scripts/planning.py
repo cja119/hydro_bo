@@ -4,7 +4,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hydro_bo import Planning, configure_logging
-from src.algs.logging_config import get_logger
+from hydro_bo.algs.logging_config import get_logger
 
 configure_logging()
 logger = get_logger(__name__)

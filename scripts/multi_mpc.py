@@ -11,8 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import yaml
 
 from hydro_bo import configure_logging
-from src.algs.logging_config import get_logger
-from src.algs.dispatcher import RayMultiMPC
+from hydro_bo.algs.logging_config import get_logger
+from hydro_bo.algs.dispatcher import RayMultiMPC
 
 configure_logging()
 logger = get_logger(__name__)
