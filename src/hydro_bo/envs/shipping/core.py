@@ -5,8 +5,8 @@ control optimiser for the shipping problem.
 
 from __future__ import annotations
 
-from algs.logging_config import get_logger
-from algs.mpc import MPCController, MPCSolveError
+from hydro_bo.algs.logging_config import get_logger
+from hydro_bo.algs.mpc import MPCController, MPCSolveError
 from .utils import (
     PlotTheme,
     apply_theme,

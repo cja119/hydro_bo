@@ -53,7 +53,7 @@ where = ["src"]
 include = ["*"]
 
 [tool.setuptools.package-data]
-"h2_gym" = [
-    "data/**/*.yml",
-    "data/**/*.csv"
-            ]
+"hydro_bo" = [
+    "data/*.yml",
+    "data/*.csv"
+]

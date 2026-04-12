@@ -2,7 +2,7 @@
 Env Manager for Shipping Environment
 """
 
-from envs.shipping.core import ShippingEnv, ShippingEnvPlot
+from hydro_bo.envs.shipping.core import ShippingEnv, ShippingEnvPlot
 
 
 def ShippingEnvManager(version: str = "v1"):

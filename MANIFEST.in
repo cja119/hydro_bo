@@ -1,2 +1,1 @@
-recursive-include h2_gym/data *.py *.csv *.yml
-recursive-include h2_gym/data *.yml
+recursive-include src/hydro_bo/data *.py *.csv *.yml

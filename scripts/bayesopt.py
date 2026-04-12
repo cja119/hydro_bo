@@ -1,11 +1,5 @@
 """
 Bayesian optimisation over the MPC planning model parameters.
-
-Objective: maximise   mean(scores) - penalty * var(scores)
-           where scores are reward/tonne values from RayMultiMPC.run_multisim()
-
-Search space: ±BOUNDS_EXPANSION % around a reference planning model file.
-              capex/opex are recomputed from calculate_capex_opex at each sample.
 """
 
 import sys
@@ -13,6 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import argparse
 import os
 import yaml
 import numpy as np
@@ -20,10 +15,10 @@ import csv
 from datetime import datetime
 
 from hydro_bo import configure_logging
-from src.algs.logging_config import get_logger
-from src.algs.dispatcher import RayMultiMPC
-from src.algs.bayesopt import BayesianOptimizer
-from src.envs.shipping.utils import calculate_capex_opex
+from hydro_bo.algs.logging_config import get_logger
+from hydro_bo.algs.dispatcher import RayMultiMPC
+from hydro_bo.algs.bayesopt import BayesianOptimizer
+from hydro_bo.envs.shipping.utils import calculate_capex_opex
 
 configure_logging()
 logger = get_logger(__name__)
@@ -230,8 +225,9 @@ def run_bayesopt():
     _eval_counter = 0
     _results_log = []
 
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    bayesopt_dir = Path(__file__).parent / "tmp" / "bayesopt"
+    now = datetime.now()
+    run_timestamp = now.strftime("%Y%m%d_%H%M%S")
+    bayesopt_dir = Path(__file__).parent / "tmp" / now.strftime("%Y-%m-%d") / now.strftime("%H-%M-%S") / VECTOR
 
     try:
         ref = load_reference(REFERENCE_PATH)
@@ -278,5 +274,38 @@ def run_bayesopt():
     return best_params, best_score
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Bayesian optimisation over MPC planning model parameters.")
+    parser.add_argument("--vector",       type=str,   default=VECTOR,           help="Hydrogen vector (default: %(default)s)")
+    parser.add_argument("--iter_budget",  type=int,   default=BO_ITER_LIMIT,    help="Number of BO iterations (default: %(default)s)")
+    parser.add_argument("--scale_factor", type=float, default=BOUNDS_EXPANSION, help="±bounds expansion fraction (default: %(default)s)")
+    parser.add_argument("--ncpus",        type=int,   default=NUM_DEVICES,      help="Number of parallel MPC workers (default: %(default)s)")
+    parser.add_argument("--nsobol",       type=int,   default=N_INITIAL_POINTS, help="Sobol evaluations before BO starts (default: %(default)s)")
+    parser.add_argument("--n_sim",        type=int,   default=None,
+                        help="Total MPC runs per BO evaluation. Defaults to --ncpus (one per CPU) if not given.")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+
+    # Override module-level constants from CLI arguments
+    VECTOR           = args.vector
+    BO_ITER_LIMIT    = args.iter_budget
+    BOUNDS_EXPANSION = args.scale_factor
+    NUM_DEVICES      = args.ncpus
+    N_INITIAL_POINTS = args.nsobol
+    N_INSTANCES      = args.n_sim if args.n_sim is not None else args.ncpus
+
+    # Derive vector-dependent paths/config from the (possibly overridden) VECTOR
+    PLANNING_MODEL = f"{VECTOR}-Chile.yml"
+    REFERENCE_PATH = Path(__file__).parent / "tmp/planning" / PLANNING_MODEL
+    ENV_ARGS = {
+        "config": {
+            "vector": VECTOR,
+            "mpc": {"planning_model": PLANNING_MODEL},
+            "weather_data": {"weather_file": WEATHER_FILE},
+        },
+    }
+
     run_bayesopt()

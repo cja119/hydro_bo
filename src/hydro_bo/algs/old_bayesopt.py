@@ -17,8 +17,8 @@ from ray.tune.schedulers import ASHAScheduler
 from ray.tune.search import ConcurrencyLimiter
 from ray.tune.search.optuna import OptunaSearch
 
-from envs.shipping.utils import calculate_capex_opex
-from algs.utils import ensure_dirs, parse_memory_string
+from hydro_bo.envs.shipping.utils import calculate_capex_opex
+from hydro_bo.algs.utils import ensure_dirs, parse_memory_string
 
 
 

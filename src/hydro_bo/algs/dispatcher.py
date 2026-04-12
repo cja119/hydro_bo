@@ -47,7 +47,7 @@ class RayMultiMPC:
 
     def run_multisim(self):
         import time as _time
-        from algs.logging_config import get_logger
+        from hydro_bo.algs.logging_config import get_logger
         from collections import Counter
 
         logger = get_logger(__name__)
