@@ -25,6 +25,24 @@ class Dynamics:
         self.states = self._init_state_variables()
         self.destination_storage = 0.5 * slow_data["params"]["storage_capacity"]
 
+        # Price dynamics (OU + jump diffusion) — toggled via config.yml price_dynamics.enabled
+        pd_cfg = fast_data.get("price_dynamics", {})
+        if pd_cfg.get("enabled", False):
+            self._price_dynamics = PriceDynamics(
+                volatility=float(pd_cfg.get("sigma", 0.7)),
+                long_run_log_price=float(pd_cfg.get("mu", 1.6094)),
+                speed=float(pd_cfg.get("kappa", 5.0)),
+                jump_intensity=float(pd_cfg.get("lambda", 12.0)),
+                jump_mu=float(pd_cfg.get("jump_mu", 0.05)),
+                jump_sigma=float(pd_cfg.get("jump_sigma", 0.2)),
+                initial_price=float(pd_cfg.get("initial_price", 5.0)),
+                seed=args["seed"],
+            )
+            self.h2_price = float(pd_cfg.get("initial_price", 5.0))
+        else:
+            self._price_dynamics = None
+            self.h2_price = 5.0
+
         self.ship_destination = {s: [] for s in fast_data["sets"]["ships"]}
         self.ship_origin = {s: [] for s in fast_data["sets"]["ships"]}
         self.ship_origin_latent = {s: [] for s in fast_data["sets"]["ships"]}
@@ -137,11 +155,21 @@ class Dynamics:
                     "initialize": expected_arrivals_indexed,
                 },
             },
+            "h2_price": {
+                "name": "h2_price",
+                "loc": "exogenous",
+                "param": {
+                    "set": None,
+                    "initialize": self.h2_price,
+                },
+            },
         }
 
     def simulate_shipping_dynamics(self):
         self._simulate_origin_shipping()
         self._decrement_ship_counters()
+        if self._price_dynamics is not None:
+            self.h2_price = float(self._price_dynamics.step(dt=1 / 365))
         self.idx += 24
         self.iter_count += 1
 
@@ -242,3 +270,66 @@ class Dynamics:
             "idx_hour": self.idx,
             "ship_tracking": per_ship,
         }
+    
+class PriceDynamics:
+    def __init__(
+        self,
+        volatility,         # annual sigma
+        long_run_log_price, # long-run mean of log-price
+        speed,              # mean reversion speed (kappa)
+        jump_intensity,     # annual lambda
+        jump_mu,            # mean jump (log space)
+        jump_sigma,         # jump volatility (log space)
+        initial_price,
+        seed=None
+    ):
+        self.sigma = volatility
+        self.mu = long_run_log_price
+        self.kappa = speed
+        self.lambda_ = jump_intensity
+
+        self.jump_mu = jump_mu
+        self.jump_sigma = jump_sigma
+
+        self.price = initial_price
+
+        if seed is not None:
+            np.random.seed(seed)
+
+    def step(self, dt=1/365):
+        """
+        Exact OU discretisation + jump diffusion
+        """
+        X = np.log(self.price)
+
+        # Precompute constants
+        exp_kdt = np.exp(-self.kappa * dt)
+
+        # Mean term
+        mean = X * exp_kdt + self.mu * (1 - exp_kdt)
+
+        # Variance term (exact)
+        var = (self.sigma**2) * (1 - np.exp(-2 * self.kappa * dt)) / (2 * self.kappa)
+        std = np.sqrt(var)
+
+        # Gaussian shock
+        diffusion = std * np.random.normal()
+
+        # Jump component
+        jump = self._jump_step(dt)
+
+        # Update log-price
+        X_new = mean + diffusion + jump
+
+        # Back to price
+        self.price = np.exp(X_new)
+
+        return self.price
+
+    def _jump_step(self, dt):
+        """
+        Compound Poisson jump in log space
+        """
+        if np.random.rand() < self.lambda_ * dt:
+            return np.random.normal(self.jump_mu, self.jump_sigma)
+        return 0.0

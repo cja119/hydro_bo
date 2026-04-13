@@ -145,7 +145,9 @@ def import_mpc_data(
     for key, value in config.get("formulations", {}).items():
         forms[key] = value
 
-    return {"sets": sets, "params": params, "vars": vars, "forms": forms}
+    price_dynamics = config.get("price_dynamics", {"enabled": False})
+
+    return {"sets": sets, "params": params, "vars": vars, "forms": forms, "price_dynamics": price_dynamics}
 
 
 def import_mpc_functions(data_folder: str, sets: Mapping[str, Sequence[Any]]) -> Dict[str, Dict[str, Any]]:
@@ -229,6 +231,7 @@ def args_dict() -> Dict[str, Any]:
             "std_ship_arrival_time": 34,
         },
         "seed": 42,
+        "price_dynamics": {"enabled": False},
     }
 
 

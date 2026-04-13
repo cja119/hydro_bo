@@ -670,6 +670,15 @@ class MPCController:
             )
             getattr(self.model, "expected_ships").construct()
 
+        # h2_price: scalar hydrogen price ($/kg), updated each day via PriceDynamics
+        if not hasattr(self.model, "h2_price"):
+            setattr(
+                self.model,
+                "h2_price",
+                Param(initialize=5.0, within=Any, mutable=True)
+            )
+            getattr(self.model, "h2_price").construct()
+
     def _build_vars(self, vars_def):
         for key, var in vars_def.items():
             setattr(self.model, key, Var(*var["time_duration"], within=var["domain"]))
