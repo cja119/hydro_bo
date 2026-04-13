@@ -59,6 +59,10 @@ class ShippingEnv:
             )
         )
 
+        # Allow env args to override price_dynamics settings from config.yml
+        if "price_dynamics" in self._args:
+            self._controller_data["price_dynamics"].update(self._args["price_dynamics"])
+
         self._controller.build(self._controller_data)
         self._dynamics = Dynamics(self._controller_data, self._slow_data, self._args)
         self._state = self._dynamics.get_state()
@@ -123,7 +127,7 @@ class ShippingEnv:
 
             # k$ + t * 5 k$/t / (t) = k$ / t or $/kg <- This is the profit per/kg
             profit_inc = results.get(("actual_profit", 0), 0) - prev_profit
-            reward = (profit_inc * 1000) + stored_val * 5
+            reward = (profit_inc * 1000) + stored_val * self._dynamics.h2_price
             observation["total_tonnes"] = stored_val + t_sent_vol
 
             call_count = getattr(self._dynamics, "_call_count", None)
@@ -310,6 +314,10 @@ class ShippingEnvPlot(ShippingEnv):
             )
         )
 
+        # Allow env args to override price_dynamics settings from config.yml
+        if "price_dynamics" in self._args:
+            self._controller_data["price_dynamics"].update(self._args["price_dynamics"])
+
         self._controller.build(self._controller_data)
         self._dynamics = Dynamics(self._controller_data, self._slow_data, self._args)
         self._state = self._dynamics.get_state()
@@ -431,7 +439,7 @@ class ShippingEnvPlot(ShippingEnv):
             if results is not None:
                 profit_inc = results.get(("actual_profit", 0), 0) - prev_profit
 
-            reward = (profit_inc * 1000) + stored_val * 5
+            reward = (profit_inc * 1000) + stored_val * self._dynamics.h2_price
             observation["total_tonnes"] = stored_val + t_sent_vol
 
             done = self._dynamics.iter_count // n_steps >= self._args["months"]

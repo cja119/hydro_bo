@@ -119,6 +119,8 @@ def run_mpc(env_args, id, params, dump_diagnostics=False):
     def _deep_set(target, updates):
         for k, v in updates.items():
             if isinstance(v, dict):
+                if k not in target or not isinstance(target[k], dict):
+                    target[k] = {}
                 _deep_set(target[k], v)
             else:
                 target[k] = v

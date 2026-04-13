@@ -14,13 +14,11 @@ import numpy as np
 import csv
 from datetime import datetime
 
-from hydro_bo import configure_logging
-from hydro_bo.algs.logging_config import get_logger
+from hydro_bo.algs.logging_config import configure_logging, get_logger
 from hydro_bo.algs.dispatcher import RayMultiMPC
 from hydro_bo.algs.bayesopt import BayesianOptimizer
 from hydro_bo.envs.shipping.utils import calculate_capex_opex
 
-configure_logging()
 logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -121,9 +119,11 @@ def params_from_x(x: np.ndarray, ref: dict) -> dict:
 # Objective
 # ---------------------------------------------------------------------------
 
-# Global counter and results storage for logging
+# Global counter, results storage, and output directory for incremental saving
 _eval_counter = 0
 _results_log = []
+_bayesopt_dir: Path | None = None
+_run_timestamp: str = ""
 
 def objective(x: np.ndarray, ref: dict) -> float:
     """Evaluate mean - λ·var over N_INSTANCES MPC runs for parameter vector x."""
@@ -143,40 +143,37 @@ def objective(x: np.ndarray, ref: dict) -> float:
 
     scores = dispatcher.run_multisim()
 
-    if not scores:
-        objective_value = -np.inf
-    else:
-        scores_arr = np.array(scores, dtype=float)
-        mean_score = float(scores_arr.mean())
-        var_score = float(scores_arr.var())
-        objective_value = mean_score - VARIANCE_PENALTY * var_score
+    scores_arr = np.array(scores, dtype=float) if scores else np.array([], dtype=float)
+    mean_score = float(scores_arr.mean()) if scores else float("nan")
+    var_score  = float(scores_arr.var())  if scores else float("nan")
+    objective_value = (mean_score - VARIANCE_PENALTY * var_score) if scores else -np.inf
 
-        # Log this evaluation with individual worker scores
-        result_entry = {
-            'eval_id': _eval_counter,
-            'timestamp': datetime.now().isoformat(),
-            'objective': objective_value,
-            'mean_score': mean_score,
-            'var_score': var_score,
-            'num_workers': len(scores),
-            'worker_scores': scores,
-        }
+    result_entry = {
+        'eval_id': _eval_counter,
+        'timestamp': datetime.now().isoformat(),
+        'objective': objective_value,
+        'mean_score': mean_score,
+        'var_score': var_score,
+        'num_workers': len(scores),
+        'worker_scores': scores,
+    }
+    for key in PARAM_KEYS:
+        result_entry[key] = params[key]
+    result_entry['capex'] = params['capex']
+    result_entry['opex'] = params['opex']
 
-        # Add all parameters to the log entry
-        for i, key in enumerate(PARAM_KEYS):
-            result_entry[key] = params[key]
+    _results_log.append(result_entry)
 
-        result_entry['capex'] = params['capex']
-        result_entry['opex'] = params['opex']
+    logger.info("bayesopt.evaluation",
+               eval_id=_eval_counter,
+               objective=objective_value,
+               mean=mean_score,
+               variance=var_score,
+               n_workers=len(scores))
 
-        _results_log.append(result_entry)
-
-        logger.info("bayesopt.evaluation",
-                   eval_id=_eval_counter,
-                   objective=objective_value,
-                   mean=mean_score,
-                   variance=var_score,
-                   n_workers=len(scores))
+    # Write results to disk after every evaluation so nothing is lost on crash
+    if _bayesopt_dir is not None:
+        save_results_to_files(_results_log, _bayesopt_dir, _run_timestamp)
 
     return objective_value
 
@@ -186,48 +183,49 @@ def objective(x: np.ndarray, ref: dict) -> float:
 # ---------------------------------------------------------------------------
 
 def save_results_to_files(results_log: list, bayesopt_dir: Path, run_timestamp: str):
-    """Save results to both CSV and JSON files."""
-    # Create the bayesopt directory
-    bayesopt_dir.mkdir(parents=True, exist_ok=True)
+    """Save results to CSV and JSON, overwriting on each call for crash-safety."""
+    import json
 
-    # Save summary CSV (one row per evaluation)
+    if not results_log:
+        return
+
+    # Save summary CSV (one row per evaluation, no worker_scores column)
+    fieldnames = ['eval_id', 'timestamp', 'objective', 'mean_score', 'var_score', 'num_workers']
+    fieldnames.extend(PARAM_KEYS)
+    fieldnames.extend(['capex', 'opex'])
+
     csv_path = bayesopt_dir / f"bo_results_{run_timestamp}.csv"
     with open(csv_path, 'w', newline='') as f:
-        if not results_log:
-            return
-
-        # Define CSV columns
-        fieldnames = ['eval_id', 'timestamp', 'objective', 'mean_score', 'var_score', 'num_workers']
-        fieldnames.extend(PARAM_KEYS)
-        fieldnames.extend(['capex', 'opex'])
-
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
-
         for entry in results_log:
-            # Create a copy without worker_scores for CSV
-            csv_entry = {k: v for k, v in entry.items() if k != 'worker_scores'}
-            writer.writerow(csv_entry)
-
-    logger.info("bayesopt.csv_saved", path=str(csv_path), n_evaluations=len(results_log))
+            writer.writerow({k: v for k, v in entry.items() if k != 'worker_scores'})
 
     # Save detailed JSON (includes individual worker scores)
     json_path = bayesopt_dir / f"bo_results_detailed_{run_timestamp}.json"
-    import json
     with open(json_path, 'w') as f:
         json.dump(results_log, f, indent=2)
 
-    logger.info("bayesopt.json_saved", path=str(json_path))
 
-
-def run_bayesopt():
-    global _eval_counter, _results_log
+def run_bayesopt(args=None):
+    global _eval_counter, _results_log, _bayesopt_dir, _run_timestamp
     _eval_counter = 0
     _results_log = []
 
     now = datetime.now()
-    run_timestamp = now.strftime("%Y%m%d_%H%M%S")
-    bayesopt_dir = Path(__file__).parent / "tmp" / now.strftime("%Y-%m-%d") / now.strftime("%H-%M-%S") / VECTOR
+    _run_timestamp = now.strftime("%Y%m%d_%H%M%S")
+    _bayesopt_dir = Path(__file__).parent / "tmp" / now.strftime("%Y-%m-%d") / now.strftime("%H-%M-%S") / VECTOR
+    _bayesopt_dir.mkdir(parents=True, exist_ok=True)
+
+    configure_logging(log_file=_bayesopt_dir / "run.log")
+
+    if args is not None:
+        import json
+        args_dict = vars(args)
+        args_dict["n_sim_resolved"] = N_INSTANCES  # record the resolved value
+        with open(_bayesopt_dir / "args.json", "w") as f:
+            json.dump(args_dict, f, indent=2)
+        logger.info("bayesopt.args_saved", path=str(_bayesopt_dir / "args.json"))
 
     try:
         ref = load_reference(REFERENCE_PATH)
@@ -263,13 +261,13 @@ def run_bayesopt():
     for k, v in best_params.items():
         logger.info("bayesopt.parameter", name=k, value=v)
 
-    out_path = Path(__file__).parent / "tmp/planning/NH3-Chile-bo.yml"
+    out_path = Path(__file__).parent / "tmp" / "planning" / f"{VECTOR}-Chile-bo.yml"
     with open(out_path, "w") as f:
         yaml.dump(best_params, f, default_flow_style=False)
     logger.info("bayesopt.saved", path=str(out_path))
 
-    # Save all evaluation results
-    save_results_to_files(_results_log, bayesopt_dir, run_timestamp)
+    # Final save (incremental saves already happened after each eval)
+    save_results_to_files(_results_log, _bayesopt_dir, _run_timestamp)
 
     return best_params, best_score
 
@@ -283,6 +281,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nsobol",       type=int,   default=N_INITIAL_POINTS, help="Sobol evaluations before BO starts (default: %(default)s)")
     parser.add_argument("--n_sim",        type=int,   default=None,
                         help="Total MPC runs per BO evaluation. Defaults to --ncpus (one per CPU) if not given.")
+    parser.add_argument("--dynamic_price", type=lambda x: x.lower() in ("true", "1", "yes"), default=False,
+                        help="Enable OU + jump-diffusion hydrogen price dynamics: True/False (default: False).")
     return parser.parse_args()
 
 
@@ -305,7 +305,8 @@ if __name__ == "__main__":
             "vector": VECTOR,
             "mpc": {"planning_model": PLANNING_MODEL},
             "weather_data": {"weather_file": WEATHER_FILE},
+            "price_dynamics": {"enabled": args.dynamic_price},
         },
     }
 
-    run_bayesopt()
+    run_bayesopt(args=args)

@@ -562,7 +562,7 @@ def hourly_profit(m, t):
                 * m.ship_capacity[s]
                 * m.calorific_value
                 / 120
-                * 5
+                * m.h2_price
                 / 1_000
                 for s in m.ships
             )
@@ -610,7 +610,7 @@ def actual_profit_eq(m, t):
             * m.ship_capacity[s]
             * m.calorific_value
             / 120
-            * 5
+            * m.h2_price
             / 1000
             for s in m.ships
         )
