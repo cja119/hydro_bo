@@ -642,5 +642,5 @@ def profit_target(m):
     """
     return (
         m.cumulative_profit[m.grid0.at(1)]
-        + sum(m.vector_flux[i] for i in range(25)) / 120
+        + sum(m.vector_flux[i] for i in range(25)) / 120 # GJ / GJ per tonnes
     )

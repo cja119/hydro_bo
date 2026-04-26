@@ -186,18 +186,7 @@ class ContiguityHandler:
         instance_bound: bool,
         clean_variable_value_fn
     ) -> Dict[str, int]:
-        """Fix variables at t=0 to ensure continuity between MPC solves.
-
-        Args:
-            instance: Pyomo model instance
-            solver: Persistent solver instance
-            start_values: Dictionary of variable values to fix
-            instance_bound: Whether instance is bound to solver
-            clean_variable_value_fn: Function to clean variable values
-
-        Returns:
-            Dictionary with count of fixed variables by name
-        """
+        """Fix variables at t=0 to ensure continuity between MPC solves"""
         fixed_vars = []
         fixed_by_name = {}
 
@@ -229,16 +218,7 @@ class ContiguityHandler:
         solver,
         instance_bound: bool
     ) -> int:
-        """Unfix all previously fixed variables before updating parameters.
-
-        Args:
-            instance: Pyomo model instance
-            solver: Persistent solver instance
-            instance_bound: Whether instance is bound to solver
-
-        Returns:
-            Count of unfixed variables
-        """
+        """Unfix all previously fixed variables before updating parameters."""
         unfixed_vars = []
         for var in instance.component_objects(Var, active=True):
             for index in var:
@@ -259,20 +239,7 @@ class ContiguityHandler:
         termination_condition: str,
         attempt: int = 0
     ) -> Optional[Dict[str, Any]]:
-        """Apply constraint relaxation based on solve failure.
-
-        This method implements a decision tree for progressively relaxing
-        constraints when solves fail. Future enhancement will add sophisticated
-        relaxation strategies.
-
-        Args:
-            instance: Pyomo model instance
-            termination_condition: Solver termination condition
-            attempt: Current relaxation attempt number
-
-        Returns:
-            Dictionary of relaxation parameters applied, or None if no relaxation
-        """
+        """Apply constraint relaxation based on solve failure"""
         # TODO: Implement decision tree logic for constraint relaxation
         # This is a placeholder for future enhancement
 
@@ -441,4 +408,18 @@ class RelaxationTree:
     def get_history(self) -> list:
         """Get full relaxation history."""
         return self.relaxation_history
+
+    def get_relaxable_param_names(self) -> set:
+        """Return the set of parameter names this tree may modify.
+
+        Used by the controller to snapshot baseline values so that parameters
+        mutated by one relaxed solve do not persist into subsequent solves.
+        """
+        names = set()
+        for relaxation_name in self._precedence_order:
+            for spec in self.decision_tree.get(relaxation_name, []):
+                if isinstance(spec, str) and "=" in spec:
+                    param_name, _ = spec.split("=", 1)
+                    names.add(param_name.strip())
+        return names
 

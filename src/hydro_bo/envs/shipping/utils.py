@@ -55,7 +55,7 @@ def _resolve_planning_model(planning_model: str | Path) -> Path:
     if isinstance(planning_model, Path):
         return planning_model
 
-    return TMP_DIR / "planning" / planning_model
+    return Path.cwd() / "tmp" / "planning" / planning_model
 
 
 def _traverse(mapping: Mapping[str, Any], keys: Iterable[str]) -> Any:
@@ -317,7 +317,7 @@ def calculate_capex_opex(
         )
         opex["vector_production"] = (
             parameters["operating_costs"]["vector_production"]["NH3"][1]
-            * parameters["vector_production"]["single_train_throughput"]["NH3"]
+            * parameters["vector_production"]["single_train_throughput"]["NH3"] ** (2 / 3)
             * _plant
             * conversion_trains_number
         )
@@ -334,7 +334,7 @@ def calculate_capex_opex(
         )
         opex["vector_production"] = (
             parameters["operating_costs"]["vector_production"]["LH2"][1]
-            * parameters["vector_production"]["single_train_throughput"]["LH2"][1]
+            * parameters["vector_production"]["single_train_throughput"]["LH2"][1] ** (2 / 3)
             * _plant
             * conversion_trains_number
         )

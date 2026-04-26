@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import argparse
+import json
 import os
 import yaml
 import numpy as np
@@ -16,7 +17,7 @@ from datetime import datetime
 
 from hydro_bo.algs.logging_config import configure_logging, get_logger
 from hydro_bo.algs.dispatcher import RayMultiMPC
-from hydro_bo.algs.bayesopt import BayesianOptimizer
+from hydro_bo.algs.bayesopt import BayesianOptimizer, configure_jax_threads
 from hydro_bo.envs.shipping.utils import calculate_capex_opex
 
 logger = get_logger(__name__)
@@ -31,13 +32,15 @@ RENEWABLES       = "wind"
 WEATHER_FILE     = "CoastalChile_15-20_Wind.csv"
 REFERENCE_PATH   = Path(__file__).parent / "tmp/planning" / PLANNING_MODEL
 
-BOUNDS_EXPANSION = 0.5         # ±50 % around reference values
-VARIANCE_PENALTY = 0.5         # λ in: mean - λ * var
-N_INITIAL_POINTS = 8           # Sobol evaluations before BO starts
-BO_ITER_LIMIT    = 20          # BO iterations
-N_INSTANCES      = 15           # total MPC runs per BO evaluation (parallelised across NUM_DEVICES)
-NUM_DEVICES      = os.cpu_count() - 1  # simultaneous instances
-TIMEOUT          = 900         # seconds per evaluation
+BOUNDS_EXPANSION  = 0.5         # ±50 % around reference values
+STDEV_PENALTY     = 0.5         # λ in noisy-EI on g(x) = mu(x) - λ·sigma(x)
+N_INITIAL_POINTS  = 8           # Sobol evaluations before BO starts
+BO_ITER_LIMIT     = 20          # BO iterations
+N_INSTANCES       = 15          # total MPC runs per BO evaluation (parallelised across NUM_DEVICES)
+NUM_DEVICES       = os.cpu_count() - 1  # simultaneous instances
+TIMEOUT           = 900         # seconds per evaluation
+MIN_VALID_SAMPLES = 4           # minimum valid worker scores per eval; below → penalty
+FAILURE_PENALTY   = -10.0       # synthetic worst-case sample injected when too few valid scores
 
 ENV_ARGS = {
     "config": {
@@ -125,8 +128,11 @@ _results_log = []
 _bayesopt_dir: Path | None = None
 _run_timestamp: str = ""
 
-def objective(x: np.ndarray, ref: dict) -> float:
-    """Evaluate mean - λ·var over N_INSTANCES MPC runs for parameter vector x."""
+def objective(x: np.ndarray, ref: dict) -> np.ndarray:
+    """Run N_INSTANCES MPC simulations at x and return the array of valid
+    worker scores. Drops non-finite entries and dispatcher penalty values
+    (≤ -1e7). If fewer than MIN_VALID_SAMPLES survive, returns a single
+    synthetic FAILURE_PENALTY sample so the surrogate learns to avoid x."""
     global _eval_counter
     _eval_counter += 1
 
@@ -141,12 +147,26 @@ def objective(x: np.ndarray, ref: dict) -> float:
         exit_fraction=1.0,
     )
 
-    scores = dispatcher.run_multisim()
+    raw_scores = dispatcher.run_multisim()
+    arr = np.asarray(raw_scores, dtype=float).ravel() if raw_scores else np.array([], dtype=float)
+    valid_mask = np.isfinite(arr) & (arr > -1e7)
+    valid_scores = arr[valid_mask]
+    n_valid = int(valid_scores.size)
+    n_failed = int(arr.size - n_valid)
 
-    scores_arr = np.array(scores, dtype=float) if scores else np.array([], dtype=float)
-    mean_score = float(scores_arr.mean()) if scores else float("nan")
-    var_score  = float(scores_arr.var())  if scores else float("nan")
-    objective_value = (mean_score - VARIANCE_PENALTY * var_score) if scores else -np.inf
+    if n_valid >= MIN_VALID_SAMPLES:
+        bo_samples = valid_scores
+        mean_score = float(valid_scores.mean())
+        var_score = float(valid_scores.var(ddof=1)) if n_valid >= 2 else float("nan")
+        sd_score = float(np.sqrt(var_score)) if np.isfinite(var_score) else 0.0
+        objective_value = mean_score - STDEV_PENALTY * sd_score
+        penalty_applied = False
+    else:
+        bo_samples = np.array([FAILURE_PENALTY], dtype=float)
+        mean_score = FAILURE_PENALTY
+        var_score = float("nan")
+        objective_value = FAILURE_PENALTY
+        penalty_applied = True
 
     result_entry = {
         'eval_id': _eval_counter,
@@ -154,8 +174,11 @@ def objective(x: np.ndarray, ref: dict) -> float:
         'objective': objective_value,
         'mean_score': mean_score,
         'var_score': var_score,
-        'num_workers': len(scores),
-        'worker_scores': scores,
+        'num_workers': len(raw_scores),
+        'n_valid': n_valid,
+        'n_failed': n_failed,
+        'penalty_applied': penalty_applied,
+        'worker_scores': list(raw_scores),
     }
     for key in PARAM_KEYS:
         result_entry[key] = params[key]
@@ -169,28 +192,87 @@ def objective(x: np.ndarray, ref: dict) -> float:
                objective=objective_value,
                mean=mean_score,
                variance=var_score,
-               n_workers=len(scores))
+               n_valid=n_valid,
+               n_failed=n_failed,
+               penalty_applied=penalty_applied)
 
-    # Write results to disk after every evaluation so nothing is lost on crash
     if _bayesopt_dir is not None:
         save_results_to_files(_results_log, _bayesopt_dir, _run_timestamp)
 
-    return objective_value
+    return bo_samples
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+def load_sobol_cache(sobol_dir: Path, expected_vector: str,
+                     expected_bounds_expansion: float,
+                     expected_dynamic_price: bool) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Load cached (x, valid_worker_scores) pairs from a sobol_mpc.py results directory.
+
+    Filters non-finite and dispatcher-penalty (≤ -1e7) worker scores. Rows
+    with fewer than MIN_VALID_SAMPLES survivors are dropped entirely (they
+    don't seed the GP — the BO will treat that x as unobserved)."""
+    observations: list[tuple[np.ndarray, np.ndarray]] = []
+    n_missing_result = 0
+    n_mismatched = 0
+    n_failed = 0
+
+    row_dirs = sorted(sobol_dir.glob("row_*"))
+    for rd in row_dirs:
+        result_files = sorted(rd.glob("result_*.json"))
+        if not result_files:
+            n_missing_result += 1
+            continue
+        with open(result_files[-1]) as f:
+            data = json.load(f)
+
+        if data.get("vector") != expected_vector:
+            n_mismatched += 1
+            continue
+        if float(data.get("bounds_expansion", -1)) != float(expected_bounds_expansion):
+            n_mismatched += 1
+            continue
+        if bool(data.get("dynamic_price", False)) != bool(expected_dynamic_price):
+            n_mismatched += 1
+            continue
+
+        scores = data.get("worker_scores")
+        if scores is None:
+            obj = data.get("objective")
+            if obj is None or not np.isfinite(obj) or obj <= -1e7:
+                n_failed += 1
+                continue
+            scores = [obj]
+
+        arr = np.asarray(scores, dtype=float).ravel()
+        valid = np.isfinite(arr) & (arr > -1e7)
+        valid_arr = arr[valid]
+        if valid_arr.size < MIN_VALID_SAMPLES:
+            n_failed += 1
+            continue
+
+        observations.append((np.asarray(data["x"], dtype=float), valid_arr))
+
+    logger.info("bayesopt.sobol_cache_loaded",
+                dir=str(sobol_dir),
+                n_rows_found=len(row_dirs),
+                n_loaded=len(observations),
+                n_missing_result=n_missing_result,
+                n_mismatched=n_mismatched,
+                n_failed=n_failed)
+    return observations
+
+
 def save_results_to_files(results_log: list, bayesopt_dir: Path, run_timestamp: str):
     """Save results to CSV and JSON, overwriting on each call for crash-safety."""
-    import json
-
     if not results_log:
         return
 
     # Save summary CSV (one row per evaluation, no worker_scores column)
-    fieldnames = ['eval_id', 'timestamp', 'objective', 'mean_score', 'var_score', 'num_workers']
+    fieldnames = ['eval_id', 'timestamp', 'objective', 'mean_score', 'var_score',
+                  'num_workers', 'n_valid', 'n_failed', 'penalty_applied']
     fieldnames.extend(PARAM_KEYS)
     fieldnames.extend(['capex', 'opex'])
 
@@ -220,7 +302,6 @@ def run_bayesopt(args=None):
     configure_logging(log_file=_bayesopt_dir / "run.log")
 
     if args is not None:
-        import json
         args_dict = vars(args)
         args_dict["n_sim_resolved"] = N_INSTANCES  # record the resolved value
         with open(_bayesopt_dir / "args.json", "w") as f:
@@ -248,9 +329,31 @@ def run_bayesopt(args=None):
         bounds=bounds,
         n_initial_points=N_INITIAL_POINTS,
         iter_limit=BO_ITER_LIMIT,
+        lam=STDEV_PENALTY,
         n_restarts=5,
         seed=42,
     )
+
+    sobol_dir_arg = getattr(args, "sobol_dir", None) if args is not None else None
+    if sobol_dir_arg:
+        sobol_dir = Path(sobol_dir_arg)
+        if not sobol_dir.is_absolute():
+            sobol_dir = Path(__file__).parent / sobol_dir
+        if not sobol_dir.exists():
+            logger.error("bayesopt.sobol_dir_missing", path=str(sobol_dir))
+        else:
+            preloaded = load_sobol_cache(
+                sobol_dir,
+                expected_vector=VECTOR,
+                expected_bounds_expansion=BOUNDS_EXPANSION,
+                expected_dynamic_price=args.dynamic_price,
+            )
+            for x, samples in preloaded:
+                bo.observe(x, samples)
+            if preloaded:
+                bo.n_initial_points = len(preloaded)
+                logger.info("bayesopt.sobol_phase_skipped_via_cache",
+                            n_preloaded=len(preloaded))
 
     best_x, best_score = bo.run()
 
@@ -283,11 +386,20 @@ def parse_args() -> argparse.Namespace:
                         help="Total MPC runs per BO evaluation. Defaults to --ncpus (one per CPU) if not given.")
     parser.add_argument("--dynamic_price", type=lambda x: x.lower() in ("true", "1", "yes"), default=False,
                         help="Enable OU + jump-diffusion hydrogen price dynamics: True/False (default: False).")
+    parser.add_argument("--sobol_dir",     type=str,   default=None,
+                        help="Path to a sobol_mpc.py results directory (e.g. tmp/sobol/NH3/). "
+                             "If set, cached (x, objective) pairs matching --vector, --scale_factor, "
+                             "and --dynamic_price seed the GP and the Sobol phase is skipped.")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+
+    # Parallelise GP fits across the same core budget Ray uses for workers.
+    # Must run before any jax import (the bayesopt module imports jax lazily,
+    # so this is still safe here).
+    configure_jax_threads(args.ncpus)
 
     # Override module-level constants from CLI arguments
     VECTOR           = args.vector

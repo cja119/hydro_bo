@@ -1,5 +1,16 @@
 """
-Structured logging configuration for MPC controller
+Structured logging configuration.
+
+structlog and stdlib `logging` are wired together via
+`structlog.stdlib.ProcessorFormatter` so a single configuration call
+produces:
+
+  - a clean, ANSI-free log file (always),
+  - an optional colorised stderr stream (when tee_stderr=True).
+
+stdlib loggers (gurobi, pyomo, jax, ...) flow through the same pipeline,
+so their output picks up the structlog format and shows up in the file
+in the same shape as our own structlog events.
 """
 
 import logging
@@ -9,63 +20,87 @@ from pathlib import Path
 import structlog
 
 
-_log_file_handle = None
+_file_handler: logging.FileHandler | None = None
+_stderr_handler: logging.StreamHandler | None = None
 
 
-class _TeeStream:
-    def __init__(self, *streams):
-        self._streams = streams
-
-    def write(self, text):
-        for stream in self._streams:
-            stream.write(text)
-
-    def flush(self):
-        for stream in self._streams:
-            stream.flush()
+def _shared_processors():
+    return [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+    ]
 
 
-def configure_logging(level=logging.INFO, log_file: str | Path | None = None):
-    """Configure structlog with appropriate processors and formatting.
+def configure_logging(level=logging.INFO, log_file: str | Path | None = None,
+                      tee_stderr: bool = True):
+    """Configure structlog + stdlib logging.
 
     Args:
-        level: Logging level (default: logging.INFO)
-        log_file: Optional path for logfile (default: ./debug_mpc/run.log)
+        level: Logging level (default: logging.INFO).
+        log_file: Path for the log file (default: ./debug_mpc/run.log).
+        tee_stderr: Mirror output to stderr in addition to the file
+            (default: True). Set False for per-worker logs so Ray's
+            captured stderr stays quiet.
     """
-    global _log_file_handle
+    global _file_handler, _stderr_handler
 
     log_path = Path(log_file) if log_file is not None else Path("./debug_mpc/run.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if _log_file_handle is not None:
-        try:
-            _log_file_handle.close()
-        except Exception:
-            pass
-
-    # Overwrite logfile on each new run.
-    _log_file_handle = open(log_path, "w", buffering=1)
-    tee_stream = _TeeStream(sys.stderr, _log_file_handle)
-
-    # Reset root handlers so repeated configure calls don't duplicate logs.
-    root_logger = logging.getLogger()
-    root_logger.handlers.clear()
-
-    # Set up Python logging (including gurobipy logger) to both stderr + file.
-    logging.basicConfig(level=level, stream=tee_stream)
+    shared = _shared_processors()
 
     structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
-            structlog.dev.ConsoleRenderer(colors=True),
+        processors=shared + [
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(level),
         context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(file=tee_stream),
+        logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=False,
     )
+
+    file_formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=shared,
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            structlog.dev.ConsoleRenderer(colors=False),
+        ],
+    )
+    stderr_formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=shared,
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            structlog.dev.ConsoleRenderer(colors=True),
+        ],
+    )
+
+    root_logger = logging.getLogger()
+    if _file_handler is not None:
+        root_logger.removeHandler(_file_handler)
+        try:
+            _file_handler.close()
+        except Exception:
+            pass
+        _file_handler = None
+    if _stderr_handler is not None:
+        root_logger.removeHandler(_stderr_handler)
+        _stderr_handler = None
+    for h in list(root_logger.handlers):
+        root_logger.removeHandler(h)
+
+    _file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    _file_handler.setFormatter(file_formatter)
+    _file_handler.setLevel(level)
+    root_logger.addHandler(_file_handler)
+
+    if tee_stderr:
+        _stderr_handler = logging.StreamHandler(sys.stderr)
+        _stderr_handler.setFormatter(stderr_formatter)
+        _stderr_handler.setLevel(level)
+        root_logger.addHandler(_stderr_handler)
+
+    root_logger.setLevel(level)
 
 
 def get_logger(name: str):

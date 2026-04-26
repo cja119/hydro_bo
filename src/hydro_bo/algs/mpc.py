@@ -9,7 +9,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 from pyomo.environ import (
@@ -78,14 +78,11 @@ class MPCController:
         self.contiguity = ContiguityHandler()
         self.relaxation_tree = RelaxationTree()
         self._relaxation_stats = {"total_relaxations": 0, "relaxations_per_solve": [], "relaxations_by_type": {}}
-        # Cached initial conditions from the most recent update() call.
-        # Overwritten each window; dumped to JSON on solve failure.
+        self._relaxation_baselines: Dict[str, Any] = {}
+        self._relaxation_dirty = False
         self._last_handoff_cache = None
-        # Uncertain-vector caches: current window and the one before it.
-        # Rotated each update(); both dumped to JSON on solve failure.
         self._current_uncertain_cache = None
         self._prev_uncertain_cache = None
-        # First solve includes t=0 ship orders (no previous window to inherit them).
         self._first_solve = True
 
     # --- Public Interface Methods --- #
@@ -115,16 +112,9 @@ class MPCController:
         self._init_fixed_flags()
 
     def solve(self, supress: bool = True, solver="gurobi"):
-        """
-        This solves the MPCController model.
-
-        :param self: MPCController instance
-        :param supress: Whether to suppress solver/stdout output
-        :param solver: Solver name (ignored, always uses gurobi_persistent)
-        """
+        """This solves the MPCController model"""
         solve_start = time.perf_counter()
 
-        # Initialize solver if needed
         solver_init_start = time.perf_counter()
         self._ensure_solver(solver)
         solver_init_time = time.perf_counter() - solver_init_start
@@ -138,7 +128,6 @@ class MPCController:
                 file=sys.stderr,
             )
 
-        # On first solve, create instance and bind to persistent solver
         if not self._instance_bound:
             instance_start = time.perf_counter()
             self.instance = self.model.create_instance()
@@ -157,44 +146,50 @@ class MPCController:
                 total_setup_ms=ms(instance_time + bind_time)
             )
 
-        # Reset relaxation tree to root for this solve iteration
+            self._snapshot_relaxation_baselines()
+
+        if self._relaxation_dirty:
+            self._restore_relaxation_baselines()
         self.relaxation_tree.reset()
         relaxation_count = 0
         done = False
 
         while not done:
-            # Solve model (persistent solver doesn't need instance parameter)
             solve_call_time, termination_condition = self._execute_solve_call(supress)
 
-            # Check if optimal
-            if termination_condition != TerminationCondition.optimal:
-                # Try to apply next relaxation from decision tree
-                relaxation_params = self.relaxation_tree.get_next_relaxation(str(termination_condition))
-
-                if relaxation_params is None:
-                    # Decision tree exhausted, save diagnostic files
-                    print(f"[MPC] Relaxation tree exhausted after {relaxation_count} attempts, termination: {termination_condition}", file=sys.stderr, flush=True)
-
-                    # Dump cached initial conditions from the previous window handoff.
-                    self._dump_failed_initial_conditions(termination_condition)
-
-                    # Save diagnostic ILP/LP files for debugging
-                    self._diagnose_infeasibility()
-
-                    raise MPCSolveError(
-                        termination_condition=termination_condition,
-                        message=getattr(self.results.solver, "message", None),
-                    )
-
-                # Apply relaxation parameters to the model
-                self._apply_relaxation_params(relaxation_params)
-                relaxation_count += 1
-
-                # Continue loop to retry solve with relaxed constraints
+            if termination_condition == TerminationCondition.optimal:
+                done = True
                 continue
 
-            # Solve succeeded
-            done = True
+            if termination_condition == TerminationCondition.maxTimeLimit:
+                if self._has_feasible_incumbent():
+                    logger.info("accepting_time_limited_incumbent",
+                                solve_call_ms=ms(solve_call_time))
+                    done = True
+                    continue
+                logger.warning("time_limit_no_incumbent",
+                               solve_call_ms=ms(solve_call_time))
+                raise MPCSolveError(
+                    termination_condition=termination_condition,
+                    message=getattr(self.results.solver, "message", None),
+                )
+
+            relaxation_params = self.relaxation_tree.get_next_relaxation(str(termination_condition))
+
+            if relaxation_params is None:
+                print(f"[MPC] Relaxation tree exhausted after {relaxation_count} attempts, termination: {termination_condition}", file=sys.stderr, flush=True)
+
+                self._dump_failed_initial_conditions(termination_condition)
+                self._diagnose_infeasibility()
+
+                raise MPCSolveError(
+                    termination_condition=termination_condition,
+                    message=getattr(self.results.solver, "message", None),
+                )
+
+            self._apply_relaxation_params(relaxation_params)
+            self._relaxation_dirty = True
+            relaxation_count += 1
 
         # Track which relaxation type actually succeeded (if any)
         if relaxation_count > 0 and self.relaxation_tree.last_applied is not None:
@@ -326,13 +321,7 @@ class MPCController:
         return None
 
     def output(self, time_step: int = 24):
-        """
-        This grabs the conditional variables for the uncertainty.
-
-        :param self: MPCController instance
-        :param time_step: Time step for output
-        :type time_step: int
-        """
+        """This grabs the conditional variables for the uncertainty."""
 
         solve = self.instance
 
@@ -462,11 +451,7 @@ class MPCController:
         return stats
 
     def log_relaxation_summary(self):
-        """Log per-type relaxation usage as % of solve windows.
-
-        Only counts relaxations that were applied AND led to a successful solve.
-        Called at the end of a simulation run.
-        """
+        """Log per-type relaxation usage as % of solve windows."""
         total_windows = self._call_count
         if total_windows == 0:
             return
@@ -522,11 +507,7 @@ class MPCController:
 
 
     def _refresh_persistent_solver_from_instance(self):
-        """Rebuild persistent solver view from current instance state.
-
-        This ensures mutable parameter coefficient updates and fixed/unfixed status
-        are consistently reflected in the backend model across MPC iterations.
-        """
+        """Rebuild persistent solver view from current instance state."""
         if self.instance is None or not self._instance_bound:
             return
         if not hasattr(self.solver, "set_instance"):
@@ -535,14 +516,7 @@ class MPCController:
         self.solver.set_instance(self.instance)
 
     def _execute_solve_call(self, supress: bool = True):
-        """Execute the solver call with suppressed output and warning handling.
-
-        Args:
-            supress: Whether to suppress solver output
-
-        Returns:
-            Tuple of (solve_time_seconds, termination_condition)
-        """
+        """Execute the solver call with suppressed output and warning handling."""
         solve_call_start = time.perf_counter()
         with suppress_output(supress):
             import warnings
@@ -556,11 +530,7 @@ class MPCController:
         return solve_call_time, self.results.solver.termination_condition
 
     def _apply_relaxation_params(self, relaxation_params: Dict[str, Any]):
-        """Apply relaxation parameters to the model instance.
-
-        Args:
-            relaxation_params: Dictionary of parameter names to new values
-        """
+        """Apply relaxation parameters to the model instance."""
         if self.instance is None:
             logger.warning("cannot_apply_relaxation", reason="instance_not_created")
             return
@@ -597,11 +567,64 @@ class MPCController:
                     error=str(e)
                 )
 
-        # Rebuild persistent solver from updated Pyomo instance so Gurobi
-        # picks up the new param values (set_value alone doesn't propagate
-        # to the persistent solver's constraint matrix).
         self._refresh_persistent_solver_from_instance()
         logger.info("persistent_solver_refreshed_after_relaxation")
+
+    def _has_feasible_incumbent(self) -> bool:
+        """Check whether Gurobi holds a feasible incumbent solution.
+
+        Used after a maxTimeLimit termination to decide whether to accept
+        the time-limited result rather than escalate to constraint relaxation.
+        """
+        gurobi_model = getattr(self.solver, "_solver_model", None)
+        if gurobi_model is None:
+            return False
+        try:
+            return int(gurobi_model.SolCount) > 0
+        except Exception as e:
+            logger.warning("incumbent_check_failed", error=str(e))
+            return False
+
+    def _snapshot_relaxation_baselines(self):
+        """Snapshot baseline values for every parameter the tree may mutate.
+
+        Called once, right after the instance is first built. The stored values
+        are the canonical defaults that `_restore_relaxation_baselines` reverts
+        to at the start of each subsequent solve.
+        """
+        if self.instance is None:
+            return
+
+        self._relaxation_baselines = {}
+        for name in self.relaxation_tree.get_relaxable_param_names():
+            param_obj = getattr(self.instance, name, None)
+            if param_obj is None:
+                continue
+            try:
+                self._relaxation_baselines[name] = value(param_obj)
+            except Exception as e:
+                logger.warning("relaxation_baseline_snapshot_failed", param=name, error=str(e))
+
+        logger.info("relaxation_baselines_snapshot", params=list(self._relaxation_baselines))
+
+    def _restore_relaxation_baselines(self):
+        """Revert any parameters a prior relaxed solve left mutated."""
+        if not self._relaxation_baselines:
+            self._relaxation_dirty = False
+            return
+
+        for name, baseline in self._relaxation_baselines.items():
+            param_obj = getattr(self.instance, name, None)
+            if param_obj is None:
+                continue
+            if hasattr(param_obj, "set_value"):
+                param_obj.set_value(baseline)
+            else:
+                param_obj.value = baseline
+
+        self._refresh_persistent_solver_from_instance()
+        self._relaxation_dirty = False
+        logger.info("relaxation_baselines_restored", params=list(self._relaxation_baselines))
 
     def _build_sets(self, sets_def):
         for key, set_ in sets_def.items():
@@ -731,7 +754,7 @@ class MPCController:
         opts["Cuts"] = -1
         opts["Heuristics"] = 0.1
         opts["TimeLimit"] = 300
-        opts["Threads"] = 0
+        opts["Threads"] = 1
         opts["Method"] = 2
         self._solver_configured = True
 
@@ -916,7 +939,6 @@ class MPCController:
                     bounds=iis_bounds[i : i + chunk_size],
                 )
 
-            # Estimate distance-to-feasibility using L1 feasibility relaxation.
             self._estimate_feasibility_distance(gurobi_model)
 
         except Exception as e:
@@ -924,11 +946,7 @@ class MPCController:
             print(f"[ERROR] Failed to compute IIS: {e}", file=sys.stderr)
 
     def _estimate_feasibility_distance(self, gurobi_model):
-        """Estimate how close the model is to feasibility via feasRelax.
-
-        Uses Gurobi's L1 relaxation objective (sum of weighted violations).
-        Lower values indicate the model is closer to feasible.
-        """
+        """Estimate how close the model is to feasibility via feasRelax"""
         try:
             relaxed = gurobi_model.copy()
             relaxed.setParam("OutputFlag", 0)
