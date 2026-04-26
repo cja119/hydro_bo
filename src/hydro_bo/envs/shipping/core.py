@@ -78,6 +78,7 @@ class ShippingEnv:
         n_steps = None
         iter_idx = None
         last_mpc_args = None
+        stored_val = 0
 
         try:
             observation = {}
@@ -97,7 +98,7 @@ class ShippingEnv:
                 self._controller.update(mpc_args, self._dynamics.results)
 
                 # Solve the mpc controller
-                results, self._dynamics.states, stored_val, sent_vol = (
+                results, self._dynamics.states, delta_stored, sent_vol = (
                     self._controller.solve(solver=self._args["mpc"]["solver"])
                 )
 
@@ -108,6 +109,7 @@ class ShippingEnv:
                     for s in self._controller_data["sets"]["ships"]
                 )
                 t_sent_vol += sent_vol
+                stored_val += delta_stored
 
                 # Print the current iteration and the total ships sent
                 if verbose:

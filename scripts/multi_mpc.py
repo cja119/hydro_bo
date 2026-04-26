@@ -1,6 +1,5 @@
 """
-Smoke test for RayMultiMPC — verifies Ray initialises and parameters
-can be injected from a planning model solve into a ShippingEnv.
+Run RayMultiMPC over a planning model and log results to disk.
 """
 
 import sys
@@ -8,22 +7,33 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import argparse
+import csv
+import json
+import os
+import time as _time
 import yaml
+import numpy as np
+from datetime import datetime
 
-from hydro_bo import configure_logging
-from hydro_bo.algs.logging_config import get_logger
+from hydro_bo.algs.logging_config import configure_logging, get_logger
 from hydro_bo.algs.dispatcher import RayMultiMPC
 
-configure_logging()
 logger = get_logger(__name__)
 
-VECTOR = "LH2"
-PLANNING_MODEL = "{vector}-Chile.yml".format(vector=VECTOR)
-WEATHER_FILE = "CoastalChile_15-20_Wind.csv"
-PLANNING_MODEL_PATH = Path(__file__).parent / "tmp/planning" / PLANNING_MODEL
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-# Set to True to dump ILP/LP files on failure and exit early
-DUMP_DIAGNOSTICS_ON_FAILURE = True
+VECTOR          = "NH3"
+PLANNING_MODEL  = f"{VECTOR}-Chile.yml"
+WEATHER_FILE    = "CoastalChile_15-20_Wind.csv"
+
+NUM_INSTANCES   = os.cpu_count() - 1  # total MPC runs
+NUM_DEVICES     = os.cpu_count() - 1  # simultaneous workers
+TIMEOUT         = 900                  # seconds per worker
+
+DUMP_DIAGNOSTICS_ON_FAILURE = False
 
 
 def load_planning_model(path: Path) -> dict:
@@ -31,46 +41,150 @@ def load_planning_model(path: Path) -> dict:
         return yaml.safe_load(f)
 
 
-ENV_ARGS = {
-    "config": {
-        "vector": VECTOR,
-        "mpc": {"planning_model": PLANNING_MODEL},
-        "weather_data": {"weather_file": WEATHER_FILE},
-    },
-}
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
+def run_multisim(args=None):
+    now = datetime.now()
+    run_timestamp = now.strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(__file__).parent / "tmp" / now.strftime("%Y-%m-%d") / now.strftime("%H-%M-%S") / VECTOR
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-def main():
-    params = load_planning_model(PLANNING_MODEL_PATH)
-    logger.info("multi_mpc.loaded_model", path=str(PLANNING_MODEL_PATH))
-    logger.info("multi_mpc.parameters", params=params)
+    configure_logging(log_file=out_dir / "run.log")
+
+    if args is not None:
+        args_dict = vars(args)
+        with open(out_dir / "args.json", "w") as f:
+            json.dump(args_dict, f, indent=2)
+        logger.info("multi_mpc.args_saved", path=str(out_dir / "args.json"))
+
+    planning_model_path = Path(__file__).parent / "tmp/planning" / PLANNING_MODEL
+    if not planning_model_path.exists():
+        logger.error(
+            "multi_mpc.missing_planning_model",
+            path=str(planning_model_path),
+            message=f"Planning model not found. Run: python scripts/planning.py {VECTOR}",
+        )
+        return
+
+    params = load_planning_model(planning_model_path)
+    logger.info("multi_mpc.loaded_model", path=str(planning_model_path))
+
+    env_args = {
+        "config": {
+            "vector": VECTOR,
+            "mpc": {"planning_model": PLANNING_MODEL},
+            "weather_data": {"weather_file": WEATHER_FILE},
+            "price_dynamics": {"enabled": args.dynamic_price if args is not None else False},
+        },
+    }
 
     dispatcher = RayMultiMPC(
-        env_args=ENV_ARGS,
+        env_args=env_args,
         param_overrides=params,
-        num_instances=144,
-        num_devices=12,
-        timeout=900,
+        num_instances=NUM_INSTANCES,
+        num_devices=NUM_DEVICES,
+        timeout=TIMEOUT,
         exit_fraction=1.0,
         dump_diagnostics_on_failure=DUMP_DIAGNOSTICS_ON_FAILURE,
+        log_dir=out_dir,
     )
 
-    logger.info("multi_mpc.initialized",
-                num_instances=dispatcher._num_instances,
-                timeout=dispatcher._timeout)
+    logger.info("multi_mpc.initialized", num_instances=NUM_INSTANCES, num_devices=NUM_DEVICES, timeout=TIMEOUT)
 
-    scores = dispatcher.run_multisim()
-    logger.info("multi_mpc.simulation_complete", scores=scores)
+    walltime_seconds = getattr(args, "walltime_seconds", None) if args is not None else None
+    buffer_seconds = getattr(args, "buffer_seconds", 300) if args is not None else 300
+    deadline = None
+    if walltime_seconds is not None:
+        deadline = _time.perf_counter() + walltime_seconds - buffer_seconds
+        logger.info("multi_mpc.deadline_set",
+                    walltime_seconds=walltime_seconds, buffer_seconds=buffer_seconds)
+
+    scores = dispatcher.run_multisim(deadline=deadline)
+
+    scores_arr = np.array(scores, dtype=float) if scores else np.array([], dtype=float)
+    finite_mask = np.isfinite(scores_arr)
+    finite_scores = scores_arr[finite_mask]
+    n_failed = int((~finite_mask).sum())
+
+    if len(finite_scores) > 0:
+        mean_score = float(finite_scores.mean())
+        var_score  = float(finite_scores.var())
+    else:
+        mean_score = float("nan")
+        var_score  = float("nan")
+
+    logger.info("multi_mpc.complete",
+                n_workers=len(scores),
+                mean_score=mean_score,
+                var_score=var_score,
+                n_failed=n_failed,
+                scores=scores)
+
+    # Save results
+    result = {
+        "timestamp": now.isoformat(),
+        "vector": VECTOR,
+        "planning_model": PLANNING_MODEL,
+        "num_instances": NUM_INSTANCES,
+        "num_devices": NUM_DEVICES,
+        "dynamic_price": args.dynamic_price if args is not None else False,
+        "n_workers": len(scores),
+        "n_failed": n_failed,
+        "mean_score": mean_score,
+        "var_score": var_score,
+        "worker_scores": scores,
+    }
+
+    json_path = out_dir / f"results_{run_timestamp}.json"
+    with open(json_path, "w") as f:
+        json.dump(result, f, indent=2)
+    logger.info("multi_mpc.results_saved", path=str(json_path))
+
+    csv_path = out_dir / f"results_{run_timestamp}.csv"
+    fieldnames = ["timestamp", "vector", "planning_model", "num_instances", "num_devices",
+                  "dynamic_price", "n_workers", "mean_score", "var_score"]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow({k: result[k] for k in fieldnames})
+    logger.info("multi_mpc.csv_saved", path=str(csv_path))
 
     import matplotlib.pyplot as plt
-
     plt.hist(scores, bins=10)
-    plt.title("Distribution of MPC Scores")
+    plt.title(f"Distribution of MPC Scores — {VECTOR}")
     plt.xlabel("Score")
     plt.ylabel("Frequency")
-    plt.savefig(Path(__file__).parent / "tmp/multi_mpc_scores.png")
-    logger.info("multi_mpc.plot_saved", path="scripts/tmp/multi_mpc_scores.png")
+    plot_path = out_dir / f"scores_{run_timestamp}.png"
+    plt.savefig(plot_path)
+    logger.info("multi_mpc.plot_saved", path=str(plot_path))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run RayMultiMPC over a planning model.")
+    parser.add_argument("--vector",        type=str, default=VECTOR,
+                        help="Hydrogen vector (default: %(default)s)")
+    parser.add_argument("--ncpus",         type=int, default=NUM_DEVICES,
+                        help="Number of parallel MPC workers (default: %(default)s)")
+    parser.add_argument("--n_sim",         type=int, default=None,
+                        help="Total MPC runs. Defaults to --ncpus if not given.")
+    parser.add_argument("--dynamic_price", type=lambda x: x.lower() in ("true", "1", "yes"), default=False,
+                        help="Enable OU + jump-diffusion hydrogen price dynamics: True/False (default: False).")
+    parser.add_argument("--walltime_seconds", type=int, default=None,
+                        help="Total PBS walltime in seconds. Enables deadline-based early exit.")
+    parser.add_argument("--buffer_seconds",   type=int, default=300,
+                        help="Seconds to reserve before walltime for result saving (default: 300).")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+
+    VECTOR          = args.vector
+    NUM_DEVICES     = args.ncpus
+    NUM_INSTANCES   = args.n_sim if args.n_sim is not None else args.ncpus
+
+    PLANNING_MODEL  = f"{VECTOR}-Chile.yml"
+
+    run_multisim(args=args)
