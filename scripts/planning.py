@@ -13,7 +13,7 @@ logger = get_logger(__name__)
 def run_planning(vector_type: str):
     tmp_dir = Path(__file__).parent / "tmp"
     environment = Planning(
-        f"{vector_type}-Chile", weather_file="CoastalChile_15-20_Wind.csv", tmp_dir=tmp_dir
+        f"{vector_type}-Chile", weather_file=["CoastalChile_05-10_Wind.csv", "CoastalChile_10-15_Wind.csv", "CoastalChile_15-20_Wind.csv", "CoastalChile_20-21_Wind.csv", "CoastalChile_21-22_Wind.csv", "CoastalChile_23-24_Wind.csv"], tmp_dir=tmp_dir
     )
 
     with environment as env:

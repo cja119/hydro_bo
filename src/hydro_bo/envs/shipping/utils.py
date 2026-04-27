@@ -19,11 +19,11 @@ from pyomo.environ import (
     Reals,
     Binary,
 )
-from numpy.random import rand
 from numpy import ones, mean
 from math import floor
-from random import randint
 import yaml
+
+from hydro_bo.algs.seeding import make_rng
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -68,7 +68,8 @@ def _traverse(mapping: Mapping[str, Any], keys: Iterable[str]) -> Any:
 
 
 def import_mpc_data(
-    planning_model: str | Path | dict, vector: str, random_param: bool = False
+    planning_model: str | Path | dict, vector: str, random_param: bool = False,
+    random_param_seed: int = 0,
 ) -> Dict[str, Dict[str, Any]]:
     """Import MPC input data from config, variables, and planning model files."""
 
@@ -117,7 +118,12 @@ def import_mpc_data(
                     params[key] = {member: param[member] for member in members if member in param}
 
         elif isinstance(param, (list, tuple)):
-            params[key] = (param[2] - param[0]) * rand() + param[0] if random_param else param[1]
+            if random_param:
+                if "_random_param_rng" not in locals():
+                    _random_param_rng = make_rng(random_param_seed)
+                params[key] = (param[2] - param[0]) * float(_random_param_rng.random()) + param[0]
+            else:
+                params[key] = param[1]
         else:
             params[key] = param
 
@@ -238,8 +244,10 @@ def args_dict() -> Dict[str, Any]:
 def temporal_align(weather: Sequence[Any], randomise: bool = False, seed: int = 42) -> list[Any]:
     """Align weather data to a random or zero offset."""
     if randomise:
-        np.random.seed(seed)
-    random_start = randint(0, len(weather) - 1) if randomise else 0
+        rng = make_rng(seed)
+        random_start = int(rng.integers(0, len(weather)))
+    else:
+        random_start = 0
     return list(weather[random_start:]) + list(weather[:random_start])
 
 

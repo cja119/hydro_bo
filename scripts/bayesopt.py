@@ -18,6 +18,7 @@ from datetime import datetime
 from hydro_bo.algs.logging_config import configure_logging, get_logger
 from hydro_bo.algs.dispatcher import RayMultiMPC
 from hydro_bo.algs.bayesopt import BayesianOptimizer, configure_jax_threads
+from hydro_bo.algs.seeding import resolve_master_seed
 from hydro_bo.envs.shipping.utils import calculate_capex_opex
 
 logger = get_logger(__name__)
@@ -29,7 +30,7 @@ logger = get_logger(__name__)
 PLANNING_MODEL   = "NH3-Chile.yml"
 VECTOR           = "NH3"
 RENEWABLES       = "wind"
-WEATHER_FILE     = "CoastalChile_15-20_Wind.csv"
+WEATHER_FILE     = ["CoastalChile_05-10_Wind.csv", "CoastalChile_10-15_Wind.csv", "CoastalChile_15-20_Wind.csv", "CoastalChile_20-21_Wind.csv", "CoastalChile_21-22_Wind.csv", "CoastalChile_23-24_Wind.csv"]
 REFERENCE_PATH   = Path(__file__).parent / "tmp/planning" / PLANNING_MODEL
 
 BOUNDS_EXPANSION  = 0.5         # ±50 % around reference values
@@ -127,6 +128,7 @@ _eval_counter = 0
 _results_log = []
 _bayesopt_dir: Path | None = None
 _run_timestamp: str = ""
+_master_seed: int = 0
 
 def objective(x: np.ndarray, ref: dict) -> np.ndarray:
     """Run N_INSTANCES MPC simulations at x and return the array of valid
@@ -145,6 +147,7 @@ def objective(x: np.ndarray, ref: dict) -> np.ndarray:
         num_devices=NUM_DEVICES,
         timeout=TIMEOUT,
         exit_fraction=1.0,
+        master_seed=_master_seed + _eval_counter,
     )
 
     raw_scores = dispatcher.run_multisim()
@@ -290,7 +293,7 @@ def save_results_to_files(results_log: list, bayesopt_dir: Path, run_timestamp: 
 
 
 def run_bayesopt(args=None):
-    global _eval_counter, _results_log, _bayesopt_dir, _run_timestamp
+    global _eval_counter, _results_log, _bayesopt_dir, _run_timestamp, _master_seed
     _eval_counter = 0
     _results_log = []
 
@@ -301,9 +304,14 @@ def run_bayesopt(args=None):
 
     configure_logging(log_file=_bayesopt_dir / "run.log")
 
+    cli_seed = getattr(args, "master_seed", None) if args is not None else None
+    _master_seed = resolve_master_seed(cli_seed)
+    logger.info("bayesopt.master_seed", master_seed=_master_seed, cli_seed=cli_seed)
+
     if args is not None:
         args_dict = vars(args)
         args_dict["n_sim_resolved"] = N_INSTANCES  # record the resolved value
+        args_dict["master_seed_resolved"] = _master_seed
         with open(_bayesopt_dir / "args.json", "w") as f:
             json.dump(args_dict, f, indent=2)
         logger.info("bayesopt.args_saved", path=str(_bayesopt_dir / "args.json"))
@@ -331,7 +339,7 @@ def run_bayesopt(args=None):
         iter_limit=BO_ITER_LIMIT,
         lam=STDEV_PENALTY,
         n_restarts=5,
-        seed=42,
+        seed=_master_seed % (2**31),
     )
 
     sobol_dir_arg = getattr(args, "sobol_dir", None) if args is not None else None
@@ -390,6 +398,8 @@ def parse_args() -> argparse.Namespace:
                         help="Path to a sobol_mpc.py results directory (e.g. tmp/sobol/NH3/). "
                              "If set, cached (x, objective) pairs matching --vector, --scale_factor, "
                              "and --dynamic_price seed the GP and the Sobol phase is skipped.")
+    parser.add_argument("--master_seed",   type=int,   default=None,
+                        help="Master seed. If omitted, derived from PBS env vars + pid + wall time.")
     return parser.parse_args()
 
 

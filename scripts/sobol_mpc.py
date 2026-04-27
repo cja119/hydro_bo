@@ -25,6 +25,7 @@ from datetime import datetime
 
 from hydro_bo.algs.logging_config import configure_logging, get_logger
 from hydro_bo.algs.dispatcher import RayMultiMPC
+from hydro_bo.algs.seeding import resolve_master_seed
 
 # Shared helpers — import from bayesopt to avoid duplication
 from bayesopt import (
@@ -110,9 +111,16 @@ def run_sobol_eval(args=None):
 
     configure_logging(log_file=out_dir / "run.log")
 
+    cli_seed = getattr(args, "master_seed", None) if args is not None else None
+    master_seed = resolve_master_seed(cli_seed)
+    logger.info("sobol_mpc.master_seed", master_seed=master_seed, cli_seed=cli_seed,
+                index_row=index_row)
+
     if args is not None:
+        args_dict = vars(args)
+        args_dict["master_seed_resolved"] = master_seed
         with open(out_dir / "args.json", "w") as f:
-            json.dump(vars(args), f, indent=2)
+            json.dump(args_dict, f, indent=2)
         logger.info("sobol_mpc.args_saved", path=str(out_dir / "args.json"))
 
     # ------------------------------------------------------------------
@@ -170,6 +178,7 @@ def run_sobol_eval(args=None):
         num_devices=NUM_DEVICES,
         timeout=TIMEOUT,
         exit_fraction=1.0,
+        master_seed=master_seed,
     )
 
     # Compute deadline from walltime budget if provided
@@ -281,6 +290,8 @@ def parse_args() -> argparse.Namespace:
                         help="Total PBS walltime in seconds. Enables deadline-based early exit.")
     parser.add_argument("--buffer_seconds",   type=int, default=300,
                         help="Seconds to reserve before walltime for result saving (default: 300).")
+    parser.add_argument("--master_seed",      type=int, default=None,
+                        help="Master seed for the run. If omitted, derived from PBS env vars + pid + wall time.")
     return parser.parse_args()
 
 

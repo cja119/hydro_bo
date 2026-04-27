@@ -18,6 +18,7 @@ from datetime import datetime
 
 from hydro_bo.algs.logging_config import configure_logging, get_logger
 from hydro_bo.algs.dispatcher import RayMultiMPC
+from hydro_bo.algs.seeding import resolve_master_seed
 
 logger = get_logger(__name__)
 
@@ -27,7 +28,7 @@ logger = get_logger(__name__)
 
 VECTOR          = "NH3"
 PLANNING_MODEL  = f"{VECTOR}-Chile.yml"
-WEATHER_FILE    = "CoastalChile_15-20_Wind.csv"
+WEATHER_FILE    = ["CoastalChile_05-10_Wind.csv", "CoastalChile_10-15_Wind.csv", "CoastalChile_15-20_Wind.csv", "CoastalChile_20-21_Wind.csv", "CoastalChile_21-22_Wind.csv", "CoastalChile_23-24_Wind.csv"]
 
 NUM_INSTANCES   = os.cpu_count() - 1  # total MPC runs
 NUM_DEVICES     = os.cpu_count() - 1  # simultaneous workers
@@ -53,8 +54,13 @@ def run_multisim(args=None):
 
     configure_logging(log_file=out_dir / "run.log")
 
+    cli_seed = getattr(args, "master_seed", None) if args is not None else None
+    master_seed = resolve_master_seed(cli_seed)
+    logger.info("multi_mpc.master_seed", master_seed=master_seed, cli_seed=cli_seed)
+
     if args is not None:
         args_dict = vars(args)
+        args_dict["master_seed_resolved"] = master_seed
         with open(out_dir / "args.json", "w") as f:
             json.dump(args_dict, f, indent=2)
         logger.info("multi_mpc.args_saved", path=str(out_dir / "args.json"))
@@ -89,6 +95,7 @@ def run_multisim(args=None):
         exit_fraction=1.0,
         dump_diagnostics_on_failure=DUMP_DIAGNOSTICS_ON_FAILURE,
         log_dir=out_dir,
+        master_seed=master_seed,
     )
 
     logger.info("multi_mpc.initialized", num_instances=NUM_INSTANCES, num_devices=NUM_DEVICES, timeout=TIMEOUT)
@@ -175,6 +182,8 @@ def parse_args() -> argparse.Namespace:
                         help="Total PBS walltime in seconds. Enables deadline-based early exit.")
     parser.add_argument("--buffer_seconds",   type=int, default=300,
                         help="Seconds to reserve before walltime for result saving (default: 300).")
+    parser.add_argument("--master_seed",      type=int, default=None,
+                        help="Master seed for the run. If omitted, derived from PBS env vars + pid + wall time.")
     return parser.parse_args()
 
 

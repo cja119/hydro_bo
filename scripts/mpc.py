@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hydro_bo import ShippingEnv
 from hydro_bo import configure_logging
 from hydro_bo.algs.logging_config import get_logger
+from hydro_bo.algs.seeding import resolve_master_seed
 
 # Configure structured logging
 configure_logging()
@@ -16,13 +17,14 @@ PLOT_DIR = Path(__file__).parent / "tmp/shipping_plots"
 
 def run_shipping(vector_type: str, seed: int = None):
     environment = ShippingEnv("shipping-plot")
+    master_seed = resolve_master_seed(seed)
+    logger.info("shipping_mpc.master_seed", master_seed=master_seed, cli_seed=seed)
 
     with environment as env:
         env["vector"] = vector_type
         env["mpc"]["planning_model"] = f"{vector_type}-Chile.yml"
-        env["weather_data"]["weather_file"] = "CoastalChile_15-20_Wind.csv"
-        if seed is not None:
-            env["seed"] = seed
+        env["weather_data"]["weather_file"] = ["CoastalChile_05-10_Wind.csv", "CoastalChile_10-15_Wind.csv", "CoastalChile_15-20_Wind.csv", "CoastalChile_20-21_Wind.csv", "CoastalChile_21-22_Wind.csv", "CoastalChile_23-24_Wind.csv"]
+        env["seed"] = master_seed
 
     # Advance the environment until 12 months are reached
     while True:

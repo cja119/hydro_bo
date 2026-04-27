@@ -46,11 +46,14 @@ class ShippingEnv:
 
     def _build_env(self) -> None:
         # rebuild controller/dynamics from current args
-        self._controller = MPCController()
+        from hydro_bo.algs.seeding import derive_subseed
+        master_seed = int(self._args.get("seed", 0))
+        self._controller = MPCController(gurobi_seed=derive_subseed(master_seed, "gurobi"))
         self._controller_data = import_mpc_data(
             self._args["mpc"]["planning_model"],
             self._args["vector"],
             self._args["mpc"]["random_param"],
+            random_param_seed=derive_subseed(master_seed, "random_param"),
         )
 
         self._controller_data.update(
@@ -304,10 +307,14 @@ class ShippingEnvPlot(ShippingEnv):
         return self._args
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
+        from hydro_bo.algs.seeding import derive_subseed
+        master_seed = int(self._args.get("seed", 0))
+        self._controller = MPCController(gurobi_seed=derive_subseed(master_seed, "gurobi"))
         self._controller_data = import_mpc_data(
             self._args["mpc"]["planning_model"],
             self._args["vector"],
             self._args["mpc"]["random_param"],
+            random_param_seed=derive_subseed(master_seed, "random_param"),
         )
 
         self._controller_data.update(

@@ -152,8 +152,18 @@ class Dataset:
         n = self.n.astype(float)
         return np.where(n > 1, 2.0 / np.maximum(n - 1, 1.0), np.nan)
 
+class BaseGP(ABC):
+    @abstractmethod
+    def fit(self, X: np.ndarray, y: np.ndarray, noise: np.ndarray) -> None:
+        """Fit the GP to data (X, y) with per-point noise variances."""
+        ...
+    
+    @abstractmethod
+    def predict(self, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Predict (mean, var) at X_test."""
+        ...
 
-class HeteroscedasticGP:
+class HeteroscedasticGP(BaseGP):
     """Exact GP regression with constant mean, ARD RBF kernel, and fixed
     per-point observation noise. Hyperparameters (kernel amplitude,
     lengthscales, mean) are fit by L-BFGS on the negative marginal
@@ -275,9 +285,7 @@ class HeteroscedasticGP:
         )
 
 
-# Module-level jit handles. Cached once per process so repeated fits at the
-# SAME (n, d) shape reuse the compiled XLA program instead of building a fresh
-# one — and crucially, do not pile up under fresh closure identities.
+# Module-level jit handles. 
 _JIT_NMLL = None
 _JIT_FACTORISE = None
 _JIT_PREDICT = None
@@ -409,25 +417,17 @@ class AcquisitionFunction(ABC):
 
 
 class NoisyExpectedImprovement(AcquisitionFunction):
-    """Noisy EI on g(x) = mu(x) - lam * sigma(x), where
-    sigma(x) = sqrt(sigma^2(x)). The stdev penalty (rather than variance)
-    keeps lam in the same units as f.
+    """
+    Approximate EI for a heteroscedastic GP objective. Our objective is not 
+    purely normal as g(x) = mu(x) - lam * sigma(x) with sigma(x) ~ LogNormal.
 
-    The two GP posteriors are treated as independent. Mean GP gives a
-    Gaussian on mu(x); log-variance GP gives a Gaussian on log_sigma2(x),
-    so sigma(x) = exp(log_sigma2(x) / 2) is log-normal with parameters
-    (m_lv / 2, v_lv / 4). The posterior of g(x) is moment-matched to a
-    Gaussian using closed-form log-normal moments:
+    Due to the scale difference of mu and signa, we assume that g(x) is still 
+    normally distributed, and match first and second order moments. (Assuming 
+    independenceof mu and sigma).
 
-        E[sigma(x)]   = exp(m_lv/2 + v_lv/8)
-        Var[sigma(x)] = (exp(v_lv/4) - 1) * exp(m_lv + v_lv/4)
-        E[g(x)]       = m_mu  - lam * E[sigma(x)]
-        Var[g(x)]     = v_mu  + lam^2 * Var[sigma(x)]
+    The acquisition is then EI with respect to the incumbent g_best = max_i E[g(x_i)].
 
-    The incumbent g_best = max_i E[g(x_i)] over training points (uses
-    GP posterior means rather than raw observations — this is the
-    "noisy" part of noisy EI). All quantities are de-standardised to the
-    original f scale so lam is in original objective units.
+    g_best = max(mu_i - lam * sigma_i)
     """
 
     def __init__(self, gp_mu: HeteroscedasticGP, gp_log_var: HeteroscedasticGP,
@@ -622,11 +622,12 @@ class BayesianOptimizer:
         n_mu = ds.n[m_mu].astype(float)
 
         if log_var_fit:
-            log_v_pred_s, _ = self.gp_log_var.predict(
+            log_v_pred_s, log_v_pred_v = self.gp_log_var.predict(
                 jnp.asarray(X_mu, dtype=jnp.float64)
             )
             log_v_pred = np.asarray(log_v_pred_s) * ds._sigma_lv + ds._mu_lv
-            pop_var = np.exp(log_v_pred)
+            log_v_pred_var = np.asarray(log_v_pred_v) * ds._sigma_lv ** 2
+            pop_var = np.exp(log_v_pred + 1/2 * log_v_pred_var)
         else:
             sv = ds.sigma2[m_mu]
             mean_finite = float(np.nanmean(sv)) if np.isfinite(sv).any() else 1.0
