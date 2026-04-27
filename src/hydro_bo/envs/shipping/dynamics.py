@@ -1,8 +1,8 @@
-from numpy.random import normal
 from pyomo.environ import value
 from meteor_py import GetData
 from math import floor
 from .utils import temporal_align, generate_weather_forecast, count_and_shift_arrivals
+from hydro_bo.algs.seeding import derive_subseed, make_rng
 
 import numpy as np
 
@@ -13,9 +13,10 @@ class Dynamics:
         self._call_count = 0
         self._args = args
 
-        np.random.seed(args["seed"])
+        seed = int(args["seed"])
+        self._rng = make_rng(derive_subseed(seed, "dynamics"))
 
-        self._init_weather_data(args["seed"])
+        self._init_weather_data(derive_subseed(seed, "weather"))
 
         self.new_states = None
         self.iter_count = 0
@@ -25,7 +26,6 @@ class Dynamics:
         self.states = self._init_state_variables()
         self.destination_storage = 0.5 * slow_data["params"]["storage_capacity"]
 
-        # Price dynamics (OU + jump diffusion) — toggled via config.yml price_dynamics.enabled
         pd_cfg = fast_data.get("price_dynamics", {})
         if pd_cfg.get("enabled", False):
             self._price_dynamics = PriceDynamics(
@@ -36,7 +36,7 @@ class Dynamics:
                 jump_mu=float(pd_cfg.get("jump_mu", 0.05)),
                 jump_sigma=float(pd_cfg.get("jump_sigma", 0.2)),
                 initial_price=float(pd_cfg.get("initial_price", 5.0)),
-                seed=args["seed"],
+                seed=derive_subseed(seed, "price"),
             )
             self.h2_price = float(pd_cfg.get("initial_price", 5.0))
         else:
@@ -199,7 +199,7 @@ class Dynamics:
             updated_baseline = []
             for remaining_days in self.ship_origin_latent[size]:
                 # Freeze noise for near-arrivals to avoid one-day rollover jitter.
-                disturbance_days = 0.0 if float(remaining_days) <= 1.0 else float(normal(0.0, std_days))
+                disturbance_days = 0.0 if float(remaining_days) <= 1.0 else float(self._rng.normal(0.0, std_days))
                 new_remaining_latent = float(remaining_days) - 1.0 + disturbance_days
                 updated_latent.append(new_remaining_latent)
 
@@ -293,8 +293,7 @@ class PriceDynamics:
 
         self.price = initial_price
 
-        if seed is not None:
-            np.random.seed(seed)
+        self._rng = make_rng(seed) if seed is not None else make_rng(0)
 
     def step(self, dt=1/365):
         """
@@ -313,7 +312,7 @@ class PriceDynamics:
         std = np.sqrt(var)
 
         # Gaussian shock
-        diffusion = std * np.random.normal()
+        diffusion = std * self._rng.normal()
 
         # Jump component
         jump = self._jump_step(dt)
@@ -330,6 +329,6 @@ class PriceDynamics:
         """
         Compound Poisson jump in log space
         """
-        if np.random.rand() < self.lambda_ * dt:
-            return np.random.normal(self.jump_mu, self.jump_sigma)
+        if self._rng.random() < self.lambda_ * dt:
+            return float(self._rng.normal(self.jump_mu, self.jump_sigma))
         return 0.0

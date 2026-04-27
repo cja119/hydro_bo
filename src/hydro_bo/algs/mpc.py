@@ -60,7 +60,7 @@ def find_equivalent_set(model, values):
 
 
 class MPCController:
-    def __init__(self):
+    def __init__(self, gurobi_seed=None):
         self.model = AbstractModel()
         self._update_keys = None
         self._fig = None
@@ -69,6 +69,7 @@ class MPCController:
         self.instance = None
         self.solver = None
         self._solver_configured = False
+        self._gurobi_seed = gurobi_seed
         self._instance_bound = False
         self._needs_instance_rebuild = False
         self._solution_cache = {}
@@ -756,6 +757,9 @@ class MPCController:
         opts["TimeLimit"] = 300
         opts["Threads"] = 1
         opts["Method"] = 2
+        if self._gurobi_seed is not None:
+            from hydro_bo.algs.seeding import gurobi_seed as _clamp_gurobi_seed
+            opts["Seed"] = _clamp_gurobi_seed(self._gurobi_seed)
         self._solver_configured = True
 
     def _ship_orders(self, solve, time_step, t_start):
