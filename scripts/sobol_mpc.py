@@ -44,7 +44,7 @@ logger = get_logger(__name__)
 
 VECTOR               = "NH3"
 PLANNING_MODEL       = "NH3-Chile.yml"
-WEATHER_FILE         = "CoastalChile_15-20_Wind.csv"
+WEATHER_FILE         = ["CoastalChile_05-10_Wind.csv", "CoastalChile_10-15_Wind.csv", "CoastalChile_15-20_Wind.csv", "CoastalChile_20-21_Wind.csv", "CoastalChile_21-22_Wind.csv", "CoastalChile_23-24_Wind.csv"]
 
 NUM_INSTANCES        = os.cpu_count() - 1
 NUM_DEVICES          = os.cpu_count() - 1
