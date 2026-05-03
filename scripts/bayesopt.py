@@ -67,6 +67,11 @@ PARAM_KEYS = [
     "vector_storage_capacity",
 ]
 
+# Keys whose feasible values are integers. The BO branches over their integer
+# levels (one LBFGS-B refinement per combo) instead of treating them as
+# continuous and rounding the optimum.
+INTEGER_KEYS = {"conversion_trains_number"}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -89,6 +94,33 @@ def build_bounds(ref: dict, expansion: float) -> np.ndarray:
             lo = max(1.0, lo)
         bounds.append([lo, hi])
     return np.array(bounds)
+
+
+def build_cat_vars(bounds: np.ndarray,
+                   integer_keys: set) -> list[tuple[int, list[float]]]:
+    """Enumerate the integer levels of each integer dim and project them to
+    unit-cube positions for the BO branch optimiser. Returns a list of
+    (full_dim_index, [unit_cube_positions]) tuples."""
+    import math
+    cat_vars: list[tuple[int, list[float]]] = []
+    for i, key in enumerate(PARAM_KEYS):
+        if key not in integer_keys:
+            continue
+        lo, hi = float(bounds[i, 0]), float(bounds[i, 1])
+        span = hi - lo
+        if span <= 0:
+            raise ValueError(
+                f"Integer key {key!r} has degenerate bounds [{lo}, {hi}]"
+            )
+        lo_int = int(math.ceil(lo))
+        hi_int = int(math.floor(hi))
+        if hi_int < lo_int:
+            raise ValueError(
+                f"Integer key {key!r} bounds [{lo}, {hi}] contain no integers"
+            )
+        unit_positions = [(k - lo) / span for k in range(lo_int, hi_int + 1)]
+        cat_vars.append((i, unit_positions))
+    return cat_vars
 
 
 def params_from_x(x: np.ndarray, ref: dict) -> dict:
@@ -132,9 +164,13 @@ _master_seed: int = 0
 
 def objective(x: np.ndarray, ref: dict) -> np.ndarray:
     """Run N_INSTANCES MPC simulations at x and return the array of valid
-    worker scores. Drops non-finite entries and dispatcher penalty values
-    (≤ -1e7). If fewer than MIN_VALID_SAMPLES survive, returns a single
-    synthetic FAILURE_PENALTY sample so the surrogate learns to avoid x."""
+    worker scores. Drops non-finite entries and any score <= -10 (catches
+    catastrophic-but-finite outputs alongside dispatcher -inf penalties).
+    If fewer than MIN_VALID_SAMPLES survive, returns a single synthetic
+    FAILURE_PENALTY sample so the surrogate sees a low anchor at x and the
+    acquisition naturally avoids the region — without writing off the entire
+    categorical level (other continuous values within the same combo can
+    still be feasible)."""
     global _eval_counter
     _eval_counter += 1
 
@@ -152,7 +188,7 @@ def objective(x: np.ndarray, ref: dict) -> np.ndarray:
 
     raw_scores = dispatcher.run_multisim()
     arr = np.asarray(raw_scores, dtype=float).ravel() if raw_scores else np.array([], dtype=float)
-    valid_mask = np.isfinite(arr) & (arr > -1e7)
+    valid_mask = np.isfinite(arr) & (arr > -10.0)
     valid_scores = arr[valid_mask]
     n_valid = int(valid_scores.size)
     n_failed = int(arr.size - n_valid)
@@ -244,13 +280,13 @@ def load_sobol_cache(sobol_dir: Path, expected_vector: str,
         scores = data.get("worker_scores")
         if scores is None:
             obj = data.get("objective")
-            if obj is None or not np.isfinite(obj) or obj <= -1e7:
+            if obj is None or not np.isfinite(obj) or obj <= -10.0:
                 n_failed += 1
                 continue
             scores = [obj]
 
         arr = np.asarray(scores, dtype=float).ravel()
-        valid = np.isfinite(arr) & (arr > -1e7)
+        valid = np.isfinite(arr) & (arr > -10.0)
         valid_arr = arr[valid]
         if valid_arr.size < MIN_VALID_SAMPLES:
             n_failed += 1
@@ -327,10 +363,21 @@ def run_bayesopt(args=None):
         return None, None
 
     bounds = build_bounds(ref, BOUNDS_EXPANSION)
+    cat_vars = build_cat_vars(bounds, INTEGER_KEYS)
 
     logger.info("bayesopt.search_space", dims=len(PARAM_KEYS))
     for key, (lo, hi) in zip(PARAM_KEYS, bounds):
         logger.info("bayesopt.parameter_bounds", parameter=key, lower=lo, upper=hi)
+    for dim_idx, positions in cat_vars:
+        logger.info("bayesopt.cat_var",
+                    parameter=PARAM_KEYS[dim_idx],
+                    dim=dim_idx,
+                    integer_levels=[
+                        int(round(bounds[dim_idx, 0]
+                                  + p * (bounds[dim_idx, 1] - bounds[dim_idx, 0])))
+                        for p in positions
+                    ],
+                    unit_positions=positions)
 
     bo = BayesianOptimizer(
         f=lambda x: objective(x, ref),
@@ -340,6 +387,7 @@ def run_bayesopt(args=None):
         lam=STDEV_PENALTY,
         n_restarts=5,
         seed=_master_seed % (2**31),
+        cat_vars=cat_vars,
     )
 
     sobol_dir_arg = getattr(args, "sobol_dir", None) if args is not None else None
@@ -400,7 +448,77 @@ def parse_args() -> argparse.Namespace:
                              "and --dynamic_price seed the GP and the Sobol phase is skipped.")
     parser.add_argument("--master_seed",   type=int,   default=None,
                         help="Master seed. If omitted, derived from PBS env vars + pid + wall time.")
+    parser.add_argument("--check_config",  action="store_true",
+                        help="Print the resolved bounds, cat_vars, and key hyperparameters then exit "
+                             "without launching the BO. Useful as a pre-flight check before submitting a job.")
     return parser.parse_args()
+
+
+def print_check_config(args):
+    """Resolve bounds + cat_vars + sobol cache without running the BO. Used by
+    --check_config. Prints to stdout in a human-readable form."""
+    print(f"VECTOR           : {VECTOR}")
+    print(f"PLANNING_MODEL   : {PLANNING_MODEL}")
+    print(f"BOUNDS_EXPANSION : {BOUNDS_EXPANSION}")
+    print(f"BO_ITER_LIMIT    : {BO_ITER_LIMIT}")
+    print(f"N_INITIAL_POINTS : {N_INITIAL_POINTS}")
+    print(f"N_INSTANCES      : {N_INSTANCES}")
+    print(f"NUM_DEVICES      : {NUM_DEVICES}")
+    print(f"STDEV_PENALTY    : {STDEV_PENALTY}")
+    print(f"FAILURE_PENALTY  : {FAILURE_PENALTY}")
+    print(f"MIN_VALID_SAMPLES: {MIN_VALID_SAMPLES}")
+    print(f"INTEGER_KEYS     : {sorted(INTEGER_KEYS)}")
+    print(f"sobol_dir        : {getattr(args, 'sobol_dir', None)}")
+    print(f"dynamic_price    : {getattr(args, 'dynamic_price', False)}")
+    print()
+
+    try:
+        ref = load_reference(REFERENCE_PATH)
+    except FileNotFoundError:
+        print(f"ERROR: planning model not found at {REFERENCE_PATH}")
+        print(f"       run: python scripts/planning.py {VECTOR}")
+        return
+
+    print(f"Reference values from {REFERENCE_PATH.name}:")
+    for key in PARAM_KEYS:
+        val = ref[key]
+        marker = "  (INT)" if key in INTEGER_KEYS else ""
+        print(f"  {key:30s}: {val}{marker}")
+    print()
+
+    bounds = build_bounds(ref, BOUNDS_EXPANSION)
+    cat_vars = build_cat_vars(bounds, INTEGER_KEYS)
+
+    print("Resolved bounds:")
+    for key, (lo, hi) in zip(PARAM_KEYS, bounds):
+        marker = "  (INT)" if key in INTEGER_KEYS else ""
+        print(f"  {key:30s}: [{lo:>12.4g}, {hi:>12.4g}]{marker}")
+    print()
+
+    print("cat_vars (categorical/integer dim wiring for the BO):")
+    if not cat_vars:
+        print("  (none — kernel rounding will be a no-op)")
+    for dim_idx, positions in cat_vars:
+        lo, hi = bounds[dim_idx]
+        levels = [int(round(lo + p * (hi - lo))) for p in positions]
+        print(f"  dim={dim_idx} ({PARAM_KEYS[dim_idx]})")
+        print(f"    integer levels  : {levels}")
+        print(f"    unit positions  : {[round(p, 6) for p in positions]}")
+        print(f"    n_combos in branch optimiser: {len(positions)}")
+    print()
+
+    sobol_dir_arg = getattr(args, "sobol_dir", None)
+    if sobol_dir_arg:
+        sobol_dir = Path(sobol_dir_arg)
+        if not sobol_dir.is_absolute():
+            sobol_dir = Path(__file__).parent / sobol_dir
+        print(f"Sobol cache dir   : {sobol_dir}")
+        print(f"  exists?         : {sobol_dir.exists()}")
+        if sobol_dir.exists():
+            n_rows = len(list(sobol_dir.glob("row_*")))
+            print(f"  row_* count     : {n_rows}")
+    else:
+        print("No --sobol_dir; BO will use Sobol init phase from scratch.")
 
 
 if __name__ == "__main__":
@@ -430,5 +548,9 @@ if __name__ == "__main__":
             "price_dynamics": {"enabled": args.dynamic_price},
         },
     }
+
+    if args.check_config:
+        print_check_config(args)
+        sys.exit(0)
 
     run_bayesopt(args=args)

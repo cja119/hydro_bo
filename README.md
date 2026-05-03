@@ -2,10 +2,6 @@
 
 Bayesian Optimisation of Hydrogen Export Infrastructure
 
-<p align="center">
-  <img src="png/hydro_bo.png" alt="Centered Image" width="400"/>
-</p>
-
 ## Installation
 
 Run the following shell commands to clone onto your local system (reccomended):

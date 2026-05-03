@@ -210,7 +210,9 @@ def run_mpc(env_args, id, params, dump_diagnostics=False, log_dir=None, master_s
                         'total_relaxations': len(history),
                         'relaxations_used': [h['name'] for h in history]
                     }
-                return True, total_reward / total_tonnes if total_tonnes > 0 else 0.0, relaxation_info
+
+                score = total_reward / total_tonnes if total_tonnes > 0 else float("-inf")
+                return True, score, relaxation_info
 
     except Exception as e:
         print(
