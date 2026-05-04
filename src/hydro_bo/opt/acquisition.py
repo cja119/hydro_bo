@@ -37,6 +37,7 @@ def _ei_g_stats(x, gp_mu_state, gp_log_var_state, scaling, round_info):
         gp_mu_state["L"],
         gp_mu_state["alpha"],
         gp_mu_state["mean"],
+        gp_mu_state["mask"],
         x,
         round_info,
     )
@@ -46,6 +47,7 @@ def _ei_g_stats(x, gp_mu_state, gp_log_var_state, scaling, round_info):
         gp_log_var_state["L"],
         gp_log_var_state["alpha"],
         gp_log_var_state["mean"],
+        gp_log_var_state["mask"],
         x,
         round_info,
     )
@@ -175,6 +177,7 @@ def _feasibility_eval(x, gp_bin_state, log_p_targ, z_sc, round_info):
         gp_bin_state["L"],
         gp_bin_state["alpha"],
         gp_bin_state["mean"],
+        gp_bin_state["mask"],
         x[None, :],
         round_info,
     )
