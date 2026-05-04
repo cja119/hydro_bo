@@ -16,9 +16,9 @@ import yaml
 import numpy as np
 from datetime import datetime
 
-from hydro_bo.algs.logging_config import configure_logging, get_logger
-from hydro_bo.algs.dispatcher import RayMultiMPC
-from hydro_bo.algs.seeding import resolve_master_seed
+from hydro_bo.utils.logging_config import configure_logging, get_logger
+from hydro_bo.mpc.dispatcher import RayMultiMPC
+from hydro_bo.utils.seeding import resolve_master_seed
 
 logger = get_logger(__name__)
 

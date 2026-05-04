@@ -23,7 +23,7 @@ from numpy import ones, mean
 from math import floor
 import yaml
 
-from hydro_bo.algs.seeding import make_rng
+from hydro_bo.utils.seeding import make_rng
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -100,8 +100,22 @@ def import_mpc_data(
     if total_duration is None:
         raise KeyError("Time.total_duration is required in config.yml")
 
+    # `forecast_horizon` is a scalar, not a grid spacing — keep it out of
+    # the set-construction loop and pull it out for validation below.
+    forecast_horizon = int(time_config.get("forecast_horizon", 168))
+    if forecast_horizon < 24:
+        raise ValueError(
+            f"Time.forecast_horizon must be >= 24h (got {forecast_horizon}); "
+            "anything shorter starves the MPC of intra-day signal."
+        )
+    if forecast_horizon > int(total_duration):
+        raise ValueError(
+            f"Time.forecast_horizon ({forecast_horizon}) cannot exceed "
+            f"Time.total_duration ({int(total_duration)})."
+        )
+
     for key, step in time_config.items():
-        if key == "total_duration":
+        if key in ("total_duration", "forecast_horizon"):
             continue
         sets[key] = [val * step for val in range(total_duration // step)]
 
@@ -127,6 +141,12 @@ def import_mpc_data(
         else:
             params[key] = param
 
+    # variables.yml defaults run BEFORE planning_model overrides so the
+    # BO can supply values (e.g. storage backoffs) that override the
+    # defaults via `param_overrides` rather than being clobbered by them.
+    for key, param in variables.get("parameters", {}).items():
+        params[key] = param
+
     if planning_model_path is not None:
         planning_model_data = _load_yaml(planning_model_path)
     for item in config.get("param_source", {}).get("planning_model", []):
@@ -145,15 +165,19 @@ def import_mpc_data(
             "domain": domain_map.get(value["domain"], Reals),
         }
 
-    for key, param in variables.get("parameters", {}).items():
-        params[key] = param
-
     for key, value in config.get("formulations", {}).items():
         forms[key] = value
 
     price_dynamics = config.get("price_dynamics", {"enabled": False})
 
-    return {"sets": sets, "params": params, "vars": vars, "forms": forms, "price_dynamics": price_dynamics}
+    return {
+        "sets": sets,
+        "params": params,
+        "vars": vars,
+        "forms": forms,
+        "price_dynamics": price_dynamics,
+        "forecast_horizon": forecast_horizon,
+    }
 
 
 def import_mpc_functions(data_folder: str, sets: Mapping[str, Sequence[Any]]) -> Dict[str, Dict[str, Any]]:
@@ -368,9 +392,22 @@ def calculate_capex_opex(
     }
 
 
-def generate_weather_forecast(weather_data: Sequence[float], start_idx: int, grid_set: Sequence[Any]) -> list[float]:
-    end = start_idx + 168
+def generate_weather_forecast(
+    weather_data: Sequence[float],
+    start_idx: int,
+    grid_set: Sequence[Any],
+    forecast_horizon: int = 168,
+) -> list[float]:
+    """Slice `forecast_horizon` hours of true weather starting at
+    `start_idx`, then pad to the full grid length with the climatological
+    mean. The horizon is the design knob that controls how much
+    look-ahead the MPC actually receives — anything beyond it is just
+    flat mean weather. Caller is expected to validate the horizon
+    against `total_duration`; we still clip defensively against the
+    grid length to avoid an empty slice."""
     full_length = len(grid_set)
+    horizon = max(1, min(int(forecast_horizon), full_length))
+    end = start_idx + horizon
     mean_weather = float(mean(weather_data))
 
     forecast = list(weather_data[start_idx:end])

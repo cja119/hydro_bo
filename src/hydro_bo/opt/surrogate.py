@@ -1,0 +1,446 @@
+"""GP surrogates used by the Bayesian optimiser."""
+
+from abc import ABC, abstractmethod
+from functools import partial
+
+import numpy as np
+import jax
+import jax.numpy as jnp
+
+
+def _project_integer_dims(X, round_info):
+    """Snap the integer dims of X to their nearest unit-cube grid position.
+    round_info: sorted tuple of (dim_idx, n_levels) — both static Python ints.
+    Empty round_info is a no-op (returns X unchanged)."""
+    if not round_info:
+        return X
+    for idx, n in round_info:
+        if n <= 1:
+            continue
+        denom = n - 1
+        col = X[..., idx]
+        rounded = jnp.round(col * denom) / denom
+        X = X.at[..., idx].set(rounded)
+    return X
+
+
+@partial(jax.jit, static_argnames="round_info")
+def _kernel(log_amp, log_ls, X1, X2, round_info):
+    """ARD RBF kernel with optional projection of integer dims onto a
+    discrete unit-cube grid. round_info is a static Python tuple — empty
+    skips projection."""
+    if round_info:
+        X1 = _project_integer_dims(X1, round_info)
+        X2 = _project_integer_dims(X2, round_info)
+    amp2 = jnp.exp(2.0 * log_amp)
+    ls = jnp.exp(log_ls)
+    diff = (X1[:, None, :] - X2[None, :, :]) / ls
+    d2 = jnp.sum(diff * diff, axis=-1)
+    return amp2 * jnp.exp(-0.5 * d2)
+
+
+@partial(jax.jit, static_argnames="round_info")
+def _neg_mll(params, X, y, noise, jitter, round_info):
+    n = X.shape[0]
+    K = _kernel(params["log_amp"], params["log_ls"], X, X, round_info)
+    K = K + jnp.diag(noise) + jitter * jnp.eye(n)
+    y_c = y - params["mean"]
+    L = jnp.linalg.cholesky(K)
+    alpha = jax.scipy.linalg.cho_solve((L, True), y_c)
+    log_det = 2.0 * jnp.sum(jnp.log(jnp.diag(L)))
+    return 0.5 * (jnp.dot(y_c, alpha) + log_det + n * jnp.log(2.0 * jnp.pi))
+
+
+@partial(jax.jit, static_argnames="round_info")
+def _factorise(params, X, y, noise, jitter, round_info):
+    n = X.shape[0]
+    K = _kernel(params["log_amp"], params["log_ls"], X, X, round_info)
+    K = K + jnp.diag(noise) + jitter * jnp.eye(n)
+    L = jnp.linalg.cholesky(K)
+    alpha = jax.scipy.linalg.cho_solve((L, True), y - params["mean"])
+    return L, alpha
+
+
+@partial(jax.jit, static_argnames="round_info")
+def _predict(params, X_train, L, alpha, mean, X_test, round_info):
+    K_s = _kernel(params["log_amp"], params["log_ls"], X_test, X_train, round_info)
+    amp2 = jnp.exp(2.0 * params["log_amp"])
+    mu = mean + K_s @ alpha
+    v = jax.scipy.linalg.cho_solve((L, True), K_s.T)
+    var = amp2 - jnp.sum(K_s * v.T, axis=1)
+    var = jnp.clip(var, 1e-12, None)
+    return mu, var
+
+@partial(jax.jit, static_argnames="round_info")
+def _predict_zero_mean(params, X_train, L, alpha, X_test, round_info):
+    params_zero_mean = {**params, "mean": jnp.array(0.0, dtype=jnp.float64)}
+    return _predict(
+        params_zero_mean,
+        X_train,
+        L,
+        alpha,
+        params_zero_mean["mean"],
+        X_test,
+        round_info,
+    )
+
+
+@partial(jax.jit, static_argnames=("round_info", "vi_max_iters"))
+def _vi_inner_loop(params, X, k, N, jitter, round_info, vi_max_iters):
+    """PG-VI alternating updates. Returns (omega, m, S_diag) at convergence."""
+    n = X.shape[0]
+
+    K = _kernel(params["log_amp"], params["log_ls"], X, X, round_info)
+    K = K + jitter * jnp.eye(n)
+    kappa = k - N / 2.0
+
+    omega_init = N / 4.0  # value at c=0
+
+    def body(omega, _):
+        # f-update: solve (K + diag(1/ω)) α = ỹ, then m = K α
+        noise = 1.0 / omega
+        K_plus_noise = K + jnp.diag(noise)
+        L = jnp.linalg.cholesky(K_plus_noise)
+        y_tilde = kappa / omega
+        alpha = jax.scipy.linalg.cho_solve((L, True), y_tilde)
+        m = K @ alpha
+
+        # diag(S): S = K - K (K + diag(1/ω))^{-1} K
+        v = jax.scipy.linalg.cho_solve((L, True), K)
+        S_diag = jnp.diag(K) - jnp.sum(K * v.T, axis=1)
+        S_diag = jnp.clip(S_diag, 1e-12, None)
+
+        # ω-update
+        c = jnp.sqrt(m**2 + S_diag)
+        c = jnp.maximum(c, 1e-6)
+        omega_new = N / (2.0 * c) * jnp.tanh(c / 2.0)
+
+        return omega_new, (m, S_diag)
+
+    omega_final, (m_traj, S_diag_traj) = jax.lax.scan(
+        body, omega_init, None, length=vi_max_iters
+    )
+
+    return omega_final, m_traj[-1], S_diag_traj[-1]
+
+
+@partial(jax.jit, static_argnames=("round_info", "vi_max_iters"))
+def _neg_elbo(params, X, k, N, jitter, round_info, vi_max_iters):
+    """Negative ELBO for PG-augmented Binomial GP.
+
+    Runs the inner PG-VI fixed-point loop to convergence at the given
+    kernel hyperparameters, then evaluates the variational lower bound
+    on log p(k | X, hyperparameters).
+
+    Args:
+        params: dict with "log_amp", "log_ls" (kernel hyperparameters).
+            Note: no "mean" — latent f is zero-mean by convention.
+        X: (n, d) training inputs.
+        k: (n,) success counts.
+        N: (n,) trial counts.
+        jitter: scalar diagonal regularisation.
+        round_info: static tuple of integer-dimension info (for kernel).
+        vi_max_iters: int, number of inner VI iterations.
+
+    Returns:
+        Scalar negative ELBO. Suitable for L-BFGS minimisation.
+    """
+    n = X.shape[0]
+
+    # 1. Run inner VI loop to converged (omega, m, S_diag).
+    omega, m, S_diag = _vi_inner_loop(params, X, k, N, jitter, round_info, vi_max_iters)
+
+    # 2. Build the kernel matrix at converged hyperparameters.
+    K = _kernel(params["log_amp"], params["log_ls"], X, X, round_info)
+    K = K + jitter * jnp.eye(n)
+
+    # 3. Convenience quantities.
+    kappa = k - N / 2.0  # centred sufficient statistic
+    c = jnp.sqrt(m**2 + S_diag)  # PG tilting parameter
+    noise = 1.0 / omega  # synthetic noise variance
+
+    # 4. Cholesky factorisations we need.
+    # K_plus_noise = K + diag(1/ω) — used for the variational covariance.
+    K_plus_noise = K + jnp.diag(noise)
+    L_kn = jnp.linalg.cholesky(K_plus_noise)
+    # L_K = Cholesky of K — used for the prior KL term.
+    L_K = jnp.linalg.cholesky(K)
+
+    # 5. ELBO terms.
+
+    # 5a. Expected log-likelihood under q.
+    #     E_q[log p(k|N,f,ω)] = κ^T m - 1/2 sum_i ω_i (m_i^2 + S_ii)
+    #                        + sum_i [- N_i log 2  ... constants ...]
+    # Constants don't depend on hyperparameters, drop them for L-BFGS.
+    expected_loglik = jnp.dot(kappa, m) - 0.5 * jnp.sum(omega * (m**2 + S_diag))
+
+    # 5b. Cross-entropy / PG term from E_q[log p(ω) / q(ω)].
+    #     For PG(N, 0) prior and PG(N, c) posterior, this works out to
+    #     sum_i [N_i log cosh(c_i / 2) - c_i^2 ω_i / 2]
+    pg_kl = jnp.sum(N * jnp.log(jnp.cosh(c / 2.0)) - 0.5 * c**2 * omega)
+
+    # 5c. Gaussian-Gaussian KL: KL(q(f) || p(f)) where p(f) = N(0, K),
+    #     q(f) = N(m, S) with S = (K^{-1} + diag(ω))^{-1}.
+    #
+    #     KL = 1/2 [tr(K^{-1} S) + m^T K^{-1} m - n + log|K| - log|S|]
+
+    # tr(K^{-1} S): use the identity K^{-1} S = I - diag(ω) S, so
+    #              tr(K^{-1} S) = n - tr(diag(ω) S) = n - sum_i ω_i S_ii
+    trace_K_inv_S = n - jnp.sum(omega * S_diag)
+
+    # m^T K^{-1} m via Cholesky of K
+    K_inv_m = jax.scipy.linalg.cho_solve((L_K, True), m)
+    quad_form = jnp.dot(m, K_inv_m)
+
+    # log|K| from L_K
+    log_det_K = 2.0 * jnp.sum(jnp.log(jnp.diag(L_K)))
+
+    # log|S| via the identity |S| = |K| / (|K + 1/ω| * prod(ω))
+    #   derivation: S^{-1} = K^{-1} + diag(ω); so |S^{-1}| = |K^{-1}| |I + diag(ω) K|
+    #   ... actually cleaner via Sylvester: |K^{-1} + diag(ω)| = |K|^{-1} |K + diag(1/ω)| prod(ω)
+    log_det_S = (
+        log_det_K - 2.0 * jnp.sum(jnp.log(jnp.diag(L_kn))) - jnp.sum(jnp.log(omega))
+    )
+
+    gaussian_kl = 0.5 * (trace_K_inv_S + quad_form - n + log_det_K - log_det_S)
+
+    # 6. Assemble ELBO.
+    #    L = E_q[log p(k|f,ω)] - KL(q(f)||p(f)) - KL(q(ω)||p(ω))
+    #    where the PG KL is what we called `pg_kl`.
+    elbo = expected_loglik - gaussian_kl - pg_kl
+
+    return -elbo
+
+
+class BaseGP(ABC):
+    @abstractmethod
+    def fit(
+        self, X: np.ndarray, y: np.ndarray, noise: np.ndarray, round_info: tuple = ()
+    ) -> None:
+        """Fit the GP to data (X, y) with per-point noise variances."""
+        ...
+
+    @abstractmethod
+    def predict(self, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Predict (mean, var) at X_test using the round_info from fit time."""
+        ...
+
+    @abstractmethod
+    def state(self) -> dict:
+        """Snapshot of the fitted state needed by acquisition functions."""
+        ...
+
+    def _release_buffers(self):
+        for attr in ("_X", "_L", "_alpha", "_mean"):
+            buf = getattr(self, attr, None)
+            if buf is not None and hasattr(buf, "delete"):
+                try:
+                    buf.delete()
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+
+
+class HeteroscedasticGP(BaseGP):
+    """Exact GP regression with constant mean, ARD RBF kernel, and fixed
+    per-point observation noise."""
+
+    def __init__(self, jitter: float = 1e-6, max_iters: int = 75):
+        self.jitter = jitter
+        self.max_iters = max_iters
+        self.params = None
+        self._X = None
+        self._L = None
+        self._alpha = None
+        self._mean = None
+        self.round_info: tuple = ()
+
+    def state(self) -> dict:
+        """Snapshot of the fitted state needed by the acquisition."""
+        return {
+            "params": self.params,
+            "X": self._X,
+            "L": self._L,
+            "alpha": self._alpha,
+            "mean": self._mean,
+        }
+
+    def fit(self, X, y, noise, round_info: tuple = ()):
+        from hydro_bo.utils.logging_config import get_logger
+
+        logger = get_logger(__name__)
+        from jaxopt import LBFGS
+
+        X = jnp.asarray(X, dtype=jnp.float64)
+        y = jnp.asarray(y, dtype=jnp.float64).reshape(-1)
+        noise = jnp.asarray(noise, dtype=jnp.float64).reshape(-1)
+        n, d = int(X.shape[0]), int(X.shape[1])
+        round_info = tuple(round_info)
+        self.round_info = round_info
+
+        logger.debug(
+            "gp_fit_start", n_datapoints=n, n_dims=d, warm_start=self.params is not None
+        )
+
+        if self.params is not None and self.params["log_ls"].shape[0] == d:
+            init = {
+                "log_amp": self.params["log_amp"],
+                "log_ls": self.params["log_ls"],
+                "mean": self.params["mean"],
+            }
+        else:
+            init = {
+                "log_amp": jnp.array(0.0, dtype=jnp.float64),
+                "log_ls": jnp.zeros(d, dtype=jnp.float64),
+                "mean": jnp.array(float(np.mean(np.asarray(y))), dtype=jnp.float64),
+            }
+
+        jitter = jnp.asarray(self.jitter, dtype=jnp.float64)
+        nmll = partial(_neg_mll, round_info=round_info)
+        solver = LBFGS(fun=nmll, maxiter=self.max_iters)
+        result = solver.run(init, X, y, noise, jitter)
+        self._release_buffers()
+        self.params = {k: jnp.asarray(v) for k, v in result.params.items()}
+
+        L, alpha = _factorise(self.params, X, y, noise, jitter, round_info)
+        self._X = X
+        self._L = L
+        self._alpha = alpha
+        self._mean = self.params["mean"]
+
+        logger.debug(
+            "gp_fit_complete",
+            final_nmll=float(result.state.value),
+            n_lbfgs_iters=int(result.state.iter_num),
+        )
+
+    def predict(self, X_test):
+        """Returns (mean, var) at X_test in standardised target space.
+        Uses self.round_info captured at fit time so predictions are
+        kernel-consistent with the fit."""
+        X_test = jnp.asarray(X_test, dtype=jnp.float64)
+        if X_test.ndim == 1:
+            X_test = X_test[None, :]
+        return _predict(
+            self.params,
+            self._X,
+            self._L,
+            self._alpha,
+            self._mean,
+            X_test,
+            self.round_info,
+        )
+
+
+class BinomialGP(BaseGP):
+    """Polya-Gamma augmented GP for binary / count feasibility data."""
+
+    def __init__(
+        self,
+        jitter: float = 1e-6,
+        max_iters: int = 75,
+        vi_max_iters: int = 30,
+        vi_tol: float = 1e-4,
+    ):
+        self.jitter = jitter
+        self.max_iters = max_iters
+        self.vi_max_iters = vi_max_iters
+        self.vi_tol = vi_tol
+        self.params = None
+        self._X = None
+        self._L = None
+        self._alpha = None
+        self._omega = None
+        self.round_info: tuple = ()
+
+    def fit(self, X, k, N, round_info=()):
+        from jaxopt import LBFGS
+
+        X = jnp.asarray(X, dtype=jnp.float64)
+        k = jnp.asarray(k, dtype=jnp.float64).reshape(-1)
+        N = jnp.asarray(N, dtype=jnp.float64).reshape(-1)
+        self.round_info = tuple(round_info)
+
+        # Initial hyperparameters
+        if self.params is not None and self.params["log_ls"].shape[0] == X.shape[1]:
+            init = self.params
+        else:
+            init = {
+                "log_amp": jnp.array(0.0, dtype=jnp.float64),
+                "log_ls": jnp.zeros(X.shape[1], dtype=jnp.float64),
+            }
+
+        # Outer L-BFGS over hyperparameters. `_neg_elbo` is a jitted
+        # callable with static_argnames=("round_info","vi_max_iters") —
+        # bind those via partial so the LBFGS minimand has signature
+        # (init, X, k, N, jitter).
+        nelbo = partial(
+            _neg_elbo, round_info=self.round_info, vi_max_iters=self.vi_max_iters,
+        )
+        solver = LBFGS(fun=nelbo, maxiter=self.max_iters)
+        result = solver.run(init, X, k, N, jnp.float64(self.jitter))
+        self._release_buffers()
+        self.params = {key: jnp.asarray(v) for key, v in result.params.items()}
+
+        # Final VI inner loop at converged hyperparameters
+        omega, m, S_diag, L = _vi_inner_loop(
+            self.params, X, k, N, self.jitter, self.round_info, self.vi_max_iters
+        )
+
+        # Cache prediction state
+        kappa = k - N / 2.0
+        y_tilde = kappa / omega
+        noise = 1.0 / omega
+        params_zero_mean = {**self.params, "mean": jnp.array(0.0, dtype=jnp.float64)}
+        L, alpha = _factorise(
+            params_zero_mean,
+            X,
+            y_tilde,
+            noise,
+            jnp.float64(self.jitter),
+            self.round_info,
+        )
+
+        self._X = X
+        self._L = L
+        self._alpha = alpha
+        self._omega = omega
+
+    def predict(self, X_test):
+        """Returns (mean, var) for q(f_*) at X_test — i.e. the latent posterior.
+        Push through Φ at the call site for chance-constraint probabilities."""
+
+        X_test = jnp.asarray(X_test, dtype=jnp.float64)
+        if X_test.ndim == 1:
+            X_test = X_test[None, :]
+
+        return _predict_zero_mean(
+            self.params,
+            self._X,
+            self._L,
+            self._alpha,
+            X_test,
+            self.round_info,
+        )
+
+    def state(self) -> dict:
+        """Snapshot of the fitted state in the dict shape consumed by
+        `_predict` / `_feasibility_eval`. Mean is fixed at 0 (zero-mean
+        prior under the PG augmentation)."""
+        if self.params is None:
+            raise RuntimeError("BinomialGP.state() called before fit()")
+        return {
+            "params": self.params,
+            "X": self._X,
+            "L": self._L,
+            "alpha": self._alpha,
+            "mean": jnp.asarray(0.0, dtype=jnp.float64),
+        }
+
+    def probability_feasibile(self, X_test, alpha):
+        """P(σ(f_*) ≥ alpha) at each test point."""
+        mu, var = self.predict(X_test)
+        sigma = jnp.sqrt(var)
+        threshold = jnp.log(alpha / (1.0 - alpha))
+        z = (mu - threshold) / sigma
+        return jax.scipy.stats.norm.cdf(z)

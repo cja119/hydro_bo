@@ -39,9 +39,6 @@ equations:
     name: "actual_profit_eq"
     domain: ["grid0"]
 constraints:
-  cons1:
-    name: "lower_hydrogen_storage_limit"
-    domain: ["grid0"]
   cons2:
     name: "upper_hydrogen_storage_limit"
     domain: ["grid0"]
@@ -94,7 +91,7 @@ constraints:
     name: "storage_removal_limit"
     domain: ["grid0"]
   cons19:
-    name: "vector_flare_bigm_constraint"
+    name: "lower_hydrogen_storage_limit"
     domain: ["grid0"]
 objectives:
   obj1: 
