@@ -85,47 +85,64 @@ def _predict_zero_mean(params, X_train, L, alpha, X_test, round_info):
     )
 
 
-@partial(jax.jit, static_argnames=("round_info", "vi_max_iters"))
-def _vi_inner_loop(params, X, k, N, jitter, round_info, vi_max_iters):
-    """PG-VI alternating updates. Returns (omega, m, S_diag) at convergence."""
+@partial(jax.jit, static_argnames=("round_info", "vi_max_iters", "vi_tol"))
+def _vi_inner_loop(params, X, k, N, jitter, round_info, vi_max_iters, vi_tol):
+    """PG-VI alternating updates. Returns (omega, m, S_diag) at convergence.
+
+    Iterates with `lax.while_loop` (no autodiff trace, O(1) memory) and
+    early-stops once max|Δω| ≤ vi_tol. The output is wrapped in
+    `stop_gradient`: the (ω, m, S) updates are the closed-form ELBO
+    maximisers in their respective variables, so at the joint fixed point
+    ∂ELBO/∂(ω, m, S) = 0. By the envelope theorem, ∇_θ ELBO equals the
+    explicit partial derivative through K(θ) alone — gradients through the
+    inner loop are zero at convergence and can be safely cut.
+    """
     n = X.shape[0]
 
     K = _kernel(params["log_amp"], params["log_ls"], X, X, round_info)
     K = K + jitter * jnp.eye(n)
     kappa = k - N / 2.0
 
-    omega_init = N / 4.0  # value at c=0
-
-    def body(omega, _):
-        # f-update: solve (K + diag(1/ω)) α = ỹ, then m = K α
+    def step(omega):
         noise = 1.0 / omega
-        K_plus_noise = K + jnp.diag(noise)
-        L = jnp.linalg.cholesky(K_plus_noise)
-        y_tilde = kappa / omega
-        alpha = jax.scipy.linalg.cho_solve((L, True), y_tilde)
+        L = jnp.linalg.cholesky(K + jnp.diag(noise))
+        alpha = jax.scipy.linalg.cho_solve((L, True), kappa / omega)
         m = K @ alpha
-
-        # diag(S): S = K - K (K + diag(1/ω))^{-1} K
         v = jax.scipy.linalg.cho_solve((L, True), K)
-        S_diag = jnp.diag(K) - jnp.sum(K * v.T, axis=1)
-        S_diag = jnp.clip(S_diag, 1e-12, None)
-
-        # ω-update
-        c = jnp.sqrt(m**2 + S_diag)
-        c = jnp.maximum(c, 1e-6)
+        S_diag = jnp.clip(jnp.diag(K) - jnp.sum(K * v.T, axis=1), 1e-12, None)
+        c = jnp.maximum(jnp.sqrt(m**2 + S_diag), 1e-6)
         omega_new = N / (2.0 * c) * jnp.tanh(c / 2.0)
+        return omega_new, m, S_diag
 
-        return omega_new, (m, S_diag)
+    omega0 = jnp.broadcast_to(N / 4.0, (n,))
+    omega1, _, _ = step(omega0)
 
-    omega_final, (m_traj, S_diag_traj) = jax.lax.scan(
-        body, omega_init, None, length=vi_max_iters
+    def cond_fun(carry):
+        i, omega, omega_prev = carry
+        return jnp.logical_and(
+            i < vi_max_iters,
+            jnp.max(jnp.abs(omega - omega_prev)) > vi_tol,
+        )
+
+    def body_fun(carry):
+        i, omega, _ = carry
+        omega_new, _, _ = step(omega)
+        return i + 1, omega_new, omega
+
+    _, omega_star, _ = jax.lax.while_loop(
+        cond_fun, body_fun, (jnp.int32(1), omega1, omega0)
+    )
+    _, m_star, S_diag_star = step(omega_star)
+
+    return (
+        jax.lax.stop_gradient(omega_star),
+        jax.lax.stop_gradient(m_star),
+        jax.lax.stop_gradient(S_diag_star),
     )
 
-    return omega_final, m_traj[-1], S_diag_traj[-1]
 
-
-@partial(jax.jit, static_argnames=("round_info", "vi_max_iters"))
-def _neg_elbo(params, X, k, N, jitter, round_info, vi_max_iters):
+@partial(jax.jit, static_argnames=("round_info", "vi_max_iters", "vi_tol"))
+def _neg_elbo(params, X, k, N, jitter, round_info, vi_max_iters, vi_tol):
     """Negative ELBO for PG-augmented Binomial GP.
 
     Runs the inner PG-VI fixed-point loop to convergence at the given
@@ -148,7 +165,9 @@ def _neg_elbo(params, X, k, N, jitter, round_info, vi_max_iters):
     n = X.shape[0]
 
     # 1. Run inner VI loop to converged (omega, m, S_diag).
-    omega, m, S_diag = _vi_inner_loop(params, X, k, N, jitter, round_info, vi_max_iters)
+    omega, m, S_diag = _vi_inner_loop(
+        params, X, k, N, jitter, round_info, vi_max_iters, vi_tol
+    )
 
     # 2. Build the kernel matrix at converged hyperparameters.
     K = _kernel(params["log_amp"], params["log_ls"], X, X, round_info)
@@ -375,7 +394,10 @@ class BinomialGP(BaseGP):
         # bind those via partial so the LBFGS minimand has signature
         # (init, X, k, N, jitter).
         nelbo = partial(
-            _neg_elbo, round_info=self.round_info, vi_max_iters=self.vi_max_iters,
+            _neg_elbo,
+            round_info=self.round_info,
+            vi_max_iters=self.vi_max_iters,
+            vi_tol=self.vi_tol,
         )
         solver = LBFGS(fun=nelbo, maxiter=self.max_iters)
         result = solver.run(init, X, k, N, jnp.float64(self.jitter))
@@ -383,8 +405,9 @@ class BinomialGP(BaseGP):
         self.params = {key: jnp.asarray(v) for key, v in result.params.items()}
 
         # Final VI inner loop at converged hyperparameters
-        omega, m, S_diag, L = _vi_inner_loop(
-            self.params, X, k, N, self.jitter, self.round_info, self.vi_max_iters
+        omega, _, _ = _vi_inner_loop(
+            self.params, X, k, N, self.jitter, self.round_info,
+            self.vi_max_iters, self.vi_tol,
         )
 
         # Cache prediction state

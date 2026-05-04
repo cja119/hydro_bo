@@ -62,7 +62,7 @@ def main():
     run_label = f"{g.vector}-dynamic_price" if g.dynamic_price else g.vector
     out_dir = SCRIPTS_DIR / "tmp" / "sobol" / run_label / f"row_{index_row:05d}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    configure_logging(log_file=out_dir / "run.log")
+    configure_logging(log_file=out_dir / "run.log", package_level=g.log_level)
 
     master_seed = resolve_master_seed(g.master_seed)
     logger.info(

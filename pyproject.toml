@@ -13,7 +13,7 @@ requires-python = ">=3.10"
 dependencies = [
     "meteor_py  @ git+https://github.com/cja119/meteor_py.git",
     "h2-plan @ git+https://github.com/cja119/stochasticmodel.git",
-    "septal @ git+https://github.com/mycelia-i/septal.git"
+    "septal @ git+https://github.com/mycelia-i/septal.git",
     "certifi>=2024.12.14",
     "charset-normalizer>=3.4.1",
     "et_xmlfile>=2.0.0",
