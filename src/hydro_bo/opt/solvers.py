@@ -56,6 +56,7 @@ def clear_jax_caches() -> None:
     except AttributeError:
         try:
             from jax._src.compilation_cache import compilation_cache as _cc
+
             _cc.reset_cache()
         except Exception:
             pass
@@ -90,7 +91,8 @@ class NLPBase:
     # ---- subclass hooks ----
 
     def _build_starts(
-        self, acq: AcquisitionFunction,
+        self,
+        acq: AcquisitionFunction,
     ) -> tuple[jnp.ndarray, jnp.ndarray, np.ndarray]:
         """Returns (starts, p_batch, screen_scores). Base = single-combo
         Sobol screen on the full unit cube; subclasses override to
@@ -148,11 +150,16 @@ class NLPBase:
         x_jnp = jnp.asarray(candidates, dtype=jnp.float64)
         raw = np.asarray(batch_fn(x_jnp, *extra_args, *acq.state_args))
         scores = rescore(raw, x_jnp) if rescore is not None else raw
-        top_idx = np.argsort(scores)[-self.n_restarts:]
+        top_idx = np.argsort(scores)[-self.n_restarts :]
         return candidates[top_idx], scores[top_idx]
 
     def _select_best(
-        self, result, starts, p_batch, screen_scores, dim_full,
+        self,
+        result,
+        starts,
+        p_batch,
+        screen_scores,
+        dim_full,
     ) -> tuple[np.ndarray, float]:
         """Best converged start (SQP enforces feasibility internally), with
         screen-score fallback if no start converged."""
@@ -162,11 +169,15 @@ class NLPBase:
         if not np.any(success):
             best = int(np.argmax(screen_scores))
             x_full = self._expand_x(
-                np.asarray(starts)[best], np.asarray(p_batch)[best], dim_full,
+                np.asarray(starts)[best],
+                np.asarray(p_batch)[best],
+                dim_full,
             )
-            logger.warning("sqp_no_converged_starts",
-                           n_starts=int(success.size),
-                           fallback=float(screen_scores[best]))
+            logger.warning(
+                "sqp_no_converged_starts",
+                n_starts=int(success.size),
+                fallback=float(screen_scores[best]),
+            )
             return x_full, float(screen_scores[best])
 
         best = int(np.argmin(np.where(success, objectives, np.inf)))
@@ -197,8 +208,9 @@ class MixedIntNLP(NLPBase):
         n_restarts: int = 5,
         sqp_config: Optional[SQPConfig] = None,
     ):
-        super().__init__(seed=seed, pow_sobol=pow_sobol,
-                         n_restarts=n_restarts, sqp_config=sqp_config)
+        super().__init__(
+            seed=seed, pow_sobol=pow_sobol, n_restarts=n_restarts, sqp_config=sqp_config
+        )
         self.cat_vars = [(int(i), [float(v) for v in vals]) for i, vals in cat_vars]
 
     # ---- subclass hooks (inherited maximise drives these) ----
@@ -216,10 +228,12 @@ class MixedIntNLP(NLPBase):
             mv = jnp.asarray(combo, dtype=jnp.float64)
             cand, sc = self._sobol_screen(acq, D_red, batch_fn, extra_args=(mv,))
             starts.append(np.asarray(cand))
-            ps.append(np.broadcast_to(
-                np.asarray(combo, dtype=float),
-                (self.n_restarts, len(cat)),
-            ).copy())
+            ps.append(
+                np.broadcast_to(
+                    np.asarray(combo, dtype=float),
+                    (self.n_restarts, len(cat)),
+                ).copy()
+            )
             scores.append(np.asarray(sc))
 
         return (
@@ -236,8 +250,10 @@ class MixedIntNLP(NLPBase):
         D_red = D - len(cat)
         return ParametricNLPProblem(
             objective=self._objective(acq, cat),
-            bounds=[jnp.zeros(D_red, dtype=jnp.float64),
-                    jnp.ones(D_red, dtype=jnp.float64)],
+            bounds=[
+                jnp.zeros(D_red, dtype=jnp.float64),
+                jnp.ones(D_red, dtype=jnp.float64),
+            ],
             n_decision=D_red,
             n_params=len(cat),
         )
@@ -295,8 +311,13 @@ class ConstrainedMixedIntNLP(MixedIntNLP):
         n_restarts: int = 5,
         sqp_config: Optional[SQPConfig] = None,
     ):
-        super().__init__(cat_vars=cat_vars, seed=seed, pow_sobol=pow_sobol,
-                         n_restarts=n_restarts, sqp_config=sqp_config)
+        super().__init__(
+            cat_vars=cat_vars,
+            seed=seed,
+            pow_sobol=pow_sobol,
+            n_restarts=n_restarts,
+            sqp_config=sqp_config,
+        )
         self.l1_penalty = float(l1_penalty)
 
     def _solver(self, acq):
@@ -331,12 +352,110 @@ class ConstrainedMixedIntNLP(MixedIntNLP):
         if cat:
             feas_fn = acq.feasibility_batch_masked_fn(cat)
             mask_values = extra_args[0]
+
             def rescore(raw, x_jnp):
                 feas = np.asarray(feas_fn(x_jnp, mask_values, *feas_state))
                 return raw - self.l1_penalty * np.maximum(0.0, -feas)
+
         else:
             feas_fn = acq.feasibility_batch_fn()
+
             def rescore(raw, x_jnp):
                 feas = np.asarray(feas_fn(x_jnp, *feas_state))
                 return raw - self.l1_penalty * np.maximum(0.0, -feas)
+
         return rescore
+
+
+def multistart_sqp(
+    objective_fn,
+    bounds: Tuple[np.ndarray, np.ndarray],
+    *,
+    seed: int,
+    pow_sobol: int = 10,
+    n_restarts: int = 8,
+    sqp_config: Optional[SQPConfig] = None,
+    n_params: int = 0,
+    constraints: Optional[dict] = None,
+) -> tuple[np.ndarray, float, dict]:
+    """Sobol-screen + multistart septal SQP for any box-constrained NLP.
+
+    The SQP minimises `objective_fn(x, p)`. Sobol-screens 2**pow_sobol
+    candidates over the box, takes the `n_restarts` lowest-objective
+    starts, vmaps the SQP solve across them, and returns the best
+    converged result. Falls back to the best Sobol candidate if no
+    start converges.
+    """
+    cfg = sqp_config or DEFAULT_SQP_CONFIG
+    lb_np = np.asarray(bounds[0], dtype=float)
+    ub_np = np.asarray(bounds[1], dtype=float)
+    d = int(lb_np.shape[0])
+    lb = jnp.asarray(lb_np, dtype=jnp.float64)
+    ub = jnp.asarray(ub_np, dtype=jnp.float64)
+
+    # Sobol cloud over the box, screen by raw objective (lower is better).
+    sampler = Sobol(d=d, scramble=True, seed=seed)
+    candidates_unit = sampler.random(2**pow_sobol)
+    candidates = lb_np + candidates_unit * (ub_np - lb_np)
+    x_jnp = jnp.asarray(candidates, dtype=jnp.float64)
+    p_zero = jnp.zeros(n_params, dtype=jnp.float64)
+    obj_batch = jax.vmap(objective_fn, in_axes=(0, None))(x_jnp, p_zero)
+    obj_np = np.asarray(obj_batch)
+
+    top_idx = np.argsort(obj_np)[:n_restarts]
+    starts = candidates[top_idx]
+    starts_jnp = jnp.asarray(starts, dtype=jnp.float64)
+    p_batch = jnp.zeros((n_restarts, n_params), dtype=jnp.float64)
+
+    # Build problem (with optional inequality constraint).
+    problem_kwargs = dict(
+        objective=objective_fn,
+        bounds=[lb, ub],
+        n_decision=d,
+        n_params=n_params,
+    )
+    if constraints is not None:
+        lhs = jnp.asarray(constraints["lhs"], dtype=jnp.float64).reshape(-1)
+        rhs = jnp.asarray(constraints["rhs"], dtype=jnp.float64).reshape(-1)
+        problem_kwargs.update(
+            constraints=constraints["fn"],
+            constraint_lhs=lhs,
+            constraint_rhs=rhs,
+            n_constraints=int(lhs.shape[0]),
+        )
+    factory = ParametricSQPFactory(ParametricNLPProblem(**problem_kwargs), cfg)
+    result = factory.solve_batch(starts_jnp, p_batch)
+
+    success = np.asarray(result.success).astype(bool)
+    objectives = np.asarray(result.objective)
+    decisions = np.asarray(result.decision_variables)
+
+    if not np.any(success):
+        best = int(np.argmin(obj_np[top_idx]))
+        x_best = np.clip(starts[best], lb_np, ub_np)
+        val_best = float(obj_np[top_idx][best])
+        info = {
+            "converged": False,
+            "n_converged": 0,
+            "n_starts": int(n_restarts),
+            "best_screen_obj": val_best,
+            "fallback": "sobol",
+        }
+        logger.warning(
+            "multistart_sqp_no_converged_starts",
+            n_starts=int(n_restarts),
+            fallback_obj=val_best,
+        )
+        return x_best, val_best, info
+
+    masked = np.where(success, objectives, np.inf)
+    best = int(np.argmin(masked))
+    x_best = np.clip(decisions[best], lb_np, ub_np)
+    val_best = float(objectives[best])
+    info = {
+        "converged": True,
+        "n_converged": int(np.sum(success)),
+        "n_starts": int(n_restarts),
+        "best_screen_obj": float(np.min(obj_np[top_idx])),
+    }
+    return x_best, val_best, info

@@ -27,7 +27,18 @@ sobol:
   seed:             42             # deterministic seed for the Sobol generator
   walltime_seconds: null           # PBS walltime; enables deadline-based early exit
   buffer_seconds:   300            # seconds reserved before walltime for result saving
-  # `index_row` is read from the PBS_ARRAY_INDEX env var, not config.
+
+nlp:
+
+  acq_pow_sobol:        14
+  acq_n_restarts:       8
+  gp_pow_sobol:         10           
+  gp_n_restarts:        8
+
+  sqp_max_iter:         300
+  sqp_tol_stationarity: 1e-6
+  sqp_tol_feasibility:  1e-6
+  sqp_use_exact_hessian: true
 
 unconstrained_bo:
   iter_budget:        20

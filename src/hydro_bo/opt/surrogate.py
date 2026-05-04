@@ -262,11 +262,23 @@ class BaseGP(ABC):
 
 class HeteroscedasticGP(BaseGP):
     """Exact GP regression with constant mean, ARD RBF kernel, and fixed
-    per-point observation noise."""
+    per-point observation noise. Hyperparameters are fit via the shared
+    multistart-SQP helper (`hydro_bo.opt.solvers.multistart_sqp`) — Sobol
+    screen → top-K SQP refines → best converged."""
 
-    def __init__(self, jitter: float = 1e-6, max_iters: int = 75):
+    def __init__(
+        self,
+        jitter: float = 1e-6,
+        pow_sobol_fit: int = 10,
+        n_restarts_fit: int = 8,
+        sqp_config=None,
+        seed: int = 0,
+    ):
         self.jitter = jitter
-        self.max_iters = max_iters
+        self.pow_sobol_fit = int(pow_sobol_fit)
+        self.n_restarts_fit = int(n_restarts_fit)
+        self.sqp_config = sqp_config
+        self.seed = int(seed)
         self.params = None
         self._X = None
         self._L = None
@@ -285,10 +297,10 @@ class HeteroscedasticGP(BaseGP):
         }
 
     def fit(self, X, y, noise, round_info: tuple = ()):
+        from hydro_bo.opt.solvers import multistart_sqp
         from hydro_bo.utils.logging_config import get_logger
 
         logger = get_logger(__name__)
-        from jaxopt import LBFGS
 
         X = jnp.asarray(X, dtype=jnp.float64)
         y = jnp.asarray(y, dtype=jnp.float64).reshape(-1)
@@ -296,31 +308,44 @@ class HeteroscedasticGP(BaseGP):
         n, d = int(X.shape[0]), int(X.shape[1])
         round_info = tuple(round_info)
         self.round_info = round_info
+        jitter = jnp.asarray(self.jitter, dtype=jnp.float64)
 
         logger.debug(
             "gp_fit_start", n_datapoints=n, n_dims=d, warm_start=self.params is not None
         )
 
-        if self.params is not None and self.params["log_ls"].shape[0] == d:
-            init = {
-                "log_amp": self.params["log_amp"],
-                "log_ls": self.params["log_ls"],
-                "mean": self.params["mean"],
-            }
-        else:
-            init = {
-                "log_amp": jnp.array(0.0, dtype=jnp.float64),
-                "log_ls": jnp.zeros(d, dtype=jnp.float64),
-                "mean": jnp.array(float(np.mean(np.asarray(y))), dtype=jnp.float64),
-            }
+        # Decision vector: [log_amp, log_ls (d), mean] — flattened for the
+        # multistart-SQP helper. Bounds: log-amp/ls in a generous log-space
+        # box, mean in a 3σ band around the data mean.
+        y_mean = float(np.mean(np.asarray(y)))
+        y_std = float(np.std(np.asarray(y))) or 1.0
+        lb = np.concatenate([[-5.0], np.full(d, -5.0), [y_mean - 3.0 * y_std]])
+        ub = np.concatenate([[5.0], np.full(d, 5.0), [y_mean + 3.0 * y_std]])
 
-        jitter = jnp.asarray(self.jitter, dtype=jnp.float64)
-        nmll = partial(_neg_mll, round_info=round_info)
-        solver = LBFGS(fun=nmll, maxiter=self.max_iters)
-        result = solver.run(init, X, y, noise, jitter)
+        # SQP minimises: NMLL is already a loss, no negation needed.
+        def _nmll_obj(x_vec, _p):
+            params = {
+                "log_amp": x_vec[0],
+                "log_ls": jax.lax.dynamic_slice(x_vec, (1,), (d,)),
+                "mean": x_vec[1 + d],
+            }
+            return _neg_mll(params, X, y, noise, jitter, round_info).reshape(())
+
+        x_best, val_best, info = multistart_sqp(
+            _nmll_obj,
+            (lb, ub),
+            seed=self.seed + len(round_info),  # vary across calls
+            pow_sobol=self.pow_sobol_fit,
+            n_restarts=self.n_restarts_fit,
+            sqp_config=self.sqp_config,
+        )
+
         self._release_buffers()
-        self.params = {k: jnp.asarray(v) for k, v in result.params.items()}
-
+        self.params = {
+            "log_amp": jnp.asarray(x_best[0], dtype=jnp.float64),
+            "log_ls": jnp.asarray(x_best[1 : 1 + d], dtype=jnp.float64),
+            "mean": jnp.asarray(x_best[1 + d], dtype=jnp.float64),
+        }
         L, alpha = _factorise(self.params, X, y, noise, jitter, round_info)
         self._X = X
         self._L = L
@@ -329,8 +354,10 @@ class HeteroscedasticGP(BaseGP):
 
         logger.debug(
             "gp_fit_complete",
-            final_nmll=float(result.state.value),
-            n_lbfgs_iters=int(result.state.iter_num),
+            final_nmll=val_best,
+            n_starts=info["n_starts"],
+            n_converged=info.get("n_converged", 0),
+            converged=info["converged"],
         )
 
     def predict(self, X_test):
@@ -352,19 +379,28 @@ class HeteroscedasticGP(BaseGP):
 
 
 class BinomialGP(BaseGP):
-    """Polya-Gamma augmented GP for binary / count feasibility data."""
+    """Polya-Gamma augmented GP for binary / count feasibility data.
+
+    Outer minimisation of the negative ELBO uses the shared multistart-SQP
+    helper; inner Polya-Gamma VI is unchanged."""
 
     def __init__(
         self,
         jitter: float = 1e-6,
-        max_iters: int = 75,
         vi_max_iters: int = 30,
         vi_tol: float = 1e-4,
+        pow_sobol_fit: int = 10,
+        n_restarts_fit: int = 8,
+        sqp_config=None,
+        seed: int = 0,
     ):
         self.jitter = jitter
-        self.max_iters = max_iters
         self.vi_max_iters = vi_max_iters
         self.vi_tol = vi_tol
+        self.pow_sobol_fit = int(pow_sobol_fit)
+        self.n_restarts_fit = int(n_restarts_fit)
+        self.sqp_config = sqp_config
+        self.seed = int(seed)
         self.params = None
         self._X = None
         self._L = None
@@ -373,36 +409,53 @@ class BinomialGP(BaseGP):
         self.round_info: tuple = ()
 
     def fit(self, X, k, N, round_info=()):
-        from jaxopt import LBFGS
+        from hydro_bo.opt.solvers import multistart_sqp
 
         X = jnp.asarray(X, dtype=jnp.float64)
         k = jnp.asarray(k, dtype=jnp.float64).reshape(-1)
         N = jnp.asarray(N, dtype=jnp.float64).reshape(-1)
         self.round_info = tuple(round_info)
+        d = int(X.shape[1])
+        jitter = jnp.asarray(self.jitter, dtype=jnp.float64)
 
-        # Initial hyperparameters
-        if self.params is not None and self.params["log_ls"].shape[0] == X.shape[1]:
-            init = self.params
-        else:
-            init = {
-                "log_amp": jnp.array(0.0, dtype=jnp.float64),
-                "log_ls": jnp.zeros(X.shape[1], dtype=jnp.float64),
+        # Decision vector: [log_amp, log_ls (d)] — no mean (zero-mean prior).
+        lb = np.concatenate([[-5.0], np.full(d, -5.0)])
+        ub = np.concatenate([[5.0], np.full(d, 5.0)])
+
+        vi_max_iters = self.vi_max_iters
+        vi_tol = self.vi_tol
+        round_info_static = self.round_info
+
+        def _nelbo_obj(x_vec, _p):
+            params = {
+                "log_amp": x_vec[0],
+                "log_ls": jax.lax.dynamic_slice(x_vec, (1,), (d,)),
             }
+            return _neg_elbo(
+                params, X, k, N, jitter, round_info_static, vi_max_iters, vi_tol,
+            ).reshape(())
 
-        # Outer L-BFGS over hyperparameters. `_neg_elbo` is a jitted
-        # callable with static_argnames=("round_info","vi_max_iters") —
-        # bind those via partial so the LBFGS minimand has signature
-        # (init, X, k, N, jitter).
-        nelbo = partial(
-            _neg_elbo,
-            round_info=self.round_info,
-            vi_max_iters=self.vi_max_iters,
-            vi_tol=self.vi_tol,
+        x_best, val_best, info = multistart_sqp(
+            _nelbo_obj,
+            (lb, ub),
+            seed=self.seed + len(self.round_info),
+            pow_sobol=self.pow_sobol_fit,
+            n_restarts=self.n_restarts_fit,
+            sqp_config=self.sqp_config,
         )
-        solver = LBFGS(fun=nelbo, maxiter=self.max_iters)
-        result = solver.run(init, X, k, N, jnp.float64(self.jitter))
+
         self._release_buffers()
-        self.params = {key: jnp.asarray(v) for key, v in result.params.items()}
+        self.params = {
+            "log_amp": jnp.asarray(x_best[0], dtype=jnp.float64),
+            "log_ls": jnp.asarray(x_best[1 : 1 + d], dtype=jnp.float64),
+        }
+        from hydro_bo.utils.logging_config import get_logger
+        get_logger(__name__).debug(
+            "binomial_gp_fit_complete",
+            final_nelbo=val_best,
+            n_starts=info["n_starts"],
+            converged=info["converged"],
+        )
 
         # Final VI inner loop at converged hyperparameters
         omega, _, _ = _vi_inner_loop(

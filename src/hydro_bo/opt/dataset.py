@@ -17,15 +17,10 @@ class Dataset:
     bounds: np.ndarray
 
     def __post_init__(self):
-        # Processing the bounds
+
         b = np.asarray(self.bounds, dtype=float)
         self._lo = b[:, 0]
         self._span = b[:, 1] - b[:, 0]
-
-        # Raw samples include non-finite entries (NaN / inf) marking failed
-        # solves. N is the total trial count per observation; k is the
-        # feasible (finite) count. mu / sigma2 are computed only over the
-        # finite subset.
         samples = [np.asarray(s, dtype=float).ravel() for s in self._samples]
         self._samples = samples
         self.N = np.array([len(s) for s in samples], dtype=int)
@@ -34,10 +29,16 @@ class Dataset:
 
         with np.errstate(invalid="ignore"):
             self.mu = np.array(
-                [float(np.mean(fs)) if len(fs) >= 1 else np.nan for fs in finite_subsets]
+                [
+                    float(np.mean(fs)) if len(fs) >= 1 else np.nan
+                    for fs in finite_subsets
+                ]
             )
             self.sigma2 = np.array(
-                [float(np.var(fs, ddof=1)) if len(fs) >= 2 else np.nan for fs in finite_subsets]
+                [
+                    float(np.var(fs, ddof=1)) if len(fs) >= 2 else np.nan
+                    for fs in finite_subsets
+                ]
             )
 
         # Computing a numerically stable log-variance

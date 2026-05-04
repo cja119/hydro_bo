@@ -46,6 +46,30 @@ class SobolCfg:
 
 
 @dataclass(frozen=True)
+class NlpCfg:
+    """Multistart + SQP settings shared by the BO acquisition optimiser
+    and the GP-hyperparameter fits (via `multistart_sqp` in solvers.py)."""
+    acq_pow_sobol: int
+    acq_n_restarts: int
+    gp_pow_sobol: int
+    gp_n_restarts: int
+    sqp_max_iter: int
+    sqp_tol_stationarity: float
+    sqp_tol_feasibility: float
+    sqp_use_exact_hessian: bool
+
+    def to_sqp_config(self):
+        """Build a `septal.jax.sqp.SQPConfig` from these settings."""
+        from septal.jax.sqp import SQPConfig
+        return SQPConfig(
+            max_iter=self.sqp_max_iter,
+            use_exact_hessian=self.sqp_use_exact_hessian,
+            tol_stationarity=self.sqp_tol_stationarity,
+            tol_feasibility=self.sqp_tol_feasibility,
+        )
+
+
+@dataclass(frozen=True)
 class UnconstrainedCfg:
     iter_budget: int
     n_initial_points: int
@@ -69,6 +93,7 @@ class ConstrainedCfg:
 class Config:
     general: GeneralCfg
     sobol: SobolCfg
+    nlp: NlpCfg
     unconstrained_bo: UnconstrainedCfg
     constrained_bo: ConstrainedCfg
 
@@ -129,6 +154,16 @@ def load_config(path: str | Path, *, vector_override: Optional[str] = None) -> C
             seed=int(raw["sobol"]["seed"]),
             walltime_seconds=raw["sobol"].get("walltime_seconds"),
             buffer_seconds=int(raw["sobol"].get("buffer_seconds", 300)),
+        ),
+        nlp=NlpCfg(
+            acq_pow_sobol=int(raw["nlp"]["acq_pow_sobol"]),
+            acq_n_restarts=int(raw["nlp"]["acq_n_restarts"]),
+            gp_pow_sobol=int(raw["nlp"]["gp_pow_sobol"]),
+            gp_n_restarts=int(raw["nlp"]["gp_n_restarts"]),
+            sqp_max_iter=int(raw["nlp"]["sqp_max_iter"]),
+            sqp_tol_stationarity=float(raw["nlp"]["sqp_tol_stationarity"]),
+            sqp_tol_feasibility=float(raw["nlp"]["sqp_tol_feasibility"]),
+            sqp_use_exact_hessian=bool(raw["nlp"]["sqp_use_exact_hessian"]),
         ),
         unconstrained_bo=UnconstrainedCfg(
             iter_budget=int(raw["unconstrained_bo"]["iter_budget"]),

@@ -243,6 +243,7 @@ def main():
                 "general": g.__dict__,
                 "constrained_bo": c.__dict__,
                 "sobol": s.__dict__,
+                "nlp": cfg.nlp.__dict__,
                 "master_seed_resolved": _master_seed,
             },
             f,
@@ -273,12 +274,16 @@ def main():
         n_initial_points=c.n_initial_points,
         iter_limit=c.iter_budget,
         lam=g.stdev_penalty,
-        n_restarts=5,
+        n_restarts=cfg.nlp.acq_n_restarts,
+        pow_sobol=cfg.nlp.acq_pow_sobol,
         seed=_master_seed % (2**31),
         cat_vars=cat_vars,
         p_targ=c.p_targ,
         z_sc=c.z_sc,
         l1_penalty=c.l1_penalty,
+        sqp_config=cfg.nlp.to_sqp_config(),
+        gp_pow_sobol=cfg.nlp.gp_pow_sobol,
+        gp_n_restarts=cfg.nlp.gp_n_restarts,
     )
 
     sobol_dir = resolve_sobol_dir(c.sobol_dir, SCRIPTS_DIR, g.vector)
