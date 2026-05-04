@@ -138,13 +138,19 @@ def load_sobol_cache(
     """Load cached `(x, valid_worker_scores)` pairs from a sobol_mpc
     results directory matching this run's general config (vector,
     bounds_expansion, dynamic_price). Rows with fewer than
-    `min_valid_samples` survivors are dropped — they don't seed the GP."""
+    `min_valid_samples` survivors are dropped — they don't seed the GP.
+    If `unconstrained_bo.n_sobol_cache` is set, stop after that many
+    matched rows have been loaded (sorted-row order, so subset is
+    stable)."""
     g, u = cfg.general, cfg.unconstrained_bo
+    cap = u.n_sobol_cache
     observations: list[tuple[np.ndarray, np.ndarray]] = []
     n_missing_result = n_mismatched = n_failed = 0
 
     row_dirs = sorted(sobol_dir.glob("row_*"))
     for rd in row_dirs:
+        if cap is not None and len(observations) >= cap:
+            break
         result_files = sorted(rd.glob("result_*.json"))
         if not result_files:
             n_missing_result += 1
@@ -181,6 +187,7 @@ def load_sobol_cache(
         n_missing_result=n_missing_result,
         n_mismatched=n_mismatched,
         n_failed=n_failed,
+        cap=cap,
     )
     return observations
 

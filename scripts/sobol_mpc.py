@@ -26,6 +26,7 @@ from hydro_bo.utils.run_config import (
     env_args_from,
     load_config,
     planning_model_path,
+    resolve_sobol_dir,
 )
 from hydro_bo.utils.search_space import (
     PARAM_KEYS,
@@ -59,8 +60,12 @@ def main():
 
     now = datetime.now()
     run_timestamp = now.strftime("%Y%m%d_%H%M%S")
-    run_label = f"{g.vector}-dynamic_price" if g.dynamic_price else g.vector
-    out_dir = SCRIPTS_DIR / "tmp" / "sobol" / run_label / f"row_{index_row:05d}"
+    sobol_base = resolve_sobol_dir(s.sobol_dir, SCRIPTS_DIR, g.vector)
+    if sobol_base is None:
+        # Back-compat fallback if `sobol.sobol_dir` is unset in the YAML.
+        run_label = f"{g.vector}-dynamic_price" if g.dynamic_price else g.vector
+        sobol_base = SCRIPTS_DIR / "tmp" / "sobol" / run_label
+    out_dir = sobol_base / f"row_{index_row:05d}"
     out_dir.mkdir(parents=True, exist_ok=True)
     configure_logging(log_file=out_dir / "run.log", package_level=g.log_level)
 
