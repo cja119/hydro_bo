@@ -43,6 +43,7 @@ class SobolCfg:
     seed: int
     walltime_seconds: Optional[int]
     buffer_seconds: int
+    sobol_dir: Optional[str]  # output directory for sobol_mpc; supports `{vector}`.
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ class UnconstrainedCfg:
     failure_penalty: float
     min_valid_samples: int
     sobol_dir: Optional[str]
+    n_sobol_cache: Optional[int]  # cap on cached Sobol rows loaded (None = all).
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,7 @@ class ConstrainedCfg:
     z_sc: float
     l1_penalty: float
     sobol_dir: Optional[str]
+    n_sobol_cache: Optional[int]  # cap on cached Sobol rows loaded (None = all).
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,12 @@ class Config:
     nlp: NlpCfg
     unconstrained_bo: UnconstrainedCfg
     constrained_bo: ConstrainedCfg
+
+
+def _optional_int(raw) -> Optional[int]:
+    if raw is None:
+        return None
+    return int(raw)
 
 
 def _resolve_log_level(raw) -> int:
@@ -154,6 +163,7 @@ def load_config(path: str | Path, *, vector_override: Optional[str] = None) -> C
             seed=int(raw["sobol"]["seed"]),
             walltime_seconds=raw["sobol"].get("walltime_seconds"),
             buffer_seconds=int(raw["sobol"].get("buffer_seconds", 300)),
+            sobol_dir=raw["sobol"].get("sobol_dir"),
         ),
         nlp=NlpCfg(
             acq_pow_sobol=int(raw["nlp"]["acq_pow_sobol"]),
@@ -171,6 +181,7 @@ def load_config(path: str | Path, *, vector_override: Optional[str] = None) -> C
             failure_penalty=float(raw["unconstrained_bo"]["failure_penalty"]),
             min_valid_samples=int(raw["unconstrained_bo"]["min_valid_samples"]),
             sobol_dir=raw["unconstrained_bo"].get("sobol_dir"),
+            n_sobol_cache=_optional_int(raw["unconstrained_bo"].get("n_sobol_cache")),
         ),
         constrained_bo=ConstrainedCfg(
             iter_budget=int(raw["constrained_bo"]["iter_budget"]),
@@ -180,6 +191,7 @@ def load_config(path: str | Path, *, vector_override: Optional[str] = None) -> C
             z_sc=float(raw["constrained_bo"]["z_sc"]),
             l1_penalty=float(raw["constrained_bo"]["l1_penalty"]),
             sobol_dir=raw["constrained_bo"].get("sobol_dir"),
+            n_sobol_cache=_optional_int(raw["constrained_bo"].get("n_sobol_cache")),
         ),
     )
 

@@ -136,15 +136,23 @@ def load_sobol_cache(
     sobol_dir: Path,
     cfg: Config,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Load every matching cached row from a sobol_mpc results
-    directory. Non-finite / catastrophic worker scores become NaN, and
-    rows are NaN-padded to `num_instances` so `N` is consistent."""
+    """Load matching cached rows from a sobol_mpc results directory.
+
+    Non-finite / catastrophic worker scores become NaN, and rows are
+    NaN-padded to `num_instances` so `N` is consistent. If
+    `constrained_bo.n_sobol_cache` is set, stop after that many matched
+    rows have been loaded — rows are visited in sorted order so the
+    subset is stable across runs.
+    """
     g, c = cfg.general, cfg.constrained_bo
+    cap = c.n_sobol_cache
     observations: list[tuple[np.ndarray, np.ndarray]] = []
     n_missing_result = n_mismatched = 0
 
     row_dirs = sorted(sobol_dir.glob("row_*"))
     for rd in row_dirs:
+        if cap is not None and len(observations) >= cap:
+            break
         result_files = sorted(rd.glob("result_*.json"))
         if not result_files:
             n_missing_result += 1
@@ -176,6 +184,7 @@ def load_sobol_cache(
         n_loaded=len(observations),
         n_missing_result=n_missing_result,
         n_mismatched=n_mismatched,
+        cap=cap,
     )
     return observations
 
