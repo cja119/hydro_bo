@@ -12,7 +12,6 @@ __all__ = [
     "BaseBayesopt",
     "MeanVarBayesopt",
     "ConstrainedBayesopt",
-    "BayesianOptimizer",
 ]
 
 
@@ -22,13 +21,11 @@ def __getattr__(name):
             BaseBayesopt,
             MeanVarBayesopt,
             ConstrainedBayesopt,
-            BayesianOptimizer,
         )
 
         return {
             "BaseBayesopt": BaseBayesopt,
             "MeanVarBayesopt": MeanVarBayesopt,
             "ConstrainedBayesopt": ConstrainedBayesopt,
-            "BayesianOptimizer": BayesianOptimizer,
         }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

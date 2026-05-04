@@ -12,6 +12,7 @@ non-script consumers can also load and inspect it.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,7 @@ class GeneralCfg:
     master_seed: Optional[int]
     dynamic_price: bool
     stdev_penalty: float
+    log_level: int  # stdlib logging level for the hydro_bo namespace.
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,20 @@ class Config:
     constrained_bo: ConstrainedCfg
 
 
+def _resolve_log_level(raw) -> int:
+    if raw is None:
+        return logging.INFO
+    if isinstance(raw, int):
+        return raw
+    name = str(raw).strip().upper()
+    level = logging.getLevelName(name)
+    if not isinstance(level, int):
+        raise ValueError(
+            f"Unknown log_level {raw!r}; expected DEBUG, INFO, WARNING, ERROR, CRITICAL."
+        )
+    return level
+
+
 def _resolve_general(g: dict) -> GeneralCfg:
     nd = g.get("num_devices")
     if nd is None:
@@ -90,6 +106,7 @@ def _resolve_general(g: dict) -> GeneralCfg:
         master_seed=g.get("master_seed"),
         dynamic_price=bool(g.get("dynamic_price", False)),
         stdev_penalty=float(g["stdev_penalty"]),
+        log_level=_resolve_log_level(g.get("log_level")),
     )
 
 

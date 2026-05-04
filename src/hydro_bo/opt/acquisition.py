@@ -14,7 +14,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from jax.scipy.stats.norm import cdf, pdf, icdf
+from jax.scipy.stats.norm import cdf, pdf
 
 from hydro_bo.opt.dataset import Dataset
 from hydro_bo.opt.surrogate import HeteroscedasticGP, BinomialGP, _predict

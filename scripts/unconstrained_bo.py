@@ -233,7 +233,7 @@ def main():
         SCRIPTS_DIR / "tmp" / now.strftime("%Y-%m-%d") / now.strftime("%H-%M-%S") / g.vector
     )
     _bayesopt_dir.mkdir(parents=True, exist_ok=True)
-    configure_logging(log_file=_bayesopt_dir / "run.log")
+    configure_logging(log_file=_bayesopt_dir / "run.log", package_level=g.log_level)
 
     _master_seed = resolve_master_seed(g.master_seed)
     logger.info("bayesopt.master_seed", master_seed=_master_seed, cli_seed=g.master_seed)
