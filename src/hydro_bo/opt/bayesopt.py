@@ -33,7 +33,6 @@ from hydro_bo.opt.solvers import (
     ConstrainedMixedIntNLP,
     MixedIntNLP,
     NLPBase,
-    clear_jax_caches,
     sobol_sample,
 )
 from hydro_bo.opt.surrogate import BinomialGP, HeteroscedasticGP
@@ -63,8 +62,8 @@ class BaseBayesopt(ABC):
         seed: int = 0,
         cat_vars: Sequence[Tuple[int, Sequence[float]]] = (),
         sqp_config=None,
-        gp_pow_sobol: int = 10,
-        gp_n_restarts: int = 8,
+        pad_initial: int = 256,
+        gp_lbfgs_max_iter: int = 100,
     ):
 
         self.f = f
@@ -77,8 +76,8 @@ class BaseBayesopt(ABC):
         self.seed = seed
         self.cat_vars = [(int(i), [float(v) for v in vals]) for i, vals in cat_vars]
         self.sqp_config = sqp_config
-        self.gp_pow_sobol = int(gp_pow_sobol)
-        self.gp_n_restarts = int(gp_n_restarts)
+        self.pad_initial = int(pad_initial)
+        self.gp_lbfgs_max_iter = int(gp_lbfgs_max_iter)
 
         self._X: list[np.ndarray] = []
         self._samples: list[np.ndarray] = []
@@ -236,7 +235,9 @@ class BaseBayesopt(ABC):
         x_orig = self.dataset.to_original(np.asarray(best_x_unit))
 
         del acq, solver
-        clear_jax_caches()
+        # No `clear_jax_caches()` — observations are padded to `n_max`
+        # so the JIT cache is shape-stable across BO iterations and
+        # reusing it is the whole point.
         gc.collect()
 
         return x_orig
@@ -250,15 +251,13 @@ class MeanVarBayesopt(BaseBayesopt):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gp_mu = HeteroscedasticGP(
-            pow_sobol_fit=self.gp_pow_sobol,
-            n_restarts_fit=self.gp_n_restarts,
-            sqp_config=self.sqp_config,
+            pad_initial=self.pad_initial,
+            lbfgs_max_iter=self.gp_lbfgs_max_iter,
             seed=self.seed,
         )
         self.gp_log_var = HeteroscedasticGP(
-            pow_sobol_fit=self.gp_pow_sobol,
-            n_restarts_fit=self.gp_n_restarts,
-            sqp_config=self.sqp_config,
+            pad_initial=self.pad_initial,
+            lbfgs_max_iter=self.gp_lbfgs_max_iter,
             seed=self.seed + 1,
         )
 
@@ -379,9 +378,8 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         self.z_sc = float(z_sc)
         self.l1_penalty = float(l1_penalty)
         self.gp_bin = BinomialGP(
-            pow_sobol_fit=self.gp_pow_sobol,
-            n_restarts_fit=self.gp_n_restarts,
-            sqp_config=self.sqp_config,
+            pad_initial=self.pad_initial,
+            lbfgs_max_iter=self.gp_lbfgs_max_iter,
             seed=self.seed + 2,
         )
 

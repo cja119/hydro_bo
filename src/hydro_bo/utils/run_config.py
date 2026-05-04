@@ -48,12 +48,20 @@ class SobolCfg:
 
 @dataclass(frozen=True)
 class NlpCfg:
-    """Multistart + SQP settings shared by the BO acquisition optimiser
-    and the GP-hyperparameter fits (via `multistart_sqp` in solvers.py)."""
+    """Solver settings: septal SQP for acquisition optimisation, jaxopt
+    L-BFGS for GP fits.
+
+    `n_max` is the padded shape used for GP observations — set generously
+    above the expected total count (n_initial + iter_budget +
+    n_sobol_cache). All GP code traces once at this shape, so the JIT
+    cache persists across BO iterations.
+    """
     acq_pow_sobol: int
     acq_n_restarts: int
-    gp_pow_sobol: int
-    gp_n_restarts: int
+    pad_initial: int
+    gp_lbfgs_max_iter: int
+    n_devices: int
+    blas_threads: int
     sqp_max_iter: int
     sqp_tol_stationarity: float
     sqp_tol_feasibility: float
@@ -104,6 +112,13 @@ class Config:
 def _optional_int(raw) -> Optional[int]:
     if raw is None:
         return None
+    return int(raw)
+
+
+def _resolve_n_devices(raw) -> int:
+    """null → os.cpu_count(); otherwise the supplied int."""
+    if raw is None:
+        return max(1, os.cpu_count() or 1)
     return int(raw)
 
 
@@ -168,8 +183,10 @@ def load_config(path: str | Path, *, vector_override: Optional[str] = None) -> C
         nlp=NlpCfg(
             acq_pow_sobol=int(raw["nlp"]["acq_pow_sobol"]),
             acq_n_restarts=int(raw["nlp"]["acq_n_restarts"]),
-            gp_pow_sobol=int(raw["nlp"]["gp_pow_sobol"]),
-            gp_n_restarts=int(raw["nlp"]["gp_n_restarts"]),
+            pad_initial=int(raw["nlp"]["pad_initial"]),
+            gp_lbfgs_max_iter=int(raw["nlp"]["gp_lbfgs_max_iter"]),
+            n_devices=_resolve_n_devices(raw["nlp"].get("n_devices")),
+            blas_threads=int(raw["nlp"].get("blas_threads", 1)),
             sqp_max_iter=int(raw["nlp"]["sqp_max_iter"]),
             sqp_tol_stationarity=float(raw["nlp"]["sqp_tol_stationarity"]),
             sqp_tol_feasibility=float(raw["nlp"]["sqp_tol_feasibility"]),

@@ -221,7 +221,7 @@ def main():
     cfg = load_config(SCRIPTS_DIR / "config.yml", vector_override=vector)
     g, c, s = cfg.general, cfg.constrained_bo, cfg.sobol
 
-    configure_jax_threads(g.num_devices)
+    configure_jax_threads(cfg.nlp.n_devices, cfg.nlp.blas_threads)
     from hydro_bo.opt import ConstrainedBayesopt  # noqa: E402
 
     global _eval_counter, _results_log, _bayesopt_dir, _run_timestamp, _master_seed
@@ -291,8 +291,8 @@ def main():
         z_sc=c.z_sc,
         l1_penalty=c.l1_penalty,
         sqp_config=cfg.nlp.to_sqp_config(),
-        gp_pow_sobol=cfg.nlp.gp_pow_sobol,
-        gp_n_restarts=cfg.nlp.gp_n_restarts,
+        pad_initial=cfg.nlp.pad_initial,
+        gp_lbfgs_max_iter=cfg.nlp.gp_lbfgs_max_iter,
     )
 
     sobol_dir = resolve_sobol_dir(c.sobol_dir, SCRIPTS_DIR, g.vector)

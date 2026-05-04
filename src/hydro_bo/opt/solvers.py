@@ -62,6 +62,27 @@ def clear_jax_caches() -> None:
             pass
 
 
+def _pmap_batch_eval(batch_fn, x_batch: jnp.ndarray, *args) -> jnp.ndarray:
+    """Shard `x_batch`'s leading axis across `jax.local_device_count()`
+    logical devices via pmap; fall back to the plain (vmap-fused) call
+    when only one device is available or the batch isn't divisible.
+
+    `batch_fn(x, *args)` is expected to be a vmapped callable mapping
+    `(B, ...) -> (B,)`. The trailing args are broadcast (not sharded).
+    Static args (e.g. `round_info`) should be bound upstream via
+    `functools.partial` so we don't need to thread them through pmap.
+    """
+    n_dev = jax.local_device_count()
+    n_total = int(x_batch.shape[0])
+    if n_dev <= 1 or n_total % n_dev != 0:
+        return batch_fn(x_batch, *args)
+    per_dev = n_total // n_dev
+    x_sharded = x_batch.reshape((n_dev, per_dev) + x_batch.shape[1:])
+    pmap_fn = jax.pmap(batch_fn, in_axes=(0,) + (None,) * len(args))
+    out = pmap_fn(x_sharded, *args)
+    return out.reshape((n_total,) + out.shape[2:])
+
+
 # ---------------------------------------------------------------------- #
 
 
@@ -148,7 +169,9 @@ class NLPBase:
         sampler = Sobol(d=dim, scramble=True, seed=self.seed)
         candidates = sampler.random(2**self.pow_sobol)
         x_jnp = jnp.asarray(candidates, dtype=jnp.float64)
-        raw = np.asarray(batch_fn(x_jnp, *extra_args, *acq.state_args))
+        raw = np.asarray(
+            _pmap_batch_eval(batch_fn, x_jnp, *extra_args, *acq.state_args)
+        )
         scores = rescore(raw, x_jnp) if rescore is not None else raw
         top_idx = np.argsort(scores)[-self.n_restarts :]
         return candidates[top_idx], scores[top_idx]
@@ -354,14 +377,18 @@ class ConstrainedMixedIntNLP(MixedIntNLP):
             mask_values = extra_args[0]
 
             def rescore(raw, x_jnp):
-                feas = np.asarray(feas_fn(x_jnp, mask_values, *feas_state))
+                feas = np.asarray(
+                    _pmap_batch_eval(feas_fn, x_jnp, mask_values, *feas_state)
+                )
                 return raw - self.l1_penalty * np.maximum(0.0, -feas)
 
         else:
             feas_fn = acq.feasibility_batch_fn()
 
             def rescore(raw, x_jnp):
-                feas = np.asarray(feas_fn(x_jnp, *feas_state))
+                feas = np.asarray(
+                    _pmap_batch_eval(feas_fn, x_jnp, *feas_state)
+                )
                 return raw - self.l1_penalty * np.maximum(0.0, -feas)
 
         return rescore

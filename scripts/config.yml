@@ -30,12 +30,12 @@ sobol:
   sobol_dir:        tmp/sobol/{vector}   # output base for sobol_mpc; row_NNNNN appended per task
 
 nlp:
-
   acq_pow_sobol:        14
   acq_n_restarts:       8
-  gp_pow_sobol:         5           
-  gp_n_restarts:        4
-
+  pad_initial:          512
+  gp_lbfgs_max_iter:    100
+  n_devices:            16
+  blas_threads:         2
   sqp_max_iter:         300
   sqp_tol_stationarity: 1e-6
   sqp_tol_feasibility:  1e-6
