@@ -25,9 +25,10 @@ from pyomo.environ import (
 )
 from pyomo.opt import TerminationCondition
 
-from hydro_bo.algs.logging_config import get_logger
-from hydro_bo.algs.utils import ext_visualise_output, suppress_output
-from hydro_bo.algs.relaxation import ContiguityHandler, RelaxationTree
+from hydro_bo.utils.logging_config import get_logger
+from hydro_bo.mpc.utils import ext_visualise_output, suppress_output
+from hydro_bo.mpc.contiguity import ContiguityHandler
+from hydro_bo.mpc.relaxation import RelaxationTree
 
 # Configure structured logger
 logger = get_logger(__name__)
@@ -758,7 +759,7 @@ class MPCController:
         opts["Threads"] = 1
         opts["Method"] = 2
         if self._gurobi_seed is not None:
-            from hydro_bo.algs.seeding import gurobi_seed as _clamp_gurobi_seed
+            from hydro_bo.utils.seeding import gurobi_seed as _clamp_gurobi_seed
             opts["Seed"] = _clamp_gurobi_seed(self._gurobi_seed)
         self._solver_configured = True
 

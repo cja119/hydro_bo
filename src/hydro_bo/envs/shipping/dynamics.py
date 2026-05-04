@@ -2,7 +2,7 @@ from pyomo.environ import value
 from meteor_py import GetData
 from math import floor
 from .utils import temporal_align, generate_weather_forecast, count_and_shift_arrivals
-from hydro_bo.algs.seeding import derive_subseed, make_rng
+from hydro_bo.utils.seeding import derive_subseed, make_rng
 
 import numpy as np
 
@@ -92,7 +92,10 @@ class Dynamics:
 
     def get_mpc_args(self):
         weather_forecast = generate_weather_forecast(
-            self._weather_data, self.idx, self._fast_data["sets"]["grid0"]
+            self._weather_data,
+            self.idx,
+            self._fast_data["sets"]["grid0"],
+            forecast_horizon=self._fast_data.get("forecast_horizon", 168),
         )
 
         origin_arrive = {}

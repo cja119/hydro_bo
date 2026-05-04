@@ -1,0 +1,45 @@
+# Shared configuration for the run scripts (sobol_mpc, unconstrained_bo,
+# constrained_bo). Single source of truth — there is no argparse layer
+# on top. To change behaviour for a run, edit this file or copy it.
+
+general:
+  vector:           NH3
+  renewables:       wind
+  weather_file:
+    - CoastalChile_05-10_Wind.csv
+    - CoastalChile_10-15_Wind.csv
+    - CoastalChile_15-20_Wind.csv
+    - CoastalChile_20-21_Wind.csv
+    - CoastalChile_21-22_Wind.csv
+    - CoastalChile_23-24_Wind.csv
+  bounds_expansion: 0.5            # ±50 % around planning-model reference values
+  num_devices:      null           # null → os.cpu_count() - 1
+  num_instances:    null           # null → num_devices (one MPC instance per CPU)
+  timeout:          900            # seconds per evaluation
+  forecast_horizon: 168            # hours of true weather; padded with mean to total_duration
+  master_seed:      null           # null → derive from PBS env vars + pid + wall time
+  dynamic_price:    false          # OU + jump-diffusion price dynamics
+  stdev_penalty:    0.5            # λ in the noisy-EI objective on g(x) = mu - λ·sigma
+
+sobol:
+  pow_n:            14             # 2**pow_n total candidates in the Sobol sequence
+  seed:             42             # deterministic seed for the Sobol generator
+  walltime_seconds: null           # PBS walltime; enables deadline-based early exit
+  buffer_seconds:   300            # seconds reserved before walltime for result saving
+  # `index_row` is read from the PBS_ARRAY_INDEX env var, not config.
+
+unconstrained_bo:
+  iter_budget:        20
+  n_initial_points:   8
+  failure_penalty:    -10.0        # synthetic worst-case sample when too few valid scores
+  min_valid_samples:  4            # below → penalty applied
+  sobol_dir:          null         # e.g. tmp/sobol/{vector}
+
+constrained_bo:
+  iter_budget:        20
+  n_initial_points:   8
+  infeas_threshold:   -10.0        # MPC scores ≤ this → marked infeasible (NaN)
+  p_targ:             0.9          # feasibility probability target for the chance bound
+  z_sc:               1.6449       # standard-normal z-score (Φ⁻¹(0.95)); passed directly
+  l1_penalty:         10.0         # Sobol-screen L1 hinge weight against feasibility shortfall
+  sobol_dir:          null         # e.g. tmp/sobol/{vector}

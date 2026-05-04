@@ -8,7 +8,7 @@ from pyomo.environ import Constraint
 
 def energy_balance(m, t):
     """
-    Energy balance equation for the lower production problem.
+    Energy balance equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -31,7 +31,7 @@ def energy_balance(m, t):
 
 def hydrogen_production(m, t):
     """
-    Hydrogen production equation for the lower production problem.
+    Hydrogen production equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -45,7 +45,7 @@ def hydrogen_production(m, t):
 
 def compression_balance(m, t):
     """
-    Compression balance equation for the lower production problem.
+    Compression balance equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -62,7 +62,7 @@ def compression_balance(m, t):
 
 def influent_hydrogen_balance(m, t):
     """
-    Influent hydrogen balance equation for the lower production problem.
+    Influent hydrogen balance equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -77,7 +77,7 @@ def influent_hydrogen_balance(m, t):
 
 def effluent_hydrogen_balance(m, t):
     """
-    Effluent hydrogen balance equation for the lower production problem.
+    Effluent hydrogen balance equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -93,7 +93,7 @@ def effluent_hydrogen_balance(m, t):
 
 def fuel_cell_production(m, t):
     """
-    Fuel cell production equation for the lower production problem.
+    Fuel cell production equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -107,7 +107,7 @@ def fuel_cell_production(m, t):
 
 def hydrogen_storage_balance(m, t):
     """
-    Hydrogen storage balance equation for the lower production problem.
+    Hydrogen storage balance equation.
     """
     if t == 0:
         if m.fixed.value is True:
@@ -124,7 +124,7 @@ def hydrogen_storage_balance(m, t):
 
 def vector_production(m, t):
     """
-    Vector production equation for the lower production problem.
+    Vector production equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -151,7 +151,7 @@ def vector_production(m, t):
 
 def vector_storage_balance(m, t):
     """
-    Vector storage balance equation for the lower production problem.
+    Vector storage balance equation.
 
     Storage balance: storage_change = production - shipping - flaring
     Rearranged: storage_change - production + shipping + flaring = 0
@@ -172,7 +172,7 @@ def vector_storage_balance(m, t):
 
 def shipping_balance(m, t):
     """
-    Shipping balance equation for the lower production problem.
+    Shipping balance equation.
     """
     if t == 0:
         if m.fixed.value is True:
@@ -198,7 +198,7 @@ def shipping_balance(m, t):
 
 def port_capacity(m, s, t):
     """
-    Constraint on the port capacity for the lower production problem.
+    Constraint on the port capacity.
     """
     if t == 0:
         if m.fixed.value is True:
@@ -222,20 +222,6 @@ def port_capacity(m, s, t):
         eqn -= m.expected_ships[s, t]
 
     return eqn == 0
-
-
-def lower_hydrogen_storage_limit(m, t):
-    """
-    Lower hydrogen storage limit equation for the lower production problem.
-    """
-    if t == 0 and m.fixed.value is True:
-        return Constraint.Skip
-    cons = 0
-
-    cons += m.hydrogen_storage_capacity * m.hydrogen_storage_lower_fraction
-    cons -= m.hydrogen_storage[t]
-
-    return cons <= 0
 
 
 def electrolyser_production_limit(m, t):
@@ -279,30 +265,42 @@ def compression_upper_limit(m, t):
 
     return cons <= 0
 
+def lower_hydrogen_storage_limit(m, t):
+    """"
+    Lower hydrogen storage limit equation 
+    """
+    if t == 0 and m.fixed.value is True:
+        return Constraint.Skip
+    
+    cons = 0
+    cons += m.hydrogen_storage_capacity * m.hydrogen_storage_lower_backoff
+    cons -= m.hydrogen_storage[t]
+
+    return cons <= 0
 
 def upper_hydrogen_storage_limit(m, t):
     """
-    Upper hydrogen storage limit equation for the lower production problem.
+    Upper hydrogen storage limit equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
     cons = 0
 
     cons += m.hydrogen_storage[t]
-    cons -= m.hydrogen_storage_capacity
+    cons -= m.hydrogen_storage_capacity * m.hydrogen_storage_upper_backoff
 
     return cons <= 0
 
 
 def lower_vector_storage_limit(m, t):
     """
-    Lower vector storage limit equation for the lower production problem.
+    Lower vector storage limit equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
     cons = 0
 
-    cons += m.vector_storage_capacity * 0.2
+    cons += m.vector_storage_capacity * m.vector_storage_lower_backoff
     cons -= m.vector_storage[t]
 
     return cons <= 0
@@ -310,25 +308,21 @@ def lower_vector_storage_limit(m, t):
 
 def upper_vector_storage_limit(m, t):
     """
-    Upper vector storage limit equation for the lower production problem.
+    Upper vector storage limit equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
     cons = 0
 
-    if t <= 24:
-        cons += m.vector_storage[t]
-        cons -= m.vector_storage_capacity
-    else:
-        cons += m.vector_storage[t]
-        cons -= m.vector_storage_capacity * 0.8
+    cons += m.vector_storage[t]
+    cons -= m.vector_storage_capacity * m.vector_storage_upper_backoff
 
     return cons <= 0
 
 
 def lower_vector_ramping_limit(m, t):
     """
-    Lower vector ramping limit equation for the lower production problem.
+    Lower vector ramping limit equation.
     """
     if t == 0:
         return Constraint.Skip
@@ -348,7 +342,7 @@ def lower_vector_ramping_limit(m, t):
 
 def upper_vector_ramping_limit(m, t):
     """
-    Upper vector ramping limit equation for the lower production problem.
+    Upper vector ramping limit equation.
     """
     if t == 0:
         return Constraint.Skip
@@ -368,7 +362,7 @@ def upper_vector_ramping_limit(m, t):
 
 def ship_send_limit(m, t):
     """
-    Ship send limit equation for the lower production problem.
+    Ship send limit equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -382,7 +376,7 @@ def ship_send_limit(m, t):
 
 def ship_schedule_aux_lower(m, s, _t):
     """
-    Ship schedule auxiliary equation for the lower production problem.
+    Ship schedule auxiliary equation.
     """
     if _t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -405,7 +399,7 @@ def ship_schedule_aux_lower(m, s, _t):
 
 def ship_schedule_aux_upper(m, s, _t):
     """
-    Ship schedule auxiliary equation for the lower production problem.
+    Ship schedule auxiliary equation.
     """
     if _t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -426,7 +420,7 @@ def ship_schedule_aux_upper(m, s, _t):
 
 def ship_arrival(m, t):
     """
-    Ship arrival balance equation for the lower production problem.
+    Ship arrival balance equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -443,7 +437,7 @@ def ship_arrival(m, t):
 
 def ship_schedule_target(m, s, _t):
     """
-    Ship schedule target equation for the lower production problem.
+    Ship schedule target equation.
     """
     if _t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -456,7 +450,7 @@ def ship_schedule_target(m, s, _t):
 
 def lower_vector_production_limit(m, t):
     """
-    Lower vector production limit equation for the lower production problem.
+    Lower vector production limit equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -474,7 +468,7 @@ def lower_vector_production_limit(m, t):
 
 def upper_vector_production_limit(m, t):
     """
-    Upper vector production limit equation for the lower production problem.
+    Upper vector production limit equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -488,7 +482,7 @@ def upper_vector_production_limit(m, t):
 
 def active_trains_limit(m, t):
     """
-    Active trains limit equation for the lower production problem.
+    Active trains limit equation.
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
@@ -524,7 +518,7 @@ def storage_removal_limit(m, t):
 
 def hydrogen_production_maximisation(m):
     """
-    Hydrogen production maximisation equation for the lower production problem.
+    Hydrogen production maximisation equation.
     """
     obj = 0
     obj += sum(m.vector_flux[t] for t in m.grid0)
@@ -577,7 +571,7 @@ def hourly_profit(m, t):
 
 def actual_profit_eq(m, t):
     """
-    Actual profit equation for the lower production problem.
+    Actual profit equation.
     """
     if t == 0:
         if m.fixed.value is True:
@@ -623,22 +617,9 @@ def actual_profit_eq(m, t):
     return eqn == 0
 
 
-def vector_flare_bigm_constraint(m, t):
-    """
-    Big-M constraint to force vector_flared to 0 when flare_allowed = 0.
-    When flare_allowed = 1, this constraint is non-binding (M is large).
-    """
-    if t == 0 and m.fixed.value is True:
-        return Constraint.Skip
-
-    M = m.vector_storage_capacity * 1000  
-
-    return m.vector_flared[t] <= M * m.flare_allowed
-
-
 def profit_target(m):
     """
-    Shipping target equation for the lower production problem.
+    Shipping target equation.
     """
     return (
         m.cumulative_profit[m.grid0.at(1)]

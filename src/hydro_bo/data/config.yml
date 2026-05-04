@@ -1,7 +1,13 @@
 Time:
   grid0: 1
-  grid1: 24  
+  grid1: 24
   total_duration: 336
+  # Hours of true weather data exposed to the MPC; the rest of the
+  # horizon (out to total_duration) is padded with the climatological
+  # mean. Bounded [24, total_duration]. Setting to 24 means the model
+  # only sees a one-day forecast and operates near-myopic; the default
+  # 168 matches the previous hard-coded one-week window.
+  forecast_horizon: 168
 
 Sets:
   ships: ["small", "medium", "large"]
@@ -18,6 +24,14 @@ param_source:
     - renewable_energy_capacity
     - renewables
     - vector_storage_capacity
+    # Storage backoffs — listed here so BO param_overrides surface them
+    # to the MPC. Defaults still come from variables.yml when the BO
+    # leaves them out (planning_model overrides run AFTER variables.yml
+    # defaults — see import_mpc_data).
+    - hydrogen_storage_lower_backoff
+    - hydrogen_storage_upper_backoff
+    - vector_storage_lower_backoff
+    - vector_storage_upper_backoff
 
   default_data:
     electrolysis_efficiency: ["efficiencies", "electrolysers", "SOFC"]
@@ -56,7 +70,6 @@ formulations:
     "eqn11",
     "eqn12",
     "eqn13",
-    "cons1",
     "cons2",
     "cons3",
     "cons4",
@@ -89,7 +102,6 @@ formulations:
     "eqn11",
     "eqn12",
     "eqn13",
-    "cons1",
     "cons2",
     "cons3",
     "cons4",
