@@ -221,7 +221,7 @@ def main():
     configure_jax_threads(g.num_devices)
 
     # BO classes pull jax at import — defer until after configure_jax_threads.
-    from hydro_bo.opt import BayesianOptimizer  # noqa: E402
+    from hydro_bo.opt import MeanVarBayesopt  # noqa: E402
 
     global _eval_counter, _results_log, _bayesopt_dir, _run_timestamp, _master_seed
     _eval_counter = 0
@@ -245,6 +245,7 @@ def main():
                 "general": g.__dict__,
                 "unconstrained_bo": u.__dict__,
                 "sobol": s.__dict__,
+                "nlp": cfg.nlp.__dict__,
                 "master_seed_resolved": _master_seed,
             },
             f,
@@ -280,15 +281,19 @@ def main():
             unit_positions=positions,
         )
 
-    bo = BayesianOptimizer(
+    bo = MeanVarBayesopt(
         f=_objective_factory(cfg, ref),
         bounds=bounds,
         n_initial_points=u.n_initial_points,
         iter_limit=u.iter_budget,
         lam=g.stdev_penalty,
-        n_restarts=5,
+        n_restarts=cfg.nlp.acq_n_restarts,
+        pow_sobol=cfg.nlp.acq_pow_sobol,
         seed=_master_seed % (2**31),
         cat_vars=cat_vars,
+        sqp_config=cfg.nlp.to_sqp_config(),
+        gp_pow_sobol=cfg.nlp.gp_pow_sobol,
+        gp_n_restarts=cfg.nlp.gp_n_restarts,
     )
 
     sobol_dir = resolve_sobol_dir(u.sobol_dir, SCRIPTS_DIR, g.vector)

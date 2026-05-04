@@ -11,8 +11,7 @@ categorical/integer dims, the round_info derivation, and the public API
 Implementations:
 
   - `MeanVarBayesopt`: heteroscedastic mean + log-variance GPs and noisy
-    EI on g(x) = mu(x) - lam * sigma(x). This is the production path —
-    what was previously called `BayesianOptimizer`.
+    EI on g(x) = mu(x) - lam * sigma(x). The production path.
   - `ConstrainedBayesopt`: cEI with a Polya-Gamma augmented
     BinomialGP for feasibility.
 """
@@ -63,6 +62,9 @@ class BaseBayesopt(ABC):
         pow_sobol: int = 14,  # 2**14 = 16384 acquisition Sobol candidates
         seed: int = 0,
         cat_vars: Sequence[Tuple[int, Sequence[float]]] = (),
+        sqp_config=None,
+        gp_pow_sobol: int = 10,
+        gp_n_restarts: int = 8,
     ):
 
         self.f = f
@@ -74,6 +76,9 @@ class BaseBayesopt(ABC):
         self.pow_sobol = pow_sobol
         self.seed = seed
         self.cat_vars = [(int(i), [float(v) for v in vals]) for i, vals in cat_vars]
+        self.sqp_config = sqp_config
+        self.gp_pow_sobol = int(gp_pow_sobol)
+        self.gp_n_restarts = int(gp_n_restarts)
 
         self._X: list[np.ndarray] = []
         self._samples: list[np.ndarray] = []
@@ -244,8 +249,18 @@ class MeanVarBayesopt(BaseBayesopt):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.gp_mu = HeteroscedasticGP()
-        self.gp_log_var = HeteroscedasticGP()
+        self.gp_mu = HeteroscedasticGP(
+            pow_sobol_fit=self.gp_pow_sobol,
+            n_restarts_fit=self.gp_n_restarts,
+            sqp_config=self.sqp_config,
+            seed=self.seed,
+        )
+        self.gp_log_var = HeteroscedasticGP(
+            pow_sobol_fit=self.gp_pow_sobol,
+            n_restarts_fit=self.gp_n_restarts,
+            sqp_config=self.sqp_config,
+            seed=self.seed + 1,
+        )
 
     def _best_observed(self) -> tuple[np.ndarray, float]:
         """Best (x, mu - lam * s) over training points, where s is the
@@ -331,6 +346,7 @@ class MeanVarBayesopt(BaseBayesopt):
             seed=seed,
             pow_sobol=self.pow_sobol,
             n_restarts=self.n_restarts,
+            sqp_config=self.sqp_config,
         )
 
 
@@ -362,7 +378,12 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         self.p_targ = float(p_targ)
         self.z_sc = float(z_sc)
         self.l1_penalty = float(l1_penalty)
-        self.gp_bin = BinomialGP()
+        self.gp_bin = BinomialGP(
+            pow_sobol_fit=self.gp_pow_sobol,
+            n_restarts_fit=self.gp_n_restarts,
+            sqp_config=self.sqp_config,
+            seed=self.seed + 2,
+        )
 
     def _fit_surrogates(self) -> None:
         # Mean + log-variance GPs (and self.dataset) — full MeanVar machinery.
@@ -409,6 +430,7 @@ class ConstrainedBayesopt(MeanVarBayesopt):
             seed=seed,
             pow_sobol=self.pow_sobol,
             n_restarts=self.n_restarts,
+            sqp_config=self.sqp_config,
         )
 
     def _best_observed(self) -> tuple[np.ndarray, float]:
