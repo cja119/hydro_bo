@@ -182,7 +182,7 @@ def _feasibility_eval(x, gp_bin_state, log_p_targ, z_sc, round_info):
         round_info,
     )
     sigma = jnp.sqrt(jnp.clip(var, 1e-12, None))
-    return (mu + z_sc * sigma - log_p_targ).squeeze()
+    return (mu - z_sc * sigma - log_p_targ).squeeze()
 
 
 @partial(jax.jit, static_argnames="round_info")

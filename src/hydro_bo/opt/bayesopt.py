@@ -27,6 +27,7 @@ from hydro_bo.opt.acquisition import (
     AcquisitionFunction,
     ConstrainedExpectedImprovement,
     ExpectedImprovement,
+    _ei_g_stats,
 )
 from hydro_bo.opt.dataset import Dataset
 from hydro_bo.opt.solvers import (
@@ -231,7 +232,26 @@ class BaseBayesopt(ABC):
         seed = self.seed + len(self._X)
         solver = self._build_solver(seed=seed)
         best_x_unit, best_val = solver.maximise(acq)
-        logger.debug("bo_acquisition_optimise_complete", best_score=float(best_val))
+
+        # Predicted confidence-bound g(x) = mu - lam·sigma at the chosen
+        # point, in the original (un-standardised) target space —
+        # `_ei_g_stats` undoes the GP-target scaling internally.
+        e_g, var_g = _ei_g_stats(
+            jnp.asarray(best_x_unit, dtype=jnp.float64)[None, :],
+            acq.gp_mu_state,
+            acq.gp_log_var_state,
+            acq.scaling,
+            acq.round_info,
+        )
+        cb = float(e_g[0])
+        cb_sigma = float(jnp.sqrt(jnp.clip(var_g[0], 0.0, None)))
+        logger.info(
+            "bo_acquisition_optimise_complete",
+            ei_value=float(best_val),
+            confidence_bound=cb,
+            confidence_bound_sigma=cb_sigma,
+            incumbent_g_best=float(acq._g_best),
+        )
         x_orig = self.dataset.to_original(np.asarray(best_x_unit))
 
         del acq, solver

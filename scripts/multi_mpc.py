@@ -184,6 +184,9 @@ def parse_args() -> argparse.Namespace:
                         help="Seconds to reserve before walltime for result saving (default: 300).")
     parser.add_argument("--master_seed",      type=int, default=None,
                         help="Master seed for the run. If omitted, derived from PBS env vars + pid + wall time.")
+    parser.add_argument("--planning_model",   type=str, default=None,
+                        help="Planning-model filename under tmp/planning/ to load instead of the default "
+                             "<VECTOR>-Chile.yml. Used to inject specific param sets (e.g. a sobol row).")
     return parser.parse_args()
 
 
@@ -194,6 +197,6 @@ if __name__ == "__main__":
     NUM_DEVICES     = args.ncpus
     NUM_INSTANCES   = args.n_sim if args.n_sim is not None else args.ncpus
 
-    PLANNING_MODEL  = f"{VECTOR}-Chile.yml"
+    PLANNING_MODEL  = args.planning_model or f"{VECTOR}-Chile.yml"
 
     run_multisim(args=args)
