@@ -215,8 +215,8 @@ def port_capacity(m, s, t):
     if t % 24 == 0:
         eqn += m.n_ship_sent[s, t]
 
-    if t >= m.mean_ship_arrival_time * 24 and t % 24 == 0:
-        eqn -= m.n_ship_ordered[s, t - m.mean_ship_arrival_time * 24]
+    if t >= (m.mean_ship_arrival_time + m.expected_arrival_offset) * 24 and t % 24 == 0:
+        eqn -= m.n_ship_ordered[s, t - (m.mean_ship_arrival_time + m.expected_arrival_offset) * 24]
 
     if t > 24 and t % 24 == 0:
         eqn -= m.expected_ships[s, t]
@@ -384,14 +384,14 @@ def ship_schedule_aux_lower(m, s, _t):
     cons = 0
     cons += m.n_ship_aux[s, _t]
 
-    if _t >= m.mean_ship_arrival_time * 24:
+    if _t >= (m.mean_ship_arrival_time + m.expected_arrival_offset) * 24:
         cons -= m.ship_schedule[s, _t] - sum(
             m.n_ship_sent[s, t]
-            for t in range(_t - m.mean_ship_arrival_time * 24, _t + 1, 24)
+            for t in range(_t - (m.mean_ship_arrival_time + m.expected_arrival_offset) * 24, _t + 1, 24)
         )
         cons -= sum(
             m.expected_ships[s, _t]
-            for _t in range(_t - m.mean_ship_arrival_time * 24, _t + 1, 24)
+            for _t in range(_t - (m.mean_ship_arrival_time + m.expected_arrival_offset) * 24, _t + 1, 24)
         )
 
     return cons <= 0
@@ -406,14 +406,14 @@ def ship_schedule_aux_upper(m, s, _t):
     cons = 0
     cons += m.n_ship_aux[_t]
 
-    if _t >= m.mean_ship_arrival_time * 24:
+    if _t >= (m.mean_ship_arrival_time + m.expected_arrival_offset) * 24:
         cons += m.ship_schedule[s, _t] - sum(
             m.n_ship_sent[s, t]
-            for t in range(_t - m.mean_ship_arrival_time * 24, _t + 1, 24)
+            for t in range(_t - (m.mean_ship_arrival_time + m.expected_arrival_offset) * 24, _t + 1, 24)
         )
         cons += sum(
             m.expected_ships[s, _t]
-            for _t in range(_t - m.mean_ship_arrival_time * 24, _t + 1, 24)
+            for _t in range(_t - (m.mean_ship_arrival_time + m.expected_arrival_offset) * 24, _t + 1, 24)
         )
     return cons <= 0
 

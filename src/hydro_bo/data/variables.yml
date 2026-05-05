@@ -1,6 +1,7 @@
 parameters:
   mean_ship_arrival_time: 7
   std_ship_arrival_time: 0.25
+  expected_arrival_offset: 0
   hydrogen_storage_lower_backoff: 0.2
   hydrogen_storage_upper_backoff: 1.0
   vector_storage_lower_backoff: 0.2

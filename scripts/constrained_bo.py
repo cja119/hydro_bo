@@ -27,8 +27,8 @@ from hydro_bo.utils.jax_threads import configure_jax_threads
 from hydro_bo.utils.logging_config import configure_logging, get_logger
 from hydro_bo.utils.run_config import (
     Config,
-    env_args_from,
     load_config,
+    merge_env_overrides,
     planning_model_path,
     resolve_sobol_dir,
 )
@@ -37,6 +37,7 @@ from hydro_bo.utils.search_space import (
     PARAM_KEYS,
     build_bounds,
     build_cat_vars,
+    flatten_dims,
     params_from_x,
 )
 from hydro_bo.utils.seeding import resolve_master_seed
@@ -64,11 +65,11 @@ def _objective_factory(cfg: Config, ref: dict):
         global _eval_counter
         _eval_counter += 1
 
-        params = params_from_x(x, ref, renewables=g.renewables, vector=g.vector)
+        planning_params, env_overrides = params_from_x(x, ref, renewables=g.renewables, vector=g.vector)
 
         dispatcher = RayMultiMPC(
-            env_args=env_args_from(cfg),
-            param_overrides=params,
+            env_args=merge_env_overrides(cfg, env_overrides),
+            param_overrides=planning_params,
             num_instances=g.num_instances,
             num_devices=g.num_devices,
             timeout=g.timeout,
@@ -109,10 +110,11 @@ def _objective_factory(cfg: Config, ref: dict):
             "feasibility_rate": feasibility_rate,
             "worker_scores": list(raw_scores),
         }
+        flat_dims = flatten_dims(planning_params, env_overrides)
         for key in PARAM_KEYS:
-            result_entry[key] = params[key]
-        result_entry["capex"] = params["capex"]
-        result_entry["opex"] = params["opex"]
+            result_entry[key] = flat_dims[key]
+        result_entry["capex"] = planning_params["capex"]
+        result_entry["opex"] = planning_params["opex"]
         _results_log.append(result_entry)
 
         logger.info(
@@ -308,20 +310,25 @@ def main():
                 logger.info("bayesopt.sobol_phase_skipped_via_cache", n_preloaded=len(preloaded))
 
     best_x, best_score = bo.run()
-    best_params = params_from_x(best_x, ref, renewables=g.renewables, vector=g.vector)
+    best_planning_params, best_env_overrides = params_from_x(
+        best_x, ref, renewables=g.renewables, vector=g.vector
+    )
+    best_flat = flatten_dims(best_planning_params, best_env_overrides)
 
     logger.info("bayesopt.complete")
     logger.info("bayesopt.best_score", score=best_score)
-    for k, v in best_params.items():
+    for k, v in best_flat.items():
         logger.info("bayesopt.parameter", name=k, value=v)
 
     out_path = SCRIPTS_DIR / "tmp" / "planning" / f"{g.vector}-Chile-cbo.yml"
+    snapshot = dict(best_planning_params)
+    snapshot["wind_forecast_mean"] = best_flat["wind_forecast_mean"]
     with open(out_path, "w") as f:
-        yaml.dump(best_params, f, default_flow_style=False)
+        yaml.dump(snapshot, f, default_flow_style=False)
     logger.info("bayesopt.saved", path=str(out_path))
 
     save_results(_results_log, _bayesopt_dir, _run_timestamp)
-    return best_params, best_score
+    return snapshot, best_score
 
 
 if __name__ == "__main__":

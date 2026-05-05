@@ -635,7 +635,7 @@ class MPCController:
 
     def _build_params(self, params_def):
         # Parameters that must remain immutable (used in control flow)
-        immutable_params = {'mean_ship_arrival_time', 'mean_ship_transit_time', 'std_ship_transit_time'}
+        immutable_params = {'mean_ship_arrival_time', 'mean_ship_transit_time', 'std_ship_transit_time', 'expected_arrival_offset'}
 
         for key, param in params_def.items():
             # Determine if this parameter should be mutable

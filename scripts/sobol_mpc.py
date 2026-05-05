@@ -23,14 +23,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hydro_bo.mpc.dispatcher import RayMultiMPC
 from hydro_bo.utils.logging_config import configure_logging, get_logger
 from hydro_bo.utils.run_config import (
-    env_args_from,
     load_config,
+    merge_env_overrides,
     planning_model_path,
     resolve_sobol_dir,
 )
 from hydro_bo.utils.search_space import (
     PARAM_KEYS,
     build_bounds,
+    flatten_dims,
     params_from_x,
     scale_unit_to_bounds,
     sobol_unit_sample,
@@ -115,8 +116,9 @@ def main():
         x=x.tolist(),
     )
 
-    params = params_from_x(x, ref, renewables=g.renewables, vector=g.vector)
-    logger.info("sobol_mpc.parameters", **{k: params[k] for k in PARAM_KEYS})
+    planning_params, env_overrides = params_from_x(x, ref, renewables=g.renewables, vector=g.vector)
+    flat_dims = flatten_dims(planning_params, env_overrides)
+    logger.info("sobol_mpc.parameters", **flat_dims)
 
     deadline = None
     if s.walltime_seconds is not None:
@@ -128,8 +130,8 @@ def main():
         )
 
     dispatcher = RayMultiMPC(
-        env_args=env_args_from(cfg),
-        param_overrides=params,
+        env_args=merge_env_overrides(cfg, env_overrides),
+        param_overrides=planning_params,
         num_instances=g.num_instances,
         num_devices=g.num_devices,
         timeout=g.timeout,
@@ -191,9 +193,9 @@ def main():
         "x": x.tolist(),
     }
     for key in PARAM_KEYS:
-        result[key] = params[key]
-    result["capex"] = params["capex"]
-    result["opex"] = params["opex"]
+        result[key] = flat_dims[key]
+    result["capex"] = planning_params["capex"]
+    result["opex"] = planning_params["opex"]
 
     json_path = out_dir / f"result_{run_timestamp}.json"
     with open(json_path, "w") as f:
