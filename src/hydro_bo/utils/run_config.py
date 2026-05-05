@@ -232,6 +232,25 @@ def env_args_from(cfg: Config) -> dict:
     }
 
 
+def merge_env_overrides(cfg: Config, env_overrides: dict) -> dict:
+    """Build a fresh env_args from cfg and deep-merge BO-supplied
+    `env_overrides` into its `config` block. Caller passes the result
+    straight to `RayMultiMPC(env_args=...)` — keeps per-eval overrides
+    out of the shared cfg-derived dict."""
+    env_args = env_args_from(cfg)
+
+    def _deep_merge(target: dict, src: dict) -> None:
+        for k, v in src.items():
+            if isinstance(v, dict) and isinstance(target.get(k), dict):
+                _deep_merge(target[k], v)
+            else:
+                target[k] = v
+
+    if env_overrides:
+        _deep_merge(env_args["config"], env_overrides)
+    return env_args
+
+
 def resolve_sobol_dir(
     cfg_sobol_dir: Optional[str],
     scripts_dir: Path,

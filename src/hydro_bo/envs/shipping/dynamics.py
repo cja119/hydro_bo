@@ -96,6 +96,9 @@ class Dynamics:
             self.idx,
             self._fast_data["sets"]["grid0"],
             forecast_horizon=self._fast_data.get("forecast_horizon", 168),
+            mean_override=self._args.get("weather_data", {}).get(
+                "forecast_mean_override"
+            ),
         )
 
         origin_arrive = {}

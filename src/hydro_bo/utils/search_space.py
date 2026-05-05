@@ -30,16 +30,28 @@ PARAM_KEYS = [
     "hydrogen_storage_upper_backoff",
     "vector_storage_lower_backoff",
     "vector_storage_upper_backoff",
+    "wind_forecast_mean",
+    "expected_arrival_offset",
 ]
 
-INTEGER_KEYS = {"conversion_trains_number"}
+# Dims the BO branches over as integer levels.
+# `expected_arrival_offset` lives in days, so its absolute bounds (-2, 2)
+# resolve to five categorical levels {-2,-1,0,1,2} via build_cat_vars.
+INTEGER_KEYS = {"conversion_trains_number", "expected_arrival_offset"}
 
 ABSOLUTE_BOUNDS = {
     "hydrogen_storage_lower_backoff": (0.0, 0.5),
     "hydrogen_storage_upper_backoff": (0.5, 1.0),
     "vector_storage_lower_backoff":   (0.0, 0.5),
     "vector_storage_upper_backoff":   (0.5, 1.0),
+    "wind_forecast_mean":             (0.0, 1.0),
+    "expected_arrival_offset":        (-2.0, 2.0),
 }
+
+# Search dims that are env-side overrides (not planning-model params).
+# Stripped from the planning_params dict and returned separately by
+# params_from_x so the BO scripts can splice them into env_args.
+ENV_OVERRIDE_KEYS = {"wind_forecast_mean"}
 
 
 def build_bounds(ref: dict, expansion: float) -> np.ndarray:
@@ -79,15 +91,32 @@ def build_cat_vars(bounds: np.ndarray) -> list[tuple[int, list[float]]]:
     return cat_vars
 
 
-def params_from_x(x: np.ndarray, ref: dict, *, renewables: str, vector: str) -> dict:
-    """Convert a BO sample vector into a full planning model dict."""
+def params_from_x(
+    x: np.ndarray, ref: dict, *, renewables: str, vector: str
+) -> tuple[dict, dict]:
+    """Convert a BO sample vector into `(planning_params, env_overrides)`.
+
+    `planning_params` flows into `RayMultiMPC(param_overrides=...)` —
+    capacities, backoffs, integer counts, the MPC-side
+    `expected_arrival_offset`, plus computed `capex`/`opex`.
+
+    `env_overrides` flows into `env_args["config"]` via deep-merge —
+    env-side knobs not represented in the planning-model reference dict
+    (currently just the wind forecast mean, nested under `weather_data`).
+    """
     from hydro_bo.envs.shipping.utils import calculate_capex_opex
 
     p = dict(ref)
+    env_overrides: dict = {}
     for i, key in enumerate(PARAM_KEYS):
         val = float(x[i])
-        if key == "conversion_trains_number":
-            val = max(1, int(round(val)))
+        if key in INTEGER_KEYS:
+            val = int(round(val))
+            if key == "conversion_trains_number":
+                val = max(1, val)
+        if key == "wind_forecast_mean":
+            env_overrides.setdefault("weather_data", {})["forecast_mean_override"] = float(val)
+            continue
         p[key] = val
 
     costs = calculate_capex_opex(
@@ -103,7 +132,22 @@ def params_from_x(x: np.ndarray, ref: dict, *, renewables: str, vector: str) -> 
     )
     p["capex"] = costs["capex"]
     p["opex"] = costs["opex"]
-    return p
+    return p, env_overrides
+
+
+def flatten_dims(planning_params: dict, env_overrides: dict) -> dict:
+    """Flat dict keyed by `PARAM_KEYS`, sourcing values from
+    `planning_params` for planning-side dims and from `env_overrides`
+    for env-side dims. Used by the BO/Sobol scripts so the per-eval log
+    rows have one column per BO dim regardless of where the value lives.
+    """
+    out: dict = {}
+    for key in PARAM_KEYS:
+        if key == "wind_forecast_mean":
+            out[key] = env_overrides["weather_data"]["forecast_mean_override"]
+        else:
+            out[key] = planning_params[key]
+    return out
 
 
 def sobol_unit_sample(seed: int, pow_n: int, index_row: int) -> np.ndarray:

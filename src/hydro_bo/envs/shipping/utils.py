@@ -170,6 +170,15 @@ def import_mpc_data(
 
     price_dynamics = config.get("price_dynamics", {"enabled": False})
 
+    # Clamp the MPC's assumed-arrival shift so (mean + offset) stays in
+    # [1, max grid1 day]. Out-of-range values would produce negative or
+    # over-horizon time indices in port_capacity / ship_schedule_aux.
+    mat = int(params.get("mean_ship_arrival_time", 7))
+    off = int(params.get("expected_arrival_offset", 0))
+    max_day = max(1, int(total_duration) // 24 - 1)
+    effective = max(1, min(max_day, mat + off))
+    params["expected_arrival_offset"] = effective - mat
+
     return {
         "sets": sets,
         "params": params,
@@ -392,11 +401,15 @@ def calculate_capex_opex(
     }
 
 
+WIND_FORECAST_SCALE = 11.88
+
+
 def generate_weather_forecast(
     weather_data: Sequence[float],
     start_idx: int,
     grid_set: Sequence[Any],
     forecast_horizon: int = 168,
+    mean_override: Optional[float] = None,
 ) -> list[float]:
     """Slice `forecast_horizon` hours of true weather starting at
     `start_idx`, then pad to the full grid length with the climatological
@@ -404,13 +417,21 @@ def generate_weather_forecast(
     look-ahead the MPC actually receives — anything beyond it is just
     flat mean weather. Caller is expected to validate the horizon
     against `total_duration`; we still clip defensively against the
-    grid length to avoid an empty slice."""
+    grid length to avoid an empty slice.
+
+    `mean_override` (in [0, 1]) replaces the horizon slice with a flat
+    value `mean_override * WIND_FORECAST_SCALE`, projecting the BO knob
+    into the same units the MPC expects. The post-horizon tail still
+    pads with the climatological mean of the true series."""
     full_length = len(grid_set)
     horizon = max(1, min(int(forecast_horizon), full_length))
     end = start_idx + horizon
     mean_weather = float(mean(weather_data))
 
-    forecast = list(weather_data[start_idx:end])
+    if mean_override is not None:
+        forecast = horizon * [float(mean_override) * WIND_FORECAST_SCALE]
+    else:
+        forecast = list(weather_data[start_idx:end])
     if len(forecast) < full_length:
         forecast += (full_length - len(forecast)) * [mean_weather]
     return forecast
