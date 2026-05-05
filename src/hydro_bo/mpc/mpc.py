@@ -757,7 +757,7 @@ class MPCController:
         opts["Heuristics"] = 0.1
         opts["TimeLimit"] = 300
         opts["Threads"] = 1
-        opts["Method"] = 2
+        opts["Method"] = 1
         if self._gurobi_seed is not None:
             from hydro_bo.utils.seeding import gurobi_seed as _clamp_gurobi_seed
             opts["Seed"] = _clamp_gurobi_seed(self._gurobi_seed)
