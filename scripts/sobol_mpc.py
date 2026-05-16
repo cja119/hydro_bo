@@ -43,21 +43,39 @@ logger = get_logger(__name__)
 SCRIPTS_DIR = Path(__file__).resolve().parent
 
 
-def _parse_vector_arg() -> str | None:
-    """Single-arg CLI: `--vector` is the only flag that overrides config.
-    Everything else lives in scripts/config.yml."""
+def _parse_cli_overrides() -> argparse.Namespace:
+    """CLI overrides for config.yml. Two knobs only — vector and ncpus —
+    everything else lives in scripts/config.yml. ncpus exists so PBS /
+    shell wrappers can pass the queue's actual core count without editing
+    the YAML; when omitted, `general.num_devices` from the YAML wins."""
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("--vector", type=str, default=None,
                         help="Hydrogen vector for this run; overrides general.vector.")
-    return parser.parse_args().vector
+    parser.add_argument("--ncpus", type=int, default=None,
+                        help="Override general.num_devices (parallel workers).")
+    return parser.parse_args()
 
 
 def main():
-    vector = _parse_vector_arg()
-    cfg = load_config(SCRIPTS_DIR / "config.yml", vector_override=vector)
+    cli = _parse_cli_overrides()
+    cfg = load_config(
+        SCRIPTS_DIR / "config.yml",
+        vector_override=cli.vector,
+        num_devices_override=cli.ncpus,
+    )
     g, s = cfg.general, cfg.sobol
 
-    index_row = int(os.environ.get("PBS_ARRAY_INDEX", "0"))
+    array_index = int(os.environ.get("PBS_ARRAY_INDEX", "0"))
+    index_file = os.environ.get("SOBOL_INDEX_FILE")
+    if index_file:
+        # Topup mode: PBS_ARRAY_INDEX selects a line of `index_file`, and that
+        # line's integer is the real Sobol row. Lets a sparse list of missing
+        # rows be re-run via a contiguous PBS array.
+        with open(index_file) as f:
+            idx_list = [int(line.strip()) for line in f if line.strip()]
+        index_row = idx_list[array_index]
+    else:
+        index_row = array_index
 
     now = datetime.now()
     run_timestamp = now.strftime("%Y%m%d_%H%M%S")
@@ -145,36 +163,15 @@ def main():
         timeout=g.timeout,
     )
 
-    scores = dispatcher.run_multisim(deadline=deadline)
-    scores_arr = np.array(scores, dtype=float) if scores else np.array([], dtype=float)
-    finite_mask = np.isfinite(scores_arr)
-    finite_scores = scores_arr[finite_mask]
-    n_failed = int((~finite_mask).sum())
-
-    if len(finite_scores) > 0:
-        mean_score = float(finite_scores.mean())
-        var_score = float(finite_scores.var(ddof=1)) if len(finite_scores) >= 2 else float("nan")
-        sd_score = float(np.sqrt(var_score)) if np.isfinite(var_score) else 0.0
-        objective = mean_score - g.stdev_penalty * sd_score
-    else:
-        mean_score = float("nan")
-        var_score = float("nan")
-        objective = -1e8
-
-    logger.info(
-        "sobol_mpc.complete",
-        index_row=index_row,
-        objective=objective,
-        mean_score=mean_score,
-        var_score=var_score,
-        n_failed=n_failed,
-        n_workers=len(scores),
-    )
-
-    status = "complete" if s.walltime_seconds is None or n_failed == 0 else "partial"
+    # Streaming partial-results protocol:
+    #   -inf  → slot not yet reported (still pending or never ran)
+    #   null  → worker ran but failed
+    #   finite → worker score
+    worker_scores = [float("-inf")] * g.num_instances
+    json_path = out_dir / f"result_{run_timestamp}.json"
     result = {
         "timestamp": now.isoformat(),
-        "status": status,
+        "status": "running",
         "index_row": index_row,
         "vector": g.vector,
         "bounds_expansion": g.bounds_expansion,
@@ -183,12 +180,12 @@ def main():
         "sobol_pow_n": s.pow_n,
         "num_instances": g.num_instances,
         "num_devices": g.num_devices,
-        "objective": objective,
-        "mean_score": mean_score,
-        "var_score": var_score,
-        "n_workers": len(scores),
-        "n_failed": n_failed,
-        "worker_scores": scores,
+        "objective": None,
+        "mean_score": None,
+        "var_score": None,
+        "n_workers": 0,
+        "n_failed": 0,
+        "worker_scores": worker_scores,
         "unit_sample": unit_sample.tolist(),
         "x": x.tolist(),
     }
@@ -197,9 +194,76 @@ def main():
     result["capex"] = planning_params["capex"]
     result["opex"] = planning_params["opex"]
 
-    json_path = out_dir / f"result_{run_timestamp}.json"
-    with open(json_path, "w") as f:
-        json.dump(result, f, indent=2)
+    def _atomic_write_json(path, obj):
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(obj, f, indent=2)
+        os.replace(tmp, path)
+
+    def _recompute_stats():
+        finite = np.array(
+            [v for v in worker_scores if v is not None and np.isfinite(v)],
+            dtype=float,
+        )
+        if finite.size > 0:
+            mean_s = float(finite.mean())
+            var_s = float(finite.var(ddof=1)) if finite.size >= 2 else float("nan")
+            sd_s = float(np.sqrt(var_s)) if np.isfinite(var_s) else 0.0
+            result["mean_score"] = mean_s
+            result["var_score"] = var_s
+            result["objective"] = mean_s - g.stdev_penalty * sd_s
+        result["n_workers"] = sum(1 for v in worker_scores if v != float("-inf"))
+        result["n_failed"] = sum(1 for v in worker_scores if v is None)
+
+    _atomic_write_json(json_path, result)
+
+    def _on_progress(worker_index, success, score, _relax_info):
+        worker_scores[worker_index] = float(score) if success and score is not None else None
+        _recompute_stats()
+        try:
+            _atomic_write_json(json_path, result)
+        except Exception:
+            logger.exception("sobol_mpc.partial_write_failed", worker_index=worker_index)
+
+    try:
+        dispatcher.run_multisim(deadline=deadline, progress_callback=_on_progress)
+    except Exception:
+        logger.exception("sobol_mpc.dispatcher_crashed", index_row=index_row)
+        result["status"] = "dispatcher_crashed"
+        _recompute_stats()
+        _atomic_write_json(json_path, result)
+        raise
+
+    _recompute_stats()
+    n_failed = result["n_failed"]
+    n_not_run = sum(1 for v in worker_scores if v == float("-inf"))
+
+    if result["objective"] is None:
+        # No finite worker scores at all — fall back to the historical sentinel
+        # so downstream filters (`obj <= -10.0`) treat the row as failed.
+        result["objective"] = -1e8
+        result["mean_score"] = float("nan")
+        result["var_score"] = float("nan")
+
+    if n_not_run > 0:
+        result["status"] = "partial"
+    elif n_failed > 0 and s.walltime_seconds is not None:
+        result["status"] = "partial"
+    else:
+        result["status"] = "complete"
+
+    logger.info(
+        "sobol_mpc.complete",
+        index_row=index_row,
+        objective=result["objective"],
+        mean_score=result["mean_score"],
+        var_score=result["var_score"],
+        n_failed=n_failed,
+        n_not_run=n_not_run,
+        n_workers=result["n_workers"],
+    )
+
+    _atomic_write_json(json_path, result)
 
     csv_fieldnames = (
         [

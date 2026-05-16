@@ -266,12 +266,14 @@ def compression_upper_limit(m, t):
     return cons <= 0
 
 def lower_hydrogen_storage_limit(m, t):
-    """"
-    Lower hydrogen storage limit equation 
+    """
+    Lower hydrogen storage limit. 
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
-    
+    if t < m.forecast_horizon.value:
+        return Constraint.Skip
+
     cons = 0
     cons += m.hydrogen_storage_capacity * m.hydrogen_storage_lower_backoff
     cons -= m.hydrogen_storage[t]
@@ -280,23 +282,28 @@ def lower_hydrogen_storage_limit(m, t):
 
 def upper_hydrogen_storage_limit(m, t):
     """
-    Upper hydrogen storage limit equation.
+    Upper hydrogen storage limit. 
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
     cons = 0
-
     cons += m.hydrogen_storage[t]
-    cons -= m.hydrogen_storage_capacity * m.hydrogen_storage_upper_backoff
+
+    if t < m.forecast_horizon.value:
+        cons -= m.hydrogen_storage_capacity
+    else:
+        cons -= m.hydrogen_storage_capacity * m.hydrogen_storage_upper_backoff
 
     return cons <= 0
 
 
 def lower_vector_storage_limit(m, t):
     """
-    Lower vector storage limit equation.
+    Lower vector storage limit. 
     """
     if t == 0 and m.fixed.value is True:
+        return Constraint.Skip
+    if t < m.forecast_horizon.value:
         return Constraint.Skip
     cons = 0
 
@@ -308,14 +315,17 @@ def lower_vector_storage_limit(m, t):
 
 def upper_vector_storage_limit(m, t):
     """
-    Upper vector storage limit equation.
+    Upper vector storage limit. 
     """
     if t == 0 and m.fixed.value is True:
         return Constraint.Skip
     cons = 0
-
     cons += m.vector_storage[t]
-    cons -= m.vector_storage_capacity * m.vector_storage_upper_backoff
+
+    if t < m.forecast_horizon.value:
+        cons -= m.vector_storage_capacity
+    else:
+        cons -= m.vector_storage_capacity * m.vector_storage_upper_backoff
 
     return cons <= 0
 

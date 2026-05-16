@@ -24,22 +24,36 @@ def _project_integer_dims(X, round_info):
     return X
 
 
-@partial(jax.jit, static_argnames="round_info")
-def _kernel(log_amp, log_ls, X1, X2, round_info):
-    """ARD RBF kernel with optional projection of integer dims onto a
-    discrete unit-cube grid. round_info is a static Python tuple — empty
-    skips projection."""
+_KERNEL_KINDS = ("rbf", "matern12")
+
+
+@partial(jax.jit, static_argnames=("round_info", "kernel_kind"))
+def _kernel(log_amp, log_ls, X1, X2, round_info, kernel_kind):
+    """ARD kernel dispatcher with optional projection of integer dims
+    onto a discrete unit-cube grid. `kernel_kind` is a static Python
+    string — `"rbf"` (squared-exponential, the default elsewhere) or
+    `"matern12"` (Laplacian / exponential, less smooth, better at
+    representing sharp boundaries without forcing extreme length scales).
+    round_info is a static Python tuple — empty skips projection.
+    """
     if round_info:
         X1 = _project_integer_dims(X1, round_info)
         X2 = _project_integer_dims(X2, round_info)
     amp2 = jnp.exp(2.0 * log_amp)
     ls = jnp.exp(log_ls)
     diff = (X1[:, None, :] - X2[None, :, :]) / ls
-    d2 = jnp.sum(diff * diff, axis=-1)
-    return amp2 * jnp.exp(-0.5 * d2)
+
+    if kernel_kind == "rbf":
+        d2 = jnp.sum(diff * diff, axis=-1)
+        return amp2 * jnp.exp(-0.5 * d2)
+    if kernel_kind == "matern12":
+        eps = 1e-12
+        d1 = jnp.sum(jnp.abs(diff), axis=-1) + eps
+        return amp2 * jnp.exp(-d1)
+    raise ValueError(f"unknown kernel_kind: {kernel_kind!r}; expected one of {_KERNEL_KINDS}")
 
 
-def _build_K_masked(log_amp, log_ls, X, mask, noise, jitter, round_info):
+def _build_K_masked(log_amp, log_ls, X, mask, noise, jitter, round_info, kernel_kind):
     """Build the (n_max, n_max) kernel matrix with padded rows/cols
     replaced by an identity block.
 
@@ -52,7 +66,7 @@ def _build_K_masked(log_amp, log_ls, X, mask, noise, jitter, round_info):
     are zero when y_c is masked, so prediction-time formulas need only
     mask the variance summation over training rows."""
     n_max = X.shape[0]
-    K = _kernel(log_amp, log_ls, X, X, round_info)
+    K = _kernel(log_amp, log_ls, X, X, round_info, kernel_kind)
     M2 = mask[:, None] * mask[None, :]
     K = K * M2  # zero cross-terms involving any padded row/col
     diag_real = mask * (noise + jitter)  # noise+jitter on real diagonal
@@ -60,8 +74,8 @@ def _build_K_masked(log_amp, log_ls, X, mask, noise, jitter, round_info):
     return K + jnp.diag(diag_real + diag_padded)
 
 
-@partial(jax.jit, static_argnames="round_info")
-def _neg_mll(params, X, y, noise, mask, jitter, round_info):
+@partial(jax.jit, static_argnames=("round_info", "kernel_kind"))
+def _neg_mll(params, X, y, noise, mask, jitter, round_info, kernel_kind):
     """Masked NMLL — observations on `mask == 1` rows count, padded
     rows contribute a constant offset that drops out of optimisation."""
     K = _build_K_masked(
@@ -72,6 +86,7 @@ def _neg_mll(params, X, y, noise, mask, jitter, round_info):
         noise,
         jitter,
         round_info,
+        kernel_kind,
     )
     y_c = (y - params["mean"]) * mask
     L = jnp.linalg.cholesky(K)
@@ -81,8 +96,8 @@ def _neg_mll(params, X, y, noise, mask, jitter, round_info):
     return 0.5 * (jnp.dot(y_c, alpha) + log_det + n_real * jnp.log(2.0 * jnp.pi))
 
 
-@partial(jax.jit, static_argnames="round_info")
-def _factorise(params, X, y, noise, mask, jitter, round_info):
+@partial(jax.jit, static_argnames=("round_info", "kernel_kind"))
+def _factorise(params, X, y, noise, mask, jitter, round_info, kernel_kind):
     K = _build_K_masked(
         params["log_amp"],
         params["log_ls"],
@@ -91,6 +106,7 @@ def _factorise(params, X, y, noise, mask, jitter, round_info):
         noise,
         jitter,
         round_info,
+        kernel_kind,
     )
     y_c = (y - params["mean"]) * mask
     L = jnp.linalg.cholesky(K)
@@ -98,12 +114,14 @@ def _factorise(params, X, y, noise, mask, jitter, round_info):
     return L, alpha
 
 
-@partial(jax.jit, static_argnames="round_info")
-def _predict(params, X_train, L, alpha, mean, mask, X_test, round_info):
+@partial(jax.jit, static_argnames=("round_info", "kernel_kind"))
+def _predict(params, X_train, L, alpha, mean, mask, X_test, round_info, kernel_kind):
     """Padded predict. `mask` zeros padded training rows out of the
     variance summation; padded contributions to the mean are already
     zero because `alpha[padded] == 0`."""
-    K_s = _kernel(params["log_amp"], params["log_ls"], X_test, X_train, round_info)
+    K_s = _kernel(
+        params["log_amp"], params["log_ls"], X_test, X_train, round_info, kernel_kind,
+    )
     amp2 = jnp.exp(2.0 * params["log_amp"])
     mu = mean + K_s @ alpha
     v = jax.scipy.linalg.cho_solve((L, True), K_s.T)
@@ -112,8 +130,8 @@ def _predict(params, X_train, L, alpha, mean, mask, X_test, round_info):
     return mu, var
 
 
-@partial(jax.jit, static_argnames="round_info")
-def _predict_zero_mean(params, X_train, L, alpha, mask, X_test, round_info):
+@partial(jax.jit, static_argnames=("round_info", "kernel_kind"))
+def _predict_zero_mean(params, X_train, L, alpha, mask, X_test, round_info, kernel_kind):
     params_zero_mean = {**params, "mean": jnp.array(0.0, dtype=jnp.float64)}
     return _predict(
         params_zero_mean,
@@ -124,11 +142,14 @@ def _predict_zero_mean(params, X_train, L, alpha, mask, X_test, round_info):
         mask,
         X_test,
         round_info,
+        kernel_kind,
     )
 
 
-@partial(jax.jit, static_argnames=("round_info", "vi_max_iters", "vi_tol"))
-def _vi_inner_loop(params, X, k, N, mask, jitter, round_info, vi_max_iters, vi_tol):
+@partial(jax.jit, static_argnames=("round_info", "vi_max_iters", "vi_tol", "kernel_kind"))
+def _vi_inner_loop(
+    params, X, k, N, mask, jitter, round_info, vi_max_iters, vi_tol, kernel_kind,
+):
     """PG-VI alternating updates with per-row mask. Padded rows have
     `mask=0`, `N=0`, `k=0`; we hold their `ω = 1` so synthetic noise
     `1/ω` stays finite and the masked kernel block stays well-conditioned."""
@@ -138,7 +159,7 @@ def _vi_inner_loop(params, X, k, N, mask, jitter, round_info, vi_max_iters, vi_t
     # block is identity. Cross-terms zeroed.
     K = _build_K_masked(
         params["log_amp"], params["log_ls"], X, mask,
-        jnp.zeros(n_max, dtype=X.dtype), jitter, round_info,
+        jnp.zeros(n_max, dtype=X.dtype), jitter, round_info, kernel_kind,
     )
     kappa = (k - N / 2.0) * mask  # zero on padded
 
@@ -181,8 +202,10 @@ def _vi_inner_loop(params, X, k, N, mask, jitter, round_info, vi_max_iters, vi_t
     )
 
 
-@partial(jax.jit, static_argnames=("round_info", "vi_max_iters", "vi_tol"))
-def _neg_elbo(params, X, k, N, mask, jitter, round_info, vi_max_iters, vi_tol):
+@partial(jax.jit, static_argnames=("round_info", "vi_max_iters", "vi_tol", "kernel_kind"))
+def _neg_elbo(
+    params, X, k, N, mask, jitter, round_info, vi_max_iters, vi_tol, kernel_kind,
+):
     """Negative ELBO for PG-augmented Binomial GP, with per-row mask.
 
     Padded rows (mask=0) contribute constants that don't depend on the
@@ -193,14 +216,14 @@ def _neg_elbo(params, X, k, N, mask, jitter, round_info, vi_max_iters, vi_tol):
 
     # 1. Inner VI loop to converged (ω, m, S_diag) — masked.
     omega, m, S_diag = _vi_inner_loop(
-        params, X, k, N, mask, jitter, round_info, vi_max_iters, vi_tol
+        params, X, k, N, mask, jitter, round_info, vi_max_iters, vi_tol, kernel_kind,
     )
 
     # 2. Masked kernel — same trick as the heteroscedastic path.
     n_max = X.shape[0]
     K = _build_K_masked(
         params["log_amp"], params["log_ls"], X, mask,
-        jnp.zeros(n_max, dtype=X.dtype), jitter, round_info,
+        jnp.zeros(n_max, dtype=X.dtype), jitter, round_info, kernel_kind,
     )
 
     # 3. Convenience.
@@ -290,7 +313,9 @@ class BaseGP(ABC):
 
 
 class HeteroscedasticGP(BaseGP):
-    """Exact GP with constant mean, ARD RBF kernel, fixed per-point noise.
+    """Exact GP with constant mean, fixed per-point noise; kernel
+    selectable via `kernel_kind` ("rbf" or "matern12", ARD in either
+    case).
 
     Observations are padded to `n_max` rows up front; the JIT cache is
     keyed on this constant shape, so the BO loop pays one trace and
@@ -304,12 +329,18 @@ class HeteroscedasticGP(BaseGP):
         jitter: float = 1e-6,
         lbfgs_max_iter: int = 100,
         seed: int = 0,
+        kernel_kind: str = "rbf",
     ):
+        if kernel_kind not in _KERNEL_KINDS:
+            raise ValueError(
+                f"unknown kernel_kind: {kernel_kind!r}; expected one of {_KERNEL_KINDS}"
+            )
         self.pad_initial = int(pad_initial)
         self.n_max = int(pad_initial)  # current pad; doubles on overflow
         self.jitter = jitter
         self.lbfgs_max_iter = int(lbfgs_max_iter)
         self.seed = int(seed)
+        self.kernel_kind = str(kernel_kind)
         self.params = None
         self._X = None
         self._L = None
@@ -376,7 +407,7 @@ class HeteroscedasticGP(BaseGP):
                 "mean": jnp.array(float(np.mean(np.asarray(y_real))), dtype=jnp.float64),
             }
 
-        nmll = partial(_neg_mll, round_info=round_info)
+        nmll = partial(_neg_mll, round_info=round_info, kernel_kind=self.kernel_kind)
         solver = LBFGS(fun=nmll, maxiter=self.lbfgs_max_iter)
         result = solver.run(init, X_padded, y_padded, noise_padded, mask, jitter)
 
@@ -384,6 +415,7 @@ class HeteroscedasticGP(BaseGP):
         self.params = {k: jnp.asarray(v) for k, v in result.params.items()}
         L, alpha = _factorise(
             self.params, X_padded, y_padded, noise_padded, mask, jitter, round_info,
+            self.kernel_kind,
         )
         self._X = X_padded
         self._L = L
@@ -413,11 +445,17 @@ class HeteroscedasticGP(BaseGP):
             self._mask,
             X_test,
             self.round_info,
+            self.kernel_kind,
         )
 
 
 class BinomialGP(BaseGP):
-    """Polya-Gamma augmented GP for binary / count feasibility data.
+    """Polya-Gamma augmented GP for binary / count feasibility data;
+    kernel selectable via `kernel_kind` ("rbf" or "matern12"). Matérn-1/2
+    is preferred for feasibility surrogates because it absorbs sharp
+    feasibility boundaries (k=0 cluster next to k=N cluster) without
+    forcing extreme length scales — which is what causes the σ-blowup
+    that breaks chance-constrained acquisition optimisation under RBF.
 
     Padded to `n_max` rows to share the JIT cache across BO iterations;
     hyperparameters fit by jaxopt L-BFGS warm-started from the previous
@@ -432,7 +470,12 @@ class BinomialGP(BaseGP):
         vi_tol: float = 1e-4,
         lbfgs_max_iter: int = 100,
         seed: int = 0,
+        kernel_kind: str = "matern12",
     ):
+        if kernel_kind not in _KERNEL_KINDS:
+            raise ValueError(
+                f"unknown kernel_kind: {kernel_kind!r}; expected one of {_KERNEL_KINDS}"
+            )
         self.pad_initial = int(pad_initial)
         self.n_max = int(pad_initial)  # current pad; doubles on overflow
         self.jitter = jitter
@@ -440,6 +483,7 @@ class BinomialGP(BaseGP):
         self.vi_tol = float(vi_tol)
         self.lbfgs_max_iter = int(lbfgs_max_iter)
         self.seed = int(seed)
+        self.kernel_kind = str(kernel_kind)
         self.params = None
         self._X = None
         self._L = None
@@ -483,6 +527,7 @@ class BinomialGP(BaseGP):
             round_info=self.round_info,
             vi_max_iters=self.vi_max_iters,
             vi_tol=self.vi_tol,
+            kernel_kind=self.kernel_kind,
         )
         solver = LBFGS(fun=nelbo, maxiter=self.lbfgs_max_iter)
         result = solver.run(init, X_padded, k_padded, N_padded, mask, jitter)
@@ -494,7 +539,7 @@ class BinomialGP(BaseGP):
         omega, _, _ = _vi_inner_loop(
             self.params, X_padded, k_padded, N_padded, mask,
             self.jitter, self.round_info,
-            self.vi_max_iters, self.vi_tol,
+            self.vi_max_iters, self.vi_tol, self.kernel_kind,
         )
 
         # Cache prediction state via the masked factorise. Synthetic
@@ -506,7 +551,7 @@ class BinomialGP(BaseGP):
         params_zero_mean = {**self.params, "mean": jnp.array(0.0, dtype=jnp.float64)}
         L, alpha = _factorise(
             params_zero_mean, X_padded, y_tilde, noise, mask,
-            jnp.float64(self.jitter), self.round_info,
+            jnp.float64(self.jitter), self.round_info, self.kernel_kind,
         )
 
         self._X = X_padded
@@ -536,6 +581,7 @@ class BinomialGP(BaseGP):
             self._mask,
             X_test,
             self.round_info,
+            self.kernel_kind,
         )
 
     def state(self) -> dict:
