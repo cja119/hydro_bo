@@ -561,10 +561,29 @@ class BinomialGP(BaseGP):
         self._mask = mask
 
         from hydro_bo.utils.logging_config import get_logger
-        get_logger(__name__).debug(
+        # Promoted to INFO + exposing fitted hyperparams: when the
+        # constrained-acq screen reports "no feasible candidates anywhere",
+        # the answer often lies in the BinomialGP collapsing its amp /
+        # extending its length scales until the chance bound is unsatisfiable
+        # across the entire cube. Watching `fitted_amp` and `fitted_ls_*`
+        # across BO iters tells you whether the GP itself is the problem.
+        log_amp_v = float(self.params["log_amp"])
+        log_ls_arr = np.asarray(self.params["log_ls"])
+        get_logger(__name__).info(
             "binomial_gp_fit_complete",
             final_nelbo=float(result.state.value),
             n_lbfgs_iters=int(result.state.iter_num),
+            n_real=int(n_real),
+            kernel=self.kernel_kind,
+            fitted_log_amp=log_amp_v,
+            fitted_amp=float(np.exp(log_amp_v)),
+            fitted_log_ls_min=float(np.min(log_ls_arr)),
+            fitted_log_ls_max=float(np.max(log_ls_arr)),
+            fitted_ls_min=float(np.exp(np.min(log_ls_arr))),
+            fitted_ls_max=float(np.exp(np.max(log_ls_arr))),
+            # Threshold needed: amp must exceed ~0.85 for prior-reverted
+            # regions to satisfy `mu + 2.576·sigma >= log_p_targ` at z_sc=-2.576.
+            amp_above_loose_threshold=bool(np.exp(log_amp_v) >= 0.85),
         )
 
     def predict(self, X_test):

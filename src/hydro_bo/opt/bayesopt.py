@@ -516,11 +516,42 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         N_bin = ds.N[m_bin].astype(float)
         round_info = self._build_round_info()
         self.gp_bin.fit(X_bin, k_bin, N_bin, round_info=round_info)
+
+        # Sanity check: does the BinomialGP posterior match the empirical
+        # success rate at the points it was just fitted to? If GP mu is
+        # near-zero (prior) at a training point where we observed k/N=1.0,
+        # the GP isn't learning from the data — usually means amp collapsed
+        # or length scales blew up. Watching the top-10 empirically-feasible
+        # points is the most informative slice.
+        empirical = k_bin / np.maximum(N_bin, 1.0)
+        mu_pred, var_pred = self.gp_bin.predict(jnp.asarray(X_bin, dtype=jnp.float64))
+        mu_pred_np = np.asarray(mu_pred)
+        sigma_pred_np = np.sqrt(np.asarray(var_pred))
+        # Probability of being feasible per the GP, given p_targ = 0.9 latent threshold.
+        log_p_targ = float(np.log(0.9 / (1.0 - 0.9)))
+        # P(latent_mu >= log_p_targ) under posterior gaussian at each training x
+        from jax.scipy.stats.norm import cdf as _norm_cdf
+        prob_meets = np.asarray(_norm_cdf((mu_pred_np - log_p_targ) / np.maximum(sigma_pred_np, 1e-9)))
+        top10_emp = np.argsort(empirical)[-10:][::-1]
         logger.info(
             "bo_bin_gp_fit",
             n_points=n_bin,
             n_feasible_total=int(np.sum(k_bin)),
             n_trials_total=int(np.sum(N_bin)),
+            empirical_max=float(empirical.max()),
+            empirical_mean=float(empirical.mean()),
+            empirical_n_at_or_above_p_targ=int((empirical >= 0.9).sum()),
+            pred_mu_max=float(mu_pred_np.max()),
+            pred_mu_min=float(mu_pred_np.min()),
+            pred_sigma_min=float(sigma_pred_np.min()),
+            pred_sigma_max=float(sigma_pred_np.max()),
+            pred_prob_meets_max=float(prob_meets.max()),
+            # At the 10 empirically-most-feasible training points: does the
+            # GP agree they're feasible? If GP mu << log_p_targ here, fit is broken.
+            top10_empirical=[float(empirical[i]) for i in top10_emp],
+            top10_pred_mu=[float(mu_pred_np[i]) for i in top10_emp],
+            top10_pred_sigma=[float(sigma_pred_np[i]) for i in top10_emp],
+            top10_pred_prob_meets=[float(prob_meets[i]) for i in top10_emp],
         )
 
     def _build_acquisition(self) -> ConstrainedExpectedImprovement:
