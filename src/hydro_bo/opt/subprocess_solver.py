@@ -95,6 +95,46 @@ def run_maximise_with_timeout(
 def _worker(payload: dict, q) -> None:
     """Child-process entry point. Must be picklable, top-level."""
     try:
+        # Configure logging in the child to APPEND to the same run.log the
+        # parent writes to — otherwise every log line emitted by the
+        # subprocess (feasible_screen_batch, maximise_timings, ...) lands
+        # in the child's stderr instead of the user-visible log file, and
+        # we can't see how far solve_batch got when a timeout kicks in.
+        # We attach a fresh FileHandler in APPEND mode so the parent's
+        # existing log content is preserved.
+        log_file = payload.get("log_file")
+        if log_file:
+            import logging
+            import structlog
+            from hydro_bo.utils.logging_config import _shared_processors
+
+            shared = _shared_processors()
+            structlog.configure(
+                processors=shared + [
+                    structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+                ],
+                wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+                context_class=dict,
+                logger_factory=structlog.stdlib.LoggerFactory(),
+                cache_logger_on_first_use=False,
+            )
+            file_formatter = structlog.stdlib.ProcessorFormatter(
+                foreign_pre_chain=shared,
+                processors=[
+                    structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                    structlog.dev.ConsoleRenderer(colors=False),
+                ],
+            )
+            fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+            fh.setFormatter(file_formatter)
+            fh.setLevel(logging.INFO)
+            root = logging.getLogger()
+            for h in list(root.handlers):
+                root.removeHandler(h)
+            root.addHandler(fh)
+            root.setLevel(logging.INFO)
+            logging.getLogger("hydro_bo").setLevel(logging.INFO)
+
         # Inside the child, this is the first jax import — XLA flags
         # already set by the parent's environment carry over.
         import jax
@@ -248,6 +288,15 @@ def serialise_acq_payload(
         if isinstance(getattr(sqp_cfg, f.name), (int, float, bool, str))
     }
 
+    # Locate the parent's log-file so the child can append to it. Look for
+    # any FileHandler attached to the root logger and grab its filename.
+    import logging as _logging
+    log_file = None
+    for _h in _logging.getLogger().handlers:
+        if isinstance(_h, _logging.FileHandler):
+            log_file = str(_h.baseFilename)
+            break
+
     payload = {
         "constrained": is_constrained,
         "gp_mu": _to_np(bo.gp_mu.state()),
@@ -255,6 +304,7 @@ def serialise_acq_payload(
         "round_info": list(bo.gp_mu.round_info),
         "mu_kernel": bo.gp_mu_kernel,
         "lv_kernel": bo.gp_log_var_kernel,
+        "log_file": log_file,
         "scaling": {
             "mu_y": float(ds._mu_y),
             "sigma_y": float(ds._sigma_y),

@@ -171,9 +171,15 @@ class NLPBase:
 
         D = self._dim(acq)
 
+        # Each stage logs a "started" marker BEFORE entering it, so if the
+        # subprocess gets killed by the timeout mid-stage we can still tell
+        # from the log which stage we died in (the "completed" marker
+        # never fires on timeout).
+        logger.info("maximise_stage_started", stage="build_starts")
         t0 = time.perf_counter()
         starts, p_batch, screen_scores = self._build_starts(acq)
         t_starts = time.perf_counter() - t0
+        logger.info("maximise_stage_completed", stage="build_starts", sec=round(t_starts, 3))
 
         n_lanes = int(np.asarray(starts).shape[0])
         logger.info(
@@ -185,17 +191,24 @@ class NLPBase:
             note="solve_batch uses vmap (single device); only Sobol screen shards via pmap",
         )
 
+        logger.info("maximise_stage_started", stage="build_solver")
         t0 = time.perf_counter()
         factory = self._build_solver(acq)
         t_build = time.perf_counter() - t0
+        logger.info("maximise_stage_completed", stage="build_solver", sec=round(t_build, 3))
 
+        logger.info("maximise_stage_started", stage="solve_batch",
+                    note="this is where XLA compile + SQP execute happen; expect minutes")
         t0 = time.perf_counter()
         result = factory.solve_batch(starts, p_batch)
         t_solve = time.perf_counter() - t0
+        logger.info("maximise_stage_completed", stage="solve_batch", sec=round(t_solve, 3))
 
+        logger.info("maximise_stage_started", stage="select_best")
         t0 = time.perf_counter()
         out = self._select_best(result, starts, p_batch, screen_scores, D)
         t_select = time.perf_counter() - t0
+        logger.info("maximise_stage_completed", stage="select_best", sec=round(t_select, 3))
 
         logger.info(
             "maximise_timings",
