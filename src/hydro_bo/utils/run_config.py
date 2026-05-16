@@ -135,7 +135,7 @@ def _optional_int(raw) -> Optional[int]:
     return int(raw)
 
 
-_VALID_KERNEL_KINDS = ("rbf", "matern12")
+_VALID_KERNEL_KINDS = ("rbf", "matern12", "matern52")
 
 
 def _resolve_kernel_kind(raw, *, key: str) -> str:

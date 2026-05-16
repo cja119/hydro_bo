@@ -24,17 +24,25 @@ def _project_integer_dims(X, round_info):
     return X
 
 
-_KERNEL_KINDS = ("rbf", "matern12")
+_KERNEL_KINDS = ("rbf", "matern12", "matern52")
 
 
 @partial(jax.jit, static_argnames=("round_info", "kernel_kind"))
 def _kernel(log_amp, log_ls, X1, X2, round_info, kernel_kind):
     """ARD kernel dispatcher with optional projection of integer dims
     onto a discrete unit-cube grid. `kernel_kind` is a static Python
-    string — `"rbf"` (squared-exponential, the default elsewhere) or
-    `"matern12"` (Laplacian / exponential, less smooth, better at
-    representing sharp boundaries without forcing extreme length scales).
-    round_info is a static Python tuple — empty skips projection.
+    string. round_info is a static Python tuple — empty skips projection.
+
+    Kernels (all with ARD per-dim length scales):
+      - `"rbf"`      : squared-exponential, C^∞. Smoothest; for smooth
+                       functions, but length-scale fits can run away.
+      - `"matern12"` : exponential / Laplacian, C^0. Sharpest decay;
+                       represents discontinuities but penalises smoothness.
+      - `"matern52"` : Matérn ν=5/2, C^2. The BO-literature default for
+                       continuous inputs (Snoek et al. 2012, Gardner et al.
+                       2014). Smoother than matern12 — robust middle
+                       ground; less prone to length-scale runaway when
+                       combined with hyperpriors.
     """
     if round_info:
         X1 = _project_integer_dims(X1, round_info)
@@ -50,6 +58,15 @@ def _kernel(log_amp, log_ls, X1, X2, round_info, kernel_kind):
         eps = 1e-12
         d1 = jnp.sum(jnp.abs(diff), axis=-1) + eps
         return amp2 * jnp.exp(-d1)
+    if kernel_kind == "matern52":
+        # d = sqrt(sum (Δx/ls)^2). Use the L2 distance per Rasmussen &
+        # Williams (eq. 4.17). Adding a tiny jitter under the sqrt keeps
+        # the gradient finite at d=0 (the formula is smooth in d but its
+        # autodiff through sqrt blows up at zero distance).
+        d2 = jnp.sum(diff * diff, axis=-1)
+        d = jnp.sqrt(d2 + 1e-12)
+        s5 = jnp.sqrt(5.0)
+        return amp2 * (1.0 + s5 * d + (5.0 / 3.0) * d2) * jnp.exp(-s5 * d)
     raise ValueError(f"unknown kernel_kind: {kernel_kind!r}; expected one of {_KERNEL_KINDS}")
 
 
@@ -74,10 +91,50 @@ def _build_K_masked(log_amp, log_ls, X, mask, noise, jitter, round_info, kernel_
     return K + jnp.diag(diag_real + diag_padded)
 
 
+def _neg_log_hyper_prior(log_amp, log_ls, alpha_ls, beta_ls, alpha_amp, beta_amp):
+    """Negative log prior on (amp, ls) for type-II MAP estimation.
+
+    Gamma priors on the natural-space (amp, ls) parameters, with the
+    change-of-variable jacobian for the log-space optimisation. For ls ~
+    Gamma(α, β) the density of log_ls = log(ls) is
+        p(log_ls) ∝ exp(α · log_ls − β · exp(log_ls))
+    so the negative log prior contribution (up to constant) is
+        α · log_ls − β · exp(log_ls)        ... negated for minimisation
+    Summed over all ARD length-scale dims, plus the amp term.
+
+    Defaults follow BoTorch's `SingleTaskGP`: Gamma(3, 6) on length
+    scale (mean=0.5, mode=0.33, soft upper bound ~1.5) and Gamma(2, 0.5)
+    on amp (mean=4, mode=2). The length-scale prior is the key one for
+    avoiding the runaway-to-infinity pathology under type-II MLE; the
+    amp prior is light and mostly there for numerical stability.
+
+    Set alpha=beta=0 on a parameter to disable its prior entirely
+    (recovers the unpenalised MLE/ELBO).
+    """
+    # ls prior: sum over ARD dims of -α·log_ls + β·exp(log_ls)
+    neg_log_ls_prior = jnp.where(
+        (alpha_ls > 0) | (beta_ls > 0),
+        jnp.sum(-alpha_ls * log_ls + beta_ls * jnp.exp(log_ls)),
+        0.0,
+    )
+    # amp prior: -α_amp·log_amp + β_amp·exp(log_amp)
+    neg_log_amp_prior = jnp.where(
+        (alpha_amp > 0) | (beta_amp > 0),
+        -alpha_amp * log_amp + beta_amp * jnp.exp(log_amp),
+        0.0,
+    )
+    return neg_log_ls_prior + neg_log_amp_prior
+
+
 @partial(jax.jit, static_argnames=("round_info", "kernel_kind"))
-def _neg_mll(params, X, y, noise, mask, jitter, round_info, kernel_kind):
-    """Masked NMLL — observations on `mask == 1` rows count, padded
-    rows contribute a constant offset that drops out of optimisation."""
+def _neg_mll(params, X, y, noise, mask, jitter,
+             alpha_ls, beta_ls, alpha_amp, beta_amp,
+             round_info, kernel_kind):
+    """Masked NMLL + neg-log-prior on hyperparameters (type-II MAP).
+    Observations on `mask == 1` rows count, padded rows contribute a
+    constant offset that drops out of optimisation. The hyperprior
+    contribution is the standard MAP penalty — see `_neg_log_hyper_prior`.
+    """
     K = _build_K_masked(
         params["log_amp"],
         params["log_ls"],
@@ -93,7 +150,11 @@ def _neg_mll(params, X, y, noise, mask, jitter, round_info, kernel_kind):
     alpha = jax.scipy.linalg.cho_solve((L, True), y_c)
     log_det = 2.0 * jnp.sum(jnp.log(jnp.diag(L)))
     n_real = jnp.sum(mask)
-    return 0.5 * (jnp.dot(y_c, alpha) + log_det + n_real * jnp.log(2.0 * jnp.pi))
+    nmll = 0.5 * (jnp.dot(y_c, alpha) + log_det + n_real * jnp.log(2.0 * jnp.pi))
+    prior = _neg_log_hyper_prior(
+        params["log_amp"], params["log_ls"], alpha_ls, beta_ls, alpha_amp, beta_amp,
+    )
+    return nmll + prior
 
 
 @partial(jax.jit, static_argnames=("round_info", "kernel_kind"))
@@ -204,13 +265,16 @@ def _vi_inner_loop(
 
 @partial(jax.jit, static_argnames=("round_info", "vi_max_iters", "vi_tol", "kernel_kind"))
 def _neg_elbo(
-    params, X, k, N, mask, jitter, round_info, vi_max_iters, vi_tol, kernel_kind,
+    params, X, k, N, mask, jitter,
+    alpha_ls, beta_ls, alpha_amp, beta_amp,
+    round_info, vi_max_iters, vi_tol, kernel_kind,
 ):
-    """Negative ELBO for PG-augmented Binomial GP, with per-row mask.
-
-    Padded rows (mask=0) contribute constants that don't depend on the
-    hyperparameters — they're explicitly zeroed in every per-row sum
-    so the optimum matches a fit on the real subset only.
+    """Negative ELBO for PG-augmented Binomial GP + neg-log-prior on
+    hyperparameters (type-II MAP). Padded rows (mask=0) contribute
+    constants that don't depend on the hyperparameters — they're
+    explicitly zeroed in every per-row sum so the optimum matches a fit
+    on the real subset only. The hyperprior contribution is the standard
+    MAP penalty — see `_neg_log_hyper_prior`.
     """
     n_real = jnp.sum(mask)
 
@@ -255,7 +319,10 @@ def _neg_elbo(
     gaussian_kl = 0.5 * (trace_K_inv_S + quad_form - n_real + log_det_K - log_det_S)
 
     elbo = expected_loglik - gaussian_kl - pg_kl
-    return -elbo
+    prior = _neg_log_hyper_prior(
+        params["log_amp"], params["log_ls"], alpha_ls, beta_ls, alpha_amp, beta_amp,
+    )
+    return -elbo + prior
 
 
 class BaseGP(ABC):
@@ -330,6 +397,14 @@ class HeteroscedasticGP(BaseGP):
         lbfgs_max_iter: int = 100,
         seed: int = 0,
         kernel_kind: str = "rbf",
+        # Gamma(α, β) hyperpriors on ls and amp for type-II MAP. Defaults
+        # mirror BoTorch's SingleTaskGP — Gamma(3, 6) on ls (mean=0.5,
+        # mode=0.33) softly bounds length scales below ~1.5. Set both
+        # alpha and beta to 0 to disable the prior (recovers MLE).
+        prior_ls_alpha: float = 3.0,
+        prior_ls_beta: float = 6.0,
+        prior_amp_alpha: float = 2.0,
+        prior_amp_beta: float = 0.5,
     ):
         if kernel_kind not in _KERNEL_KINDS:
             raise ValueError(
@@ -341,6 +416,10 @@ class HeteroscedasticGP(BaseGP):
         self.lbfgs_max_iter = int(lbfgs_max_iter)
         self.seed = int(seed)
         self.kernel_kind = str(kernel_kind)
+        self.prior_ls_alpha = float(prior_ls_alpha)
+        self.prior_ls_beta = float(prior_ls_beta)
+        self.prior_amp_alpha = float(prior_amp_alpha)
+        self.prior_amp_beta = float(prior_amp_beta)
         self.params = None
         self._X = None
         self._L = None
@@ -407,9 +486,17 @@ class HeteroscedasticGP(BaseGP):
                 "mean": jnp.array(float(np.mean(np.asarray(y_real))), dtype=jnp.float64),
             }
 
+        alpha_ls = jnp.asarray(self.prior_ls_alpha, dtype=jnp.float64)
+        beta_ls = jnp.asarray(self.prior_ls_beta, dtype=jnp.float64)
+        alpha_amp = jnp.asarray(self.prior_amp_alpha, dtype=jnp.float64)
+        beta_amp = jnp.asarray(self.prior_amp_beta, dtype=jnp.float64)
+
         nmll = partial(_neg_mll, round_info=round_info, kernel_kind=self.kernel_kind)
         solver = LBFGS(fun=nmll, maxiter=self.lbfgs_max_iter)
-        result = solver.run(init, X_padded, y_padded, noise_padded, mask, jitter)
+        result = solver.run(
+            init, X_padded, y_padded, noise_padded, mask, jitter,
+            alpha_ls, beta_ls, alpha_amp, beta_amp,
+        )
 
         self._release_buffers()
         self.params = {k: jnp.asarray(v) for k, v in result.params.items()}
@@ -471,6 +558,15 @@ class BinomialGP(BaseGP):
         lbfgs_max_iter: int = 100,
         seed: int = 0,
         kernel_kind: str = "matern12",
+        # Gamma(α, β) hyperpriors — same defaults as HeteroscedasticGP.
+        # The length-scale prior is what stops the runaway-to-infinity
+        # pathology that collapses posterior σ across the cube and
+        # breaks chance-constrained acquisition optimisation. See
+        # `_neg_log_hyper_prior` for details.
+        prior_ls_alpha: float = 3.0,
+        prior_ls_beta: float = 6.0,
+        prior_amp_alpha: float = 2.0,
+        prior_amp_beta: float = 0.5,
     ):
         if kernel_kind not in _KERNEL_KINDS:
             raise ValueError(
@@ -484,6 +580,10 @@ class BinomialGP(BaseGP):
         self.lbfgs_max_iter = int(lbfgs_max_iter)
         self.seed = int(seed)
         self.kernel_kind = str(kernel_kind)
+        self.prior_ls_alpha = float(prior_ls_alpha)
+        self.prior_ls_beta = float(prior_ls_beta)
+        self.prior_amp_alpha = float(prior_amp_alpha)
+        self.prior_amp_beta = float(prior_amp_beta)
         self.params = None
         self._X = None
         self._L = None
@@ -522,6 +622,11 @@ class BinomialGP(BaseGP):
                 "log_ls": jnp.zeros(d, dtype=jnp.float64),
             }
 
+        alpha_ls = jnp.asarray(self.prior_ls_alpha, dtype=jnp.float64)
+        beta_ls = jnp.asarray(self.prior_ls_beta, dtype=jnp.float64)
+        alpha_amp = jnp.asarray(self.prior_amp_alpha, dtype=jnp.float64)
+        beta_amp = jnp.asarray(self.prior_amp_beta, dtype=jnp.float64)
+
         nelbo = partial(
             _neg_elbo,
             round_info=self.round_info,
@@ -530,7 +635,10 @@ class BinomialGP(BaseGP):
             kernel_kind=self.kernel_kind,
         )
         solver = LBFGS(fun=nelbo, maxiter=self.lbfgs_max_iter)
-        result = solver.run(init, X_padded, k_padded, N_padded, mask, jitter)
+        result = solver.run(
+            init, X_padded, k_padded, N_padded, mask, jitter,
+            alpha_ls, beta_ls, alpha_amp, beta_amp,
+        )
 
         self._release_buffers()
         self.params = {key: jnp.asarray(v) for key, v in result.params.items()}
