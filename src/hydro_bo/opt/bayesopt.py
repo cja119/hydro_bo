@@ -554,6 +554,40 @@ class ConstrainedBayesopt(MeanVarBayesopt):
             top10_pred_prob_meets=[float(prob_meets[i]) for i in top10_emp],
         )
 
+        # Diagnostic: GP prediction at a fresh 1000-point random sample of
+        # the unit cube — represents what the feasibility screen actually
+        # sees, NOT the training points. Combined with the configured z_sc
+        # this directly answers "given the GP we just fit, how many
+        # random Sobol points pass the chance bound?" If
+        # `sobol_n_feasible_of_1000 == 0` while `empirical_n_at_or_above_p_targ
+        # > 0`, the GP fit doesn't propagate the feasibility signal off the
+        # training points — Sobol screen will return nothing regardless.
+        from scipy.stats.qmc import Sobol as _Sobol
+        _d = X_bin.shape[1]
+        _test = _Sobol(d=_d, scramble=True, seed=42).random(1000)
+        _mu_s, _var_s = self.gp_bin.predict(jnp.asarray(_test, dtype=jnp.float64))
+        _mu_s_np = np.asarray(_mu_s)
+        _sigma_s_np = np.sqrt(np.asarray(_var_s))
+        _z_sc = float(getattr(self, "z_sc", 0.0))
+        _feas_s = _mu_s_np - _z_sc * _sigma_s_np - log_p_targ
+        logger.info(
+            "bo_bin_gp_unexplored_check",
+            n_sobol=1000,
+            z_sc=_z_sc,
+            log_p_targ=log_p_targ,
+            sobol_mu_min=float(_mu_s_np.min()),
+            sobol_mu_p50=float(np.median(_mu_s_np)),
+            sobol_mu_mean=float(_mu_s_np.mean()),
+            sobol_mu_max=float(_mu_s_np.max()),
+            sobol_sigma_min=float(_sigma_s_np.min()),
+            sobol_sigma_p50=float(np.median(_sigma_s_np)),
+            sobol_sigma_max=float(_sigma_s_np.max()),
+            sobol_feas_min=float(_feas_s.min()),
+            sobol_feas_p50=float(np.median(_feas_s)),
+            sobol_feas_max=float(_feas_s.max()),
+            sobol_n_feasible_of_1000=int((_feas_s >= 0).sum()),
+        )
+
     def _build_acquisition(self) -> ConstrainedExpectedImprovement:
         return ConstrainedExpectedImprovement(
             gp_mu=self.gp_mu,
