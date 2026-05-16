@@ -170,14 +170,12 @@ def import_mpc_data(
 
     price_dynamics = config.get("price_dynamics", {"enabled": False})
 
-    # Clamp the MPC's assumed-arrival shift so (mean + offset) stays in
-    # [1, max grid1 day]. Out-of-range values would produce negative or
-    # over-horizon time indices in port_capacity / ship_schedule_aux.
     mat = int(params.get("mean_ship_arrival_time", 7))
     off = int(params.get("expected_arrival_offset", 0))
     max_day = max(1, int(total_duration) // 24 - 1)
     effective = max(1, min(max_day, mat + off))
     params["expected_arrival_offset"] = effective - mat
+    params["forecast_horizon"] = forecast_horizon
 
     return {
         "sets": sets,

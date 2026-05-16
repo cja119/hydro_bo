@@ -242,6 +242,8 @@ class BaseBayesopt(ABC):
             acq.gp_log_var_state,
             acq.scaling,
             acq.round_info,
+            acq.mu_kernel_kind,
+            acq.lv_kernel_kind,
         )
         cb = float(e_g[0])
         cb_sigma = float(jnp.sqrt(jnp.clip(var_g[0], 0.0, None)))
@@ -268,17 +270,27 @@ class MeanVarBayesopt(BaseBayesopt):
     g(x) = mu(x) - lam * sigma(x).
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        gp_mu_kernel: str = "rbf",
+        gp_log_var_kernel: str = "rbf",
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
+        self.gp_mu_kernel = str(gp_mu_kernel)
+        self.gp_log_var_kernel = str(gp_log_var_kernel)
         self.gp_mu = HeteroscedasticGP(
             pad_initial=self.pad_initial,
             lbfgs_max_iter=self.gp_lbfgs_max_iter,
             seed=self.seed,
+            kernel_kind=self.gp_mu_kernel,
         )
         self.gp_log_var = HeteroscedasticGP(
             pad_initial=self.pad_initial,
             lbfgs_max_iter=self.gp_lbfgs_max_iter,
             seed=self.seed + 1,
+            kernel_kind=self.gp_log_var_kernel,
         )
 
     def _best_observed(self) -> tuple[np.ndarray, float]:
@@ -391,16 +403,19 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         p_targ: float = 0.9,
         z_sc: float = 1.6449,  # Φ⁻¹(0.95) — pass directly as z-score, not as a probability.
         l1_penalty: float = 1.0,
+        gp_bin_kernel: str = "matern12",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.p_targ = float(p_targ)
         self.z_sc = float(z_sc)
         self.l1_penalty = float(l1_penalty)
+        self.gp_bin_kernel = str(gp_bin_kernel)
         self.gp_bin = BinomialGP(
             pad_initial=self.pad_initial,
             lbfgs_max_iter=self.gp_lbfgs_max_iter,
             seed=self.seed + 2,
+            kernel_kind=self.gp_bin_kernel,
         )
 
     def _fit_surrogates(self) -> None:

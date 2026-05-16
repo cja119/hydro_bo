@@ -45,17 +45,38 @@ def configure_jax_threads(n_devices: int, blas_threads_per_device: int = 1) -> N
 
     nd = max(1, int(n_devices))
     bt = max(1, int(blas_threads_per_device))
+    total_threads = nd * bt
 
     os.environ.setdefault("JAX_ENABLE_X64", "1")
 
-    flags = [
+    # XLA flag set we manage. 
+    
+    # Flags this function has ever set under any prior version. We strip
+    # all of these from XLA_FLAGS before re-applying so a stale env from
+    # a previous run (esp. one that set the now-removed
+    # --xla_cpu_max_intra_op_parallelism, which aborts on this XLA build)
+    # can't survive into the new process.
+    managed_prefixes = (
+        "--xla_force_host_platform_device_count",
+        "--xla_cpu_multi_thread_eigen",
+        "--xla_cpu_max_intra_op_parallelism",  # historical; strip on entry.
+    )
+    new_flags = [
         f"--xla_force_host_platform_device_count={nd}",
         "--xla_cpu_multi_thread_eigen=true",
-        f"intra_op_parallelism_threads={bt}",
-        f"inter_op_parallelism_threads={bt}",
     ]
-    existing = os.environ.get("XLA_FLAGS", "")
-    os.environ["XLA_FLAGS"] = (existing + " " + " ".join(flags)).strip()
 
+    existing = os.environ.get("XLA_FLAGS", "").split()
+    cleaned = [
+        tok for tok in existing
+        if not any(tok.startswith(p) for p in managed_prefixes)
+    ]
+    os.environ["XLA_FLAGS"] = " ".join(cleaned + new_flags).strip()
+
+    # BLAS-side thread caps. 
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ[var] = str(bt)
+    # XLA's CPU thread caps. 
+    os.environ["TF_INTRA_OP_PARALLELISM_THREADS"] = str(total_threads)
+    os.environ["TF_INTER_OP_PARALLELISM_THREADS"] = str(bt)
+    os.environ["XLA_CPU_MULTI_THREAD_EIGEN"] = "true"

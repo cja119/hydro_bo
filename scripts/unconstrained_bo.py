@@ -213,18 +213,26 @@ def save_results(results_log: list, bayesopt_dir: Path, run_timestamp: str):
         json.dump(results_log, f, indent=2)
 
 
-def _parse_vector_arg() -> str | None:
-    """Single-arg CLI: `--vector` is the only flag that overrides config.
-    Everything else lives in scripts/config.yml."""
+def _parse_cli_overrides() -> argparse.Namespace:
+    """CLI overrides for config.yml. Two knobs only — vector and ncpus —
+    everything else lives in scripts/config.yml. ncpus exists so PBS /
+    shell wrappers can pass the queue's actual core count without editing
+    the YAML; when omitted, `general.num_devices` from the YAML wins."""
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("--vector", type=str, default=None,
                         help="Hydrogen vector for this run; overrides general.vector.")
-    return parser.parse_args().vector
+    parser.add_argument("--ncpus", type=int, default=None,
+                        help="Override general.num_devices (parallel workers).")
+    return parser.parse_args()
 
 
 def main():
-    vector = _parse_vector_arg()
-    cfg = load_config(SCRIPTS_DIR / "config.yml", vector_override=vector)
+    cli = _parse_cli_overrides()
+    cfg = load_config(
+        SCRIPTS_DIR / "config.yml",
+        vector_override=cli.vector,
+        num_devices_override=cli.ncpus,
+    )
     g, u, s = cfg.general, cfg.unconstrained_bo, cfg.sobol
 
     configure_jax_threads(cfg.nlp.n_devices, cfg.nlp.blas_threads)
@@ -303,6 +311,8 @@ def main():
         sqp_config=cfg.nlp.to_sqp_config(),
         pad_initial=cfg.nlp.pad_initial,
         gp_lbfgs_max_iter=cfg.nlp.gp_lbfgs_max_iter,
+        gp_mu_kernel=cfg.nlp.gp_mu_kernel,
+        gp_log_var_kernel=cfg.nlp.gp_log_var_kernel,
     )
 
     sobol_dir = resolve_sobol_dir(u.sobol_dir, SCRIPTS_DIR, g.vector)

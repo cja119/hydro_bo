@@ -1,5 +1,9 @@
 """
 Run RayMultiMPC over a planning model and log results to disk.
+
+Reads `scripts/config.yml` for the run knobs (vector, weather_file,
+forecast_horizon, num_instances, num_devices, timeout, dynamic_price,
+log_level). CLI flags override individual fields where given.
 """
 
 import sys
@@ -10,29 +14,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import argparse
 import csv
 import json
-import os
 import time as _time
 import yaml
 import numpy as np
 from datetime import datetime
 
 from hydro_bo.utils.logging_config import configure_logging, get_logger
-from hydro_bo.mpc.dispatcher import RayMultiMPC
+from hydro_bo.utils.jax_threads import configure_jax_threads
+from hydro_bo.utils.run_config import Config, env_args_from, load_config
 from hydro_bo.utils.seeding import resolve_master_seed
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-VECTOR          = "NH3"
-PLANNING_MODEL  = f"{VECTOR}-Chile.yml"
-WEATHER_FILE    = ["CoastalChile_05-10_Wind.csv", "CoastalChile_10-15_Wind.csv", "CoastalChile_15-20_Wind.csv", "CoastalChile_20-21_Wind.csv", "CoastalChile_21-22_Wind.csv", "CoastalChile_23-24_Wind.csv"]
-
-NUM_INSTANCES   = os.cpu_count() - 1  # total MPC runs
-NUM_DEVICES     = os.cpu_count() - 1  # simultaneous workers
-TIMEOUT         = 900                  # seconds per worker
+SCRIPTS_DIR = Path(__file__).resolve().parent
 
 DUMP_DIAGNOSTICS_ON_FAILURE = False
 
@@ -46,62 +40,78 @@ def load_planning_model(path: Path) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
-def run_multisim(args=None):
+def run_multisim(cfg: Config, args: argparse.Namespace):
+    g = cfg.general
     now = datetime.now()
     run_timestamp = now.strftime("%Y%m%d_%H%M%S")
-    out_dir = Path(__file__).parent / "tmp" / now.strftime("%Y-%m-%d") / now.strftime("%H-%M-%S") / VECTOR
+    out_dir = SCRIPTS_DIR / "tmp" / now.strftime("%Y-%m-%d") / now.strftime("%H-%M-%S") / g.vector
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    configure_logging(log_file=out_dir / "run.log")
+    configure_logging(log_file=out_dir / "run.log", package_level=g.log_level)
 
-    cli_seed = getattr(args, "master_seed", None) if args is not None else None
+    cli_seed = getattr(args, "master_seed", None)
     master_seed = resolve_master_seed(cli_seed)
     logger.info("multi_mpc.master_seed", master_seed=master_seed, cli_seed=cli_seed)
 
-    if args is not None:
-        args_dict = vars(args)
-        args_dict["master_seed_resolved"] = master_seed
-        with open(out_dir / "args.json", "w") as f:
-            json.dump(args_dict, f, indent=2)
-        logger.info("multi_mpc.args_saved", path=str(out_dir / "args.json"))
+    # Persist resolved config + CLI args for traceability.
+    snapshot = {
+        "general": g.__dict__,
+        "args": vars(args),
+        "master_seed_resolved": master_seed,
+    }
+    with open(out_dir / "args.json", "w") as f:
+        json.dump(snapshot, f, indent=2, default=str)
+    logger.info("multi_mpc.args_saved", path=str(out_dir / "args.json"))
 
-    planning_model_path = Path(__file__).parent / "tmp/planning" / PLANNING_MODEL
+    planning_model_filename = args.planning_model or f"{g.vector}-Chile.yml"
+    planning_model_path = SCRIPTS_DIR / "tmp" / "planning" / planning_model_filename
     if not planning_model_path.exists():
         logger.error(
             "multi_mpc.missing_planning_model",
             path=str(planning_model_path),
-            message=f"Planning model not found. Run: python scripts/planning.py {VECTOR}",
+            message=f"Planning model not found. Run: python scripts/planning.py {g.vector}",
         )
         return
 
     params = load_planning_model(planning_model_path)
     logger.info("multi_mpc.loaded_model", path=str(planning_model_path))
 
-    env_args = {
-        "config": {
-            "vector": VECTOR,
-            "mpc": {"planning_model": PLANNING_MODEL},
-            "weather_data": {"weather_file": WEATHER_FILE},
-            "price_dynamics": {"enabled": args.dynamic_price if args is not None else False},
-        },
-    }
+    # env_args_from(cfg) populates "Time.forecast_horizon" from
+    # `general.forecast_horizon`, plus weather files, price-dynamics enable
+    # and vector. Apply per-CLI overrides on top.
+    env_args = env_args_from(cfg)
+    env_args["config"]["mpc"]["planning_model"] = planning_model_filename
+    if args.dynamic_price is not None:
+        env_args["config"]["price_dynamics"]["enabled"] = bool(args.dynamic_price)
+
+    num_instances = args.n_sim if args.n_sim is not None else g.num_instances
+    num_devices = g.num_devices
+
+    from hydro_bo.mpc.dispatcher import RayMultiMPC  # noqa: E402  defer until JAX threads are configured
 
     dispatcher = RayMultiMPC(
         env_args=env_args,
         param_overrides=params,
-        num_instances=NUM_INSTANCES,
-        num_devices=NUM_DEVICES,
-        timeout=TIMEOUT,
+        num_instances=num_instances,
+        num_devices=num_devices,
+        timeout=g.timeout,
         exit_fraction=1.0,
         dump_diagnostics_on_failure=DUMP_DIAGNOSTICS_ON_FAILURE,
         log_dir=out_dir,
         master_seed=master_seed,
     )
 
-    logger.info("multi_mpc.initialized", num_instances=NUM_INSTANCES, num_devices=NUM_DEVICES, timeout=TIMEOUT)
+    logger.info(
+        "multi_mpc.initialized",
+        num_instances=num_instances,
+        num_devices=num_devices,
+        timeout=g.timeout,
+        forecast_horizon=g.forecast_horizon,
+        dynamic_price=env_args["config"]["price_dynamics"]["enabled"],
+    )
 
-    walltime_seconds = getattr(args, "walltime_seconds", None) if args is not None else None
-    buffer_seconds = getattr(args, "buffer_seconds", 300) if args is not None else 300
+    walltime_seconds = getattr(args, "walltime_seconds", None)
+    buffer_seconds = getattr(args, "buffer_seconds", 300)
     deadline = None
     if walltime_seconds is not None:
         deadline = _time.perf_counter() + walltime_seconds - buffer_seconds
@@ -129,14 +139,14 @@ def run_multisim(args=None):
                 n_failed=n_failed,
                 scores=scores)
 
-    # Save results
     result = {
         "timestamp": now.isoformat(),
-        "vector": VECTOR,
-        "planning_model": PLANNING_MODEL,
-        "num_instances": NUM_INSTANCES,
-        "num_devices": NUM_DEVICES,
-        "dynamic_price": args.dynamic_price if args is not None else False,
+        "vector": g.vector,
+        "planning_model": planning_model_filename,
+        "forecast_horizon": g.forecast_horizon,
+        "num_instances": num_instances,
+        "num_devices": num_devices,
+        "dynamic_price": env_args["config"]["price_dynamics"]["enabled"],
         "n_workers": len(scores),
         "n_failed": n_failed,
         "mean_score": mean_score,
@@ -150,8 +160,9 @@ def run_multisim(args=None):
     logger.info("multi_mpc.results_saved", path=str(json_path))
 
     csv_path = out_dir / f"results_{run_timestamp}.csv"
-    fieldnames = ["timestamp", "vector", "planning_model", "num_instances", "num_devices",
-                  "dynamic_price", "n_workers", "mean_score", "var_score"]
+    fieldnames = ["timestamp", "vector", "planning_model", "forecast_horizon",
+                  "num_instances", "num_devices", "dynamic_price", "n_workers",
+                  "n_failed", "mean_score", "var_score"]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -160,7 +171,7 @@ def run_multisim(args=None):
 
     import matplotlib.pyplot as plt
     plt.hist(scores, bins=10)
-    plt.title(f"Distribution of MPC Scores — {VECTOR}")
+    plt.title(f"Distribution of MPC Scores — {g.vector}")
     plt.xlabel("Score")
     plt.ylabel("Frequency")
     plot_path = out_dir / f"scores_{run_timestamp}.png"
@@ -170,14 +181,18 @@ def run_multisim(args=None):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run RayMultiMPC over a planning model.")
-    parser.add_argument("--vector",        type=str, default=VECTOR,
-                        help="Hydrogen vector (default: %(default)s)")
-    parser.add_argument("--ncpus",         type=int, default=NUM_DEVICES,
-                        help="Number of parallel MPC workers (default: %(default)s)")
+    parser.add_argument("--vector",        type=str, default=None,
+                        help="Override general.vector.")
+    parser.add_argument("--ncpus",         type=int, default=None,
+                        help="Override general.num_devices (parallel workers).")
     parser.add_argument("--n_sim",         type=int, default=None,
-                        help="Total MPC runs. Defaults to --ncpus if not given.")
-    parser.add_argument("--dynamic_price", type=lambda x: x.lower() in ("true", "1", "yes"), default=False,
-                        help="Enable OU + jump-diffusion hydrogen price dynamics: True/False (default: False).")
+                        help="Total MPC runs. Defaults to general.num_instances from config.yml.")
+    parser.add_argument(
+        "--dynamic_price",
+        type=lambda x: x.lower() in ("true", "1", "yes"),
+        default=None,
+        help="Override general.dynamic_price. Pass True/False; omit to use config.yml.",
+    )
     parser.add_argument("--walltime_seconds", type=int, default=None,
                         help="Total PBS walltime in seconds. Enables deadline-based early exit.")
     parser.add_argument("--buffer_seconds",   type=int, default=300,
@@ -192,11 +207,12 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-
-    VECTOR          = args.vector
-    NUM_DEVICES     = args.ncpus
-    NUM_INSTANCES   = args.n_sim if args.n_sim is not None else args.ncpus
-
-    PLANNING_MODEL  = args.planning_model or f"{VECTOR}-Chile.yml"
-
-    run_multisim(args=args)
+    cfg = load_config(
+        SCRIPTS_DIR / "config.yml",
+        vector_override=args.vector,
+        num_devices_override=args.ncpus,
+    )
+    # XLA flags / thread caps must be set before any jax import — and
+    # RayMultiMPC's dispatch chain pulls jax via the worker imports.
+    configure_jax_threads(cfg.nlp.n_devices, cfg.nlp.blas_threads)
+    run_multisim(cfg, args)

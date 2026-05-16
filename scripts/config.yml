@@ -27,34 +27,46 @@ sobol:
   seed:             42             # deterministic seed for the Sobol generator
   walltime_seconds: null           # PBS walltime; enables deadline-based early exit
   buffer_seconds:   300            # seconds reserved before walltime for result saving
-  sobol_dir:        tmp/sobol_24h_forecast/{vector}   # output base for sobol_mpc; row_NNNNN appended per task
+  sobol_dir:        tmp/sobol_backoffs/{vector}   # output base for sobol_mpc; row_NNNNN appended per task
 
 nlp:
   acq_pow_sobol:        14
-  acq_n_restarts:       8
+  acq_n_restarts:       4
   pad_initial:          512
-  gp_lbfgs_max_iter:    100
+  gp_lbfgs_max_iter:    300
   n_devices:            16
   blas_threads:         1
-  sqp_max_iter:         300
-  sqp_tol_stationarity: 1e-6
-  sqp_tol_feasibility:  1e-6
-  sqp_use_exact_hessian: true
+  sqp_max_iter:         50
+  sqp_tol_stationarity: 1e-4
+  sqp_tol_feasibility:  1e-4
+  sqp_use_exact_hessian: false
+  sqp_osqp_max_iter:    500          # septal default 4000
+  sqp_osqp_tol:         1e-5         # septal default 1e-7
+  sqp_max_line_search:  10           # septal default 30
+  gp_mu_kernel:         rbf
+  gp_log_var_kernel:    rbf
+  gp_bin_kernel:        matern12
 
 unconstrained_bo:
-  iter_budget:        20
-  n_initial_points:   8
+  iter_budget:        500
+  n_initial_points:   4
   failure_penalty:    -10.0        # synthetic worst-case sample when too few valid scores
   min_valid_samples:  4            # below → penalty applied
-  sobol_dir:          tmp/sobol_24h_forecast/{vector}
-  n_sobol_cache:      256         # cap on cached Sobol rows fed into the BO; null → all available
+  sobol_dir:          tmp/sobol_backoffs/{vector}
+  n_sobol_cache:      512         # cap on cached Sobol rows fed into the BO; null → all available
 
 constrained_bo:
-  iter_budget:        20
-  n_initial_points:   8
-  infeas_threshold:   -10.0        # MPC scores ≤ this → marked infeasible (NaN)
+  iter_budget:        500
+  n_initial_points:   4
+  infeas_threshold:   0.0          # MPC scores ≤ this → marked infeasible (NaN)
   p_targ:             0.9          # feasibility probability target for the chance bound
-  z_sc:               -1.6449      # standard-normal z-score (Φ⁻¹(0.05)); passed directly
+  z_sc:               1.6449       # +Φ⁻¹(0.95): require lower 95% band of latent ≥ log_p_targ
   l1_penalty:         50.0         # Sobol-screen L1 hinge weight against feasibility shortfall
-  sobol_dir:          tmp/sobol_24h_forecast/{vector}
-  n_sobol_cache:      256         # cap on cached Sobol rows fed into the BO; null → all available
+  sobol_dir:          tmp/sobol_backoffs/{vector}
+  n_sobol_cache:      512         # cap on cached Sobol rows fed into the BO; null → all available
+  # Resume from prior `bo_results_detailed_*.json` runs. Non-existent
+  # dirs are skipped with a warning, so per-vector continuations can
+  # share one list — only the matching one resolves on disk.
+  warm_start_dirs: null
+  #  - tmp/2026-05-09/21-36-26/{vector}   # LH2: 148 evals from 05-09 run
+  #  - tmp/2026-05-09/21-37-11/{vector}   # NH3:  68 evals from 05-09 run

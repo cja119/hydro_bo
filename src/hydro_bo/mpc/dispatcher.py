@@ -51,7 +51,7 @@ class RayMultiMPC:
             logging_level=logging.ERROR,
         )
 
-    def run_multisim(self, deadline=None):
+    def run_multisim(self, deadline=None, progress_callback=None):
         import time as _time
         from hydro_bo.utils.logging_config import get_logger
         from collections import Counter
@@ -67,17 +67,29 @@ class RayMultiMPC:
         else:
             logger.info("dispatcher.master_seed", master_seed=self._master_seed)
         tasks = [run_mpc.remote(self._env_args, id=f"iter_{i}", params=self._params, dump_diagnostics=self._dump_diagnostics, log_dir=worker_log_dir, master_seed=self._master_seed) for i in range(self._num_instances)]
+        ref_to_idx = {ref: i for i, ref in enumerate(tasks)}
+
+        def _emit(idx, result):
+            if progress_callback is None:
+                return
+            success, score, relax_info = result
+            try:
+                progress_callback(idx, success, score, relax_info)
+            except Exception:
+                logger.exception("progress_callback_failed", worker_index=idx)
 
         if self._dump_diagnostics:
             results = []
             for i, task in enumerate(tasks):
                 result = ray.get([task])[0]
                 results.append(result)
+                _emit(i, result)
                 success, _, _ = result
                 if not success:
                     logger.info("early_exit_on_failure", task_index=i, reason="Diagnostic dump requested")
                     for remaining_task in tasks[i+1:]:
                         ray.cancel(remaining_task)
+                        _emit(ref_to_idx[remaining_task], (False, None, None))
                     break
         elif deadline is not None:
             results = []
@@ -91,18 +103,33 @@ class RayMultiMPC:
                 ready, pending = ray.wait(pending, num_returns=1, timeout=min(remaining, 10.0))
                 for ref in ready:
                     try:
-                        results.append(ray.get(ref))
+                        res = ray.get(ref)
                     except Exception:
                         # `None` (YAML/JSON null) marks the score field as a
                         # failed run — downstream consumers coerce to NaN.
-                        results.append((False, None, None))
+                        res = (False, None, None)
+                    results.append(res)
+                    _emit(ref_to_idx[ref], res)
             if stopped_early:
                 n_cancelled = len(pending)
                 logger.info("deadline_reached", n_completed=len(results), n_cancelled=n_cancelled)
                 for ref in pending:
                     ray.cancel(ref)
+                    _emit(ref_to_idx[ref], (False, None, None))
                 # Pad with failure entries for cancelled tasks
                 results.extend([(False, None, None)] * n_cancelled)
+        elif progress_callback is not None:
+            results = []
+            pending = list(tasks)
+            while pending:
+                ready, pending = ray.wait(pending, num_returns=1)
+                for ref in ready:
+                    try:
+                        res = ray.get(ref)
+                    except Exception:
+                        res = (False, None, None)
+                    results.append(res)
+                    _emit(ref_to_idx[ref], res)
         else:
             results = ray.get(tasks)
 

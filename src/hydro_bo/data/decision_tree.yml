@@ -1,7 +1,1 @@
-presidence_order: [expand_backoffs]
-
-expand_backoffs:
-  - hydrogen_storage_lower_backoff = 0
-  - hydrogen_storage_upper_backoff = 1
-  - vector_storage_lower_backoff = 0
-  - vector_storage_upper_backoff = 1
+presidence_order: []

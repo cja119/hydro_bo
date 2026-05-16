@@ -31,6 +31,7 @@ from hydro_bo.utils.run_config import (
     merge_env_overrides,
     planning_model_path,
     resolve_sobol_dir,
+    resolve_warm_start_dirs,
 )
 from hydro_bo.utils.search_space import (
     INTEGER_KEYS,
@@ -109,6 +110,7 @@ def _objective_factory(cfg: Config, ref: dict):
             "n_total": n_total,
             "feasibility_rate": feasibility_rate,
             "worker_scores": list(raw_scores),
+            "x": [float(v) for v in np.asarray(x, dtype=float).ravel()],
         }
         flat_dims = flatten_dims(planning_params, env_overrides)
         for key in PARAM_KEYS:
@@ -191,6 +193,80 @@ def load_sobol_cache(
     return observations
 
 
+def load_bo_observations(
+    warm_start_dirs: list,
+    cfg: Config,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Load observations from prior `constrained_bo` run directories.
+
+    Each entry in `bo_results_detailed_*.json` records one BO evaluation:
+    the flat per-dim values (one column per `PARAM_KEYS` entry) and the
+    raw `worker_scores`. We rebuild `x` in `PARAM_KEYS` order, NaN-pad
+    short sample arrays to `num_instances`, and re-apply the current
+    `infeas_threshold` — so resuming with a stricter threshold reclassifies
+    borderline points correctly. Only the most-recent
+    `bo_results_detailed_*.json` per directory is used (mirroring how the
+    BO script overwrites the file each iteration).
+    """
+    g, c = cfg.general, cfg.constrained_bo
+    observations: list[tuple[np.ndarray, np.ndarray]] = []
+    n_missing = n_no_scores = 0
+
+    for wsd in warm_start_dirs:
+        if not wsd.exists():
+            logger.warning("bayesopt.warm_start_dir_missing", path=str(wsd))
+            n_missing += 1
+            continue
+        detailed_files = sorted(wsd.glob("bo_results_detailed_*.json"))
+        if not detailed_files:
+            logger.warning("bayesopt.warm_start_no_detailed", path=str(wsd))
+            n_missing += 1
+            continue
+        with open(detailed_files[-1]) as f:
+            entries = json.load(f)
+
+        n_loaded_dir = 0
+        for entry in entries:
+            scores = entry.get("worker_scores")
+            if not scores:
+                n_no_scores += 1
+                continue
+            try:
+                x = np.asarray([float(entry[k]) for k in PARAM_KEYS], dtype=float)
+            except KeyError as missing:
+                logger.warning(
+                    "bayesopt.warm_start_missing_dim",
+                    path=str(detailed_files[-1]),
+                    eval_id=entry.get("eval_id"),
+                    missing=str(missing),
+                )
+                continue
+            arr = np.asarray(scores, dtype=float).ravel()
+            if arr.size < g.num_instances:
+                arr = np.concatenate([arr, np.full(g.num_instances - arr.size, np.nan)])
+            infeasible = ~np.isfinite(arr) | (arr <= c.infeas_threshold)
+            arr = np.where(infeasible, np.nan, arr)
+            observations.append((x, arr))
+            n_loaded_dir += 1
+
+        logger.info(
+            "bayesopt.warm_start_loaded",
+            path=str(wsd),
+            file=str(detailed_files[-1].name),
+            n_entries=len(entries),
+            n_loaded=n_loaded_dir,
+        )
+
+    logger.info(
+        "bayesopt.warm_start_total",
+        n_dirs=len(warm_start_dirs),
+        n_missing=n_missing,
+        n_no_scores=n_no_scores,
+        n_loaded=len(observations),
+    )
+    return observations
+
+
 def save_results(results_log: list, bayesopt_dir: Path, run_timestamp: str):
     if not results_log:
         return
@@ -209,18 +285,26 @@ def save_results(results_log: list, bayesopt_dir: Path, run_timestamp: str):
         json.dump(results_log, f, indent=2)
 
 
-def _parse_vector_arg() -> str | None:
-    """Single-arg CLI: `--vector` is the only flag that overrides config.
-    Everything else lives in scripts/config.yml."""
+def _parse_cli_overrides() -> argparse.Namespace:
+    """CLI overrides for config.yml. Two knobs only — vector and ncpus —
+    everything else lives in scripts/config.yml. ncpus exists so PBS /
+    shell wrappers can pass the queue's actual core count without editing
+    the YAML; when omitted, `general.num_devices` from the YAML wins."""
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("--vector", type=str, default=None,
                         help="Hydrogen vector for this run; overrides general.vector.")
-    return parser.parse_args().vector
+    parser.add_argument("--ncpus", type=int, default=None,
+                        help="Override general.num_devices (parallel workers).")
+    return parser.parse_args()
 
 
 def main():
-    vector = _parse_vector_arg()
-    cfg = load_config(SCRIPTS_DIR / "config.yml", vector_override=vector)
+    cli = _parse_cli_overrides()
+    cfg = load_config(
+        SCRIPTS_DIR / "config.yml",
+        vector_override=cli.vector,
+        num_devices_override=cli.ncpus,
+    )
     g, c, s = cfg.general, cfg.constrained_bo, cfg.sobol
 
     configure_jax_threads(cfg.nlp.n_devices, cfg.nlp.blas_threads)
@@ -295,9 +379,13 @@ def main():
         sqp_config=cfg.nlp.to_sqp_config(),
         pad_initial=cfg.nlp.pad_initial,
         gp_lbfgs_max_iter=cfg.nlp.gp_lbfgs_max_iter,
+        gp_mu_kernel=cfg.nlp.gp_mu_kernel,
+        gp_log_var_kernel=cfg.nlp.gp_log_var_kernel,
+        gp_bin_kernel=cfg.nlp.gp_bin_kernel,
     )
 
     sobol_dir = resolve_sobol_dir(c.sobol_dir, SCRIPTS_DIR, g.vector)
+    n_preloaded = 0
     if sobol_dir is not None:
         if not sobol_dir.exists():
             logger.error("bayesopt.sobol_dir_missing", path=str(sobol_dir))
@@ -305,9 +393,18 @@ def main():
             preloaded = load_sobol_cache(sobol_dir, cfg)
             for x, samples in preloaded:
                 bo.observe(x, samples)
-            if preloaded:
-                bo.n_initial_points = len(preloaded)
-                logger.info("bayesopt.sobol_phase_skipped_via_cache", n_preloaded=len(preloaded))
+            n_preloaded += len(preloaded)
+
+    warm_start_dirs = resolve_warm_start_dirs(c.warm_start_dirs, SCRIPTS_DIR, g.vector)
+    if warm_start_dirs:
+        warm = load_bo_observations(warm_start_dirs, cfg)
+        for x, samples in warm:
+            bo.observe(x, samples)
+        n_preloaded += len(warm)
+
+    if n_preloaded:
+        bo.n_initial_points = n_preloaded
+        logger.info("bayesopt.sobol_phase_skipped_via_cache", n_preloaded=n_preloaded)
 
     best_x, best_score = bo.run()
     best_planning_params, best_env_overrides = params_from_x(

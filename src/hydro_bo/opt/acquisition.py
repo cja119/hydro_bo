@@ -25,8 +25,14 @@ from hydro_bo.opt.surrogate import HeteroscedasticGP, BinomialGP, _predict
 # --------------------------------------------------------------------- #
 
 
-@partial(jax.jit, static_argnames="round_info")
-def _ei_g_stats(x, gp_mu_state, gp_log_var_state, scaling, round_info):
+@partial(
+    jax.jit,
+    static_argnames=("round_info", "mu_kernel_kind", "lv_kernel_kind"),
+)
+def _ei_g_stats(
+    x, gp_mu_state, gp_log_var_state, scaling, round_info,
+    mu_kernel_kind, lv_kernel_kind,
+):
     """Mean and variance of g(x) = mu(x) - lam * sigma(x), under the
     moment-matching approximation."""
     mu_y, sigma_y, mu_lv, sigma_lv, lam = scaling
@@ -40,6 +46,7 @@ def _ei_g_stats(x, gp_mu_state, gp_log_var_state, scaling, round_info):
         gp_mu_state["mask"],
         x,
         round_info,
+        mu_kernel_kind,
     )
     lv_s, var_lv_s = _predict(
         gp_log_var_state["params"],
@@ -50,6 +57,7 @@ def _ei_g_stats(x, gp_mu_state, gp_log_var_state, scaling, round_info):
         gp_log_var_state["mask"],
         x,
         round_info,
+        lv_kernel_kind,
     )
 
     m_mu = mu_s * sigma_y + mu_y
@@ -66,11 +74,20 @@ def _ei_g_stats(x, gp_mu_state, gp_log_var_state, scaling, round_info):
     return e_g, var_g
 
 
-@partial(jax.jit, static_argnames="round_info")
-def _ei_eval(x, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info):
+@partial(
+    jax.jit,
+    static_argnames=("round_info", "mu_kernel_kind", "lv_kernel_kind"),
+)
+def _ei_eval(
+    x, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info,
+    mu_kernel_kind, lv_kernel_kind,
+):
     """EI value at a single point. x has shape (d,)."""
     x2 = x[None, :]
-    e_g, var_g = _ei_g_stats(x2, gp_mu_state, gp_log_var_state, scaling, round_info)
+    e_g, var_g = _ei_g_stats(
+        x2, gp_mu_state, gp_log_var_state, scaling, round_info,
+        mu_kernel_kind, lv_kernel_kind,
+    )
     sigma_g = jnp.sqrt(jnp.clip(var_g, jitter, None))
     delta = e_g - g_best
     z = delta / sigma_g
@@ -78,23 +95,40 @@ def _ei_eval(x, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_in
     return ei.squeeze()
 
 
-@partial(jax.jit, static_argnames="round_info")
-def _ei_neg(x, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info):
-    return -_ei_eval(
-        x, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info
-    )
-
-
-@partial(jax.jit, static_argnames="round_info")
-def _ei_batch(
-    x_batch, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info
+@partial(
+    jax.jit,
+    static_argnames=("round_info", "mu_kernel_kind", "lv_kernel_kind"),
+)
+def _ei_neg(
+    x, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info,
+    mu_kernel_kind, lv_kernel_kind,
 ):
-    return jax.vmap(_ei_eval, in_axes=(0, None, None, None, None, None, None))(
-        x_batch, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info
+    return -_ei_eval(
+        x, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info,
+        mu_kernel_kind, lv_kernel_kind,
     )
 
 
-@partial(jax.jit, static_argnames=("mask_indices", "round_info"))
+@partial(
+    jax.jit,
+    static_argnames=("round_info", "mu_kernel_kind", "lv_kernel_kind"),
+)
+def _ei_batch(
+    x_batch, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info,
+    mu_kernel_kind, lv_kernel_kind,
+):
+    return jax.vmap(
+        _ei_eval, in_axes=(0, None, None, None, None, None, None, None, None),
+    )(
+        x_batch, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info,
+        mu_kernel_kind, lv_kernel_kind,
+    )
+
+
+@partial(
+    jax.jit,
+    static_argnames=("mask_indices", "round_info", "mu_kernel_kind", "lv_kernel_kind"),
+)
 def _ei_neg_masked(
     x_reduced,
     mask_values,
@@ -105,6 +139,8 @@ def _ei_neg_masked(
     jitter,
     mask_indices,
     round_info,
+    mu_kernel_kind,
+    lv_kernel_kind,
 ):
     """Insert mask_values at mask_indices in x_reduced, then evaluate
     -EI. mask_indices is static (one trace per index pattern);
@@ -116,11 +152,15 @@ def _ei_neg_masked(
         fill = jnp.broadcast_to(mask_values[i].astype(x.dtype), x.shape[:-1] + (1,))
         x = jnp.concatenate([left, fill, right], axis=-1)
     return _ei_neg(
-        x, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info
+        x, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info,
+        mu_kernel_kind, lv_kernel_kind,
     )
 
 
-@partial(jax.jit, static_argnames=("mask_indices", "round_info"))
+@partial(
+    jax.jit,
+    static_argnames=("mask_indices", "round_info", "mu_kernel_kind", "lv_kernel_kind"),
+)
 def _ei_batch_masked(
     x_batch,
     mask_values,
@@ -131,6 +171,8 @@ def _ei_batch_masked(
     jitter,
     mask_indices,
     round_info,
+    mu_kernel_kind,
+    lv_kernel_kind,
 ):
     """Vmapped POSITIVE EI over a batch of x_reduced points."""
 
@@ -144,8 +186,11 @@ def _ei_batch_masked(
         return x
 
     x_full_batch = jax.vmap(expand_one)(x_batch)
-    return jax.vmap(_ei_eval, in_axes=(0, None, None, None, None, None, None))(
-        x_full_batch, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info
+    return jax.vmap(
+        _ei_eval, in_axes=(0, None, None, None, None, None, None, None, None),
+    )(
+        x_full_batch, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info,
+        mu_kernel_kind, lv_kernel_kind,
     )
 
 
@@ -166,8 +211,8 @@ def _ei_batch_masked(
 # --------------------------------------------------------------------- #
 
 
-@partial(jax.jit, static_argnames="round_info")
-def _feasibility_eval(x, gp_bin_state, log_p_targ, z_sc, round_info):
+@partial(jax.jit, static_argnames=("round_info", "bin_kernel_kind"))
+def _feasibility_eval(x, gp_bin_state, log_p_targ, z_sc, round_info, bin_kernel_kind):
     """LHS of the latent-space chance bound at a single point. `z_sc`
     is the standard-normal quantile (already a z-score, not a
     probability). x has shape (d,); returns scalar."""
@@ -180,23 +225,26 @@ def _feasibility_eval(x, gp_bin_state, log_p_targ, z_sc, round_info):
         gp_bin_state["mask"],
         x[None, :],
         round_info,
+        bin_kernel_kind,
     )
     sigma = jnp.sqrt(jnp.clip(var, 1e-12, None))
     return (mu - z_sc * sigma - log_p_targ).squeeze()
 
 
-@partial(jax.jit, static_argnames="round_info")
-def _feasibility_batch(x_batch, gp_bin_state, log_p_targ, z_sc, round_info):
+@partial(jax.jit, static_argnames=("round_info", "bin_kernel_kind"))
+def _feasibility_batch(
+    x_batch, gp_bin_state, log_p_targ, z_sc, round_info, bin_kernel_kind,
+):
     """Vmapped LHS over a batch — returns shape (B,)."""
-    return jax.vmap(_feasibility_eval, in_axes=(0, None, None, None, None))(
-        x_batch, gp_bin_state, log_p_targ, z_sc, round_info
+    return jax.vmap(_feasibility_eval, in_axes=(0, None, None, None, None, None))(
+        x_batch, gp_bin_state, log_p_targ, z_sc, round_info, bin_kernel_kind,
     )
 
 
-@partial(jax.jit, static_argnames=("mask_indices", "round_info"))
+@partial(jax.jit, static_argnames=("mask_indices", "round_info", "bin_kernel_kind"))
 def _feasibility_eval_masked(
     x_reduced, mask_values, gp_bin_state, log_p_targ, z_sc,
-    mask_indices, round_info,
+    mask_indices, round_info, bin_kernel_kind,
 ):
     """Masked single-point LHS: insert mask_values at mask_indices in
     x_reduced, then evaluate `_feasibility_eval`."""
@@ -206,13 +254,13 @@ def _feasibility_eval_masked(
         right = x[..., idx:]
         fill = jnp.broadcast_to(mask_values[i].astype(x.dtype), x.shape[:-1] + (1,))
         x = jnp.concatenate([left, fill, right], axis=-1)
-    return _feasibility_eval(x, gp_bin_state, log_p_targ, z_sc, round_info)
+    return _feasibility_eval(x, gp_bin_state, log_p_targ, z_sc, round_info, bin_kernel_kind)
 
 
-@partial(jax.jit, static_argnames=("mask_indices", "round_info"))
+@partial(jax.jit, static_argnames=("mask_indices", "round_info", "bin_kernel_kind"))
 def _feasibility_batch_masked(
     x_batch, mask_values, gp_bin_state, log_p_targ, z_sc,
-    mask_indices, round_info,
+    mask_indices, round_info, bin_kernel_kind,
 ):
     """Vmapped masked LHS over a batch of x_reduced points."""
     def expand_one(x_red_one):
@@ -225,8 +273,8 @@ def _feasibility_batch_masked(
         return x
 
     x_full_batch = jax.vmap(expand_one)(x_batch)
-    return jax.vmap(_feasibility_eval, in_axes=(0, None, None, None, None))(
-        x_full_batch, gp_bin_state, log_p_targ, z_sc, round_info
+    return jax.vmap(_feasibility_eval, in_axes=(0, None, None, None, None, None))(
+        x_full_batch, gp_bin_state, log_p_targ, z_sc, round_info, bin_kernel_kind,
     )
 
 
@@ -339,7 +387,12 @@ class ExpectedImprovement(AcquisitionFunction):
         round_info: tuple = (),
     ):
         # round_info must match the round_info both GPs were fit with.
+        # Each GP's `kernel_kind` is captured at construction time and
+        # baked into the jitted callables via `partial` — JAX uses it
+        # as a static argument, so changing it triggers a re-trace.
         self.round_info = tuple(round_info)
+        self.mu_kernel_kind = str(gp_mu.kernel_kind)
+        self.lv_kernel_kind = str(gp_log_var.kernel_kind)
         self.scaling = (
             jnp.asarray(dataset._mu_y, dtype=jnp.float64),
             jnp.asarray(dataset._sigma_y, dtype=jnp.float64),
@@ -370,26 +423,39 @@ class ExpectedImprovement(AcquisitionFunction):
             self.gp_log_var_state,
             self.scaling,
             self.round_info,
+            self.mu_kernel_kind,
+            self.lv_kernel_kind,
         )
         return jnp.max(e_g)
 
     def evaluate(self, x):
-        return _ei_eval(x, *self.state_args, self.round_info)
+        return _ei_eval(
+            x, *self.state_args, self.round_info,
+            self.mu_kernel_kind, self.lv_kernel_kind,
+        )
 
     def neg_acq_fn(self):
-        return partial(_ei_neg, round_info=self.round_info)
+        return partial(
+            _ei_neg, round_info=self.round_info,
+            mu_kernel_kind=self.mu_kernel_kind, lv_kernel_kind=self.lv_kernel_kind,
+        )
 
     def acq_batch_fn(self):
-        return partial(_ei_batch, round_info=self.round_info)
+        return partial(
+            _ei_batch, round_info=self.round_info,
+            mu_kernel_kind=self.mu_kernel_kind, lv_kernel_kind=self.lv_kernel_kind,
+        )
 
     def neg_acq_masked_fn(self, mask_indices: tuple):
         return partial(
-            _ei_neg_masked, mask_indices=mask_indices, round_info=self.round_info
+            _ei_neg_masked, mask_indices=mask_indices, round_info=self.round_info,
+            mu_kernel_kind=self.mu_kernel_kind, lv_kernel_kind=self.lv_kernel_kind,
         )
 
     def acq_batch_masked_fn(self, mask_indices: tuple):
         return partial(
-            _ei_batch_masked, mask_indices=mask_indices, round_info=self.round_info
+            _ei_batch_masked, mask_indices=mask_indices, round_info=self.round_info,
+            mu_kernel_kind=self.mu_kernel_kind, lv_kernel_kind=self.lv_kernel_kind,
         )
 
 
@@ -430,6 +496,7 @@ class ConstrainedExpectedImprovement(ExpectedImprovement):
             round_info=round_info,
         )
         self.gp_bin_state = gp_bin.state()
+        self.bin_kernel_kind = str(gp_bin.kernel_kind)
         p = jnp.asarray(p_targ, dtype=jnp.float64)
         self.log_p_targ = jnp.log(p / (1.0 - p))
         self.z_sc = jnp.asarray(z_sc, dtype=jnp.float64)
@@ -441,6 +508,7 @@ class ConstrainedExpectedImprovement(ExpectedImprovement):
             log_p_targ=self.log_p_targ,
             z_sc=self.z_sc,
             round_info=self.round_info,
+            bin_kernel_kind=self.bin_kernel_kind,
         )
 
     def feasibility_batch_fn(self):
@@ -450,6 +518,7 @@ class ConstrainedExpectedImprovement(ExpectedImprovement):
             log_p_targ=self.log_p_targ,
             z_sc=self.z_sc,
             round_info=self.round_info,
+            bin_kernel_kind=self.bin_kernel_kind,
         )
 
     def feasibility_eval_masked_fn(self, mask_indices: tuple):
@@ -460,6 +529,7 @@ class ConstrainedExpectedImprovement(ExpectedImprovement):
             z_sc=self.z_sc,
             mask_indices=tuple(mask_indices),
             round_info=self.round_info,
+            bin_kernel_kind=self.bin_kernel_kind,
         )
 
     def feasibility_batch_masked_fn(self, mask_indices: tuple):
@@ -470,5 +540,6 @@ class ConstrainedExpectedImprovement(ExpectedImprovement):
             z_sc=self.z_sc,
             mask_indices=tuple(mask_indices),
             round_info=self.round_info,
+            bin_kernel_kind=self.bin_kernel_kind,
         )
 

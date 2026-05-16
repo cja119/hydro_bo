@@ -66,6 +66,12 @@ class NlpCfg:
     sqp_tol_stationarity: float
     sqp_tol_feasibility: float
     sqp_use_exact_hessian: bool
+    gp_mu_kernel: str
+    gp_log_var_kernel: str
+    gp_bin_kernel: str
+    sqp_osqp_max_iter: int
+    sqp_osqp_tol: float
+    sqp_max_line_search: int
 
     def to_sqp_config(self):
         """Build a `septal.jax.sqp.SQPConfig` from these settings."""
@@ -75,6 +81,9 @@ class NlpCfg:
             use_exact_hessian=self.sqp_use_exact_hessian,
             tol_stationarity=self.sqp_tol_stationarity,
             tol_feasibility=self.sqp_tol_feasibility,
+            osqp_max_iter=self.sqp_osqp_max_iter,
+            osqp_tol=self.sqp_osqp_tol,
+            max_line_search=self.sqp_max_line_search,
         )
 
 
@@ -98,6 +107,7 @@ class ConstrainedCfg:
     l1_penalty: float
     sobol_dir: Optional[str]
     n_sobol_cache: Optional[int]  # cap on cached Sobol rows loaded (None = all).
+    warm_start_dirs: List[str]  # per-vector list of prior BO output dirs to replay as initial observations.
 
 
 @dataclass(frozen=True)
@@ -115,11 +125,37 @@ def _optional_int(raw) -> Optional[int]:
     return int(raw)
 
 
-def _resolve_n_devices(raw) -> int:
-    """null → os.cpu_count(); otherwise the supplied int."""
+_VALID_KERNEL_KINDS = ("rbf", "matern12")
+
+
+def _resolve_kernel_kind(raw, *, key: str) -> str:
     if raw is None:
+        return "rbf"
+    s = str(raw).strip().lower()
+    if s not in _VALID_KERNEL_KINDS:
+        raise ValueError(
+            f"nlp.{key}: unknown kernel {raw!r}; expected one of {_VALID_KERNEL_KINDS}."
+        )
+    return s
+
+
+def _resolve_n_devices(raw) -> int:
+    """null → cpuset size (PBS-allocated cores), not node total.
+
+    `os.sched_getaffinity(0)` returns the set of CPU IDs the current
+    process is allowed to run on under the active cgroup / cpuset — i.e.
+    what PBS actually gave us. `os.cpu_count()` is the *node* total and
+    on a shared HPC node will routinely be 6-10× the allocation, so
+    using it as the default would oversubscribe XLA threads.
+    Linux-only API; falls back to `os.cpu_count()` on platforms that
+    don't expose it (macOS / Windows).
+    """
+    if raw is not None:
+        return int(raw)
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
         return max(1, os.cpu_count() or 1)
-    return int(raw)
 
 
 def _resolve_log_level(raw) -> int:
@@ -159,18 +195,35 @@ def _resolve_general(g: dict) -> GeneralCfg:
     )
 
 
-def load_config(path: str | Path, *, vector_override: Optional[str] = None) -> Config:
+def load_config(
+    path: str | Path,
+    *,
+    vector_override: Optional[str] = None,
+    num_devices_override: Optional[int] = None,
+) -> Config:
     """Load the YAML at `path` and return a typed `Config`. Caller is
     responsible for the path (typically `scripts/config.yml`).
 
     `vector_override`, if given, replaces `general.vector` before the
     rest of the config is built — used by the run scripts to expose a
     single `--vector` CLI flag while keeping every other knob in YAML.
+
+    `num_devices_override`, if given, replaces `general.num_devices`. The
+    derived `num_instances` (which defaults to num_devices when null) is
+    recomputed accordingly. Lets PBS / shell wrappers pass the queue's
+    actual ncpus without editing config.yml.
     """
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     if vector_override is not None:
         raw["general"]["vector"] = str(vector_override)
+    if num_devices_override is not None:
+        nd = int(num_devices_override)
+        raw["general"]["num_devices"] = nd
+        # Also clamp the JAX driver's logical-device count so the BO's
+        # GP fits don't oversubscribe past the PBS allocation. Without
+        # this, --ncpus 4 would still leave nlp.n_devices at 16.
+        raw.setdefault("nlp", {})["n_devices"] = nd
     return Config(
         general=_resolve_general(raw["general"]),
         sobol=SobolCfg(
@@ -191,6 +244,19 @@ def load_config(path: str | Path, *, vector_override: Optional[str] = None) -> C
             sqp_tol_stationarity=float(raw["nlp"]["sqp_tol_stationarity"]),
             sqp_tol_feasibility=float(raw["nlp"]["sqp_tol_feasibility"]),
             sqp_use_exact_hessian=bool(raw["nlp"]["sqp_use_exact_hessian"]),
+            sqp_osqp_max_iter=int(raw["nlp"].get("sqp_osqp_max_iter", 4000)),
+            sqp_osqp_tol=float(raw["nlp"].get("sqp_osqp_tol", 1e-7)),
+            sqp_max_line_search=int(raw["nlp"].get("sqp_max_line_search", 30)),
+            gp_mu_kernel=_resolve_kernel_kind(
+                raw["nlp"].get("gp_mu_kernel"), key="gp_mu_kernel",
+            ),
+            gp_log_var_kernel=_resolve_kernel_kind(
+                raw["nlp"].get("gp_log_var_kernel"), key="gp_log_var_kernel",
+            ),
+            gp_bin_kernel=_resolve_kernel_kind(
+                raw["nlp"].get("gp_bin_kernel") or "matern12",
+                key="gp_bin_kernel",
+            ),
         ),
         unconstrained_bo=UnconstrainedCfg(
             iter_budget=int(raw["unconstrained_bo"]["iter_budget"]),
@@ -209,6 +275,7 @@ def load_config(path: str | Path, *, vector_override: Optional[str] = None) -> C
             l1_penalty=float(raw["constrained_bo"]["l1_penalty"]),
             sobol_dir=raw["constrained_bo"].get("sobol_dir"),
             n_sobol_cache=_optional_int(raw["constrained_bo"].get("n_sobol_cache")),
+            warm_start_dirs=list(raw["constrained_bo"].get("warm_start_dirs") or []),
         ),
     )
 
@@ -249,6 +316,24 @@ def merge_env_overrides(cfg: Config, env_overrides: dict) -> dict:
     if env_overrides:
         _deep_merge(env_args["config"], env_overrides)
     return env_args
+
+
+def resolve_warm_start_dirs(
+    cfg_warm_start_dirs: List[str],
+    scripts_dir: Path,
+    vector: str,
+) -> List[Path]:
+    """Resolve a list of prior BO output dirs, with the same `{vector}`
+    substitution and relative-path-to-scripts handling as
+    `resolve_sobol_dir`."""
+    resolved: List[Path] = []
+    for entry in cfg_warm_start_dirs or []:
+        formatted = str(entry).format(vector=vector)
+        p = Path(formatted)
+        if not p.is_absolute():
+            p = Path(scripts_dir) / p
+        resolved.append(p)
+    return resolved
 
 
 def resolve_sobol_dir(

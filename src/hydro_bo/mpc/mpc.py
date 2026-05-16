@@ -634,8 +634,15 @@ class MPCController:
             getattr(self.model, key).construct()
 
     def _build_params(self, params_def):
-        # Parameters that must remain immutable (used in control flow)
-        immutable_params = {'mean_ship_arrival_time', 'mean_ship_transit_time', 'std_ship_transit_time', 'expected_arrival_offset'}
+        # Parameters that must remain immutable (used in control flow,
+        # constraint construction, or set indexing).
+        immutable_params = {
+            'mean_ship_arrival_time',
+            'mean_ship_transit_time',
+            'std_ship_transit_time',
+            'expected_arrival_offset',
+            'forecast_horizon',  # branches storage-backoff constraints
+        }
 
         for key, param in params_def.items():
             # Determine if this parameter should be mutable
