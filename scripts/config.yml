@@ -46,6 +46,9 @@ nlp:
   gp_mu_kernel:         rbf
   gp_log_var_kernel:    rbf
   gp_bin_kernel:        matern12
+  acq_timeout_sec:      300            # subprocess kills SQP after this; BO falls back to a fresh Sobol point
+  feasible_screen:      true           # constrained BO: filter Sobol candidates by chance-bound feasibility instead of L1 rescore
+  max_screen_batches:   10             # cap on Sobol resampling batches when chasing feasible seeds
 
 unconstrained_bo:
   iter_budget:        500

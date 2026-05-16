@@ -62,6 +62,46 @@ def clear_jax_caches() -> None:
             pass
 
 
+def _log_screen_diag(raw, feas, adjusted, l1_penalty, n_restarts):
+    """Per-screen-call summary of L1-hinge effectiveness.
+
+    Key fields to watch in the log:
+      - `n_feasible`        : how many of the 16384 candidates have feas >= 0
+                              per the chance-bound (BinomialGP-derived).
+      - `top_k_n_feasible`  : how many of the n_restarts seeds actually handed
+                              to the SQP are feasible. If 0 while n_feasible > 0,
+                              the L1 penalty is too small relative to raw-EI scale.
+                              If 0 while n_feasible == 0, the constraint is
+                              unsatisfiable per the GP at this z_sc — SQP will
+                              spin chasing an infeasible problem.
+      - `penalty_at_feas_min` vs `raw_p99`: directly comparable; the former must
+                              dominate to push infeasible candidates below feasible.
+    """
+    top_idx = np.argsort(adjusted)[-n_restarts:]
+    n_feas_total = int(np.sum(feas >= 0))
+    top_feas = feas[top_idx]
+    top_raw = raw[top_idx]
+    logger.info(
+        "sobol_screen_diag",
+        n_total=int(feas.size),
+        n_feasible=n_feas_total,
+        feas_frac=float(n_feas_total) / float(feas.size),
+        raw_min=float(np.min(raw)),
+        raw_max=float(np.max(raw)),
+        raw_p99=float(np.percentile(raw, 99)),
+        feas_min=float(np.min(feas)),
+        feas_max=float(np.max(feas)),
+        feas_p50=float(np.median(feas)),
+        l1_penalty=float(l1_penalty),
+        penalty_at_feas_min=float(l1_penalty * max(0.0, -float(np.min(feas)))),
+        top_k_n_feasible=int(np.sum(top_feas >= 0)),
+        top_k_feas_min=float(np.min(top_feas)),
+        top_k_feas_max=float(np.max(top_feas)),
+        top_k_raw_min=float(np.min(top_raw)),
+        top_k_raw_max=float(np.max(top_raw)),
+    )
+
+
 def _pmap_batch_eval(batch_fn, x_batch: jnp.ndarray, *args) -> jnp.ndarray:
     """Shard `x_batch`'s leading axis across `jax.local_device_count()`
     logical devices via pmap; fall back to the plain (vmap-fused) call
@@ -74,13 +114,36 @@ def _pmap_batch_eval(batch_fn, x_batch: jnp.ndarray, *args) -> jnp.ndarray:
     """
     n_dev = jax.local_device_count()
     n_total = int(x_batch.shape[0])
-    if n_dev <= 1 or n_total % n_dev != 0:
+    if n_dev <= 1:
+        # Likely XLA flag didn't take effect (configure_jax_threads was called
+        # after jax import). Logged once per process at INFO so it's visible
+        # without spamming on every screen call.
+        global _pmap_single_device_warned
+        if not _pmap_single_device_warned:
+            logger.warning(
+                "pmap_falling_back_to_single_device",
+                jax_local_devices=n_dev,
+                message="Sobol screen will run on a single device (no sharding). "
+                        "Check configure_jax_threads was called BEFORE any jax import.",
+            )
+            _pmap_single_device_warned = True
+        return batch_fn(x_batch, *args)
+    if n_total % n_dev != 0:
+        logger.warning(
+            "pmap_batch_not_divisible",
+            n_total=n_total,
+            n_dev=n_dev,
+            message="Sobol batch not divisible by device count; running single-device.",
+        )
         return batch_fn(x_batch, *args)
     per_dev = n_total // n_dev
     x_sharded = x_batch.reshape((n_dev, per_dev) + x_batch.shape[1:])
     pmap_fn = jax.pmap(batch_fn, in_axes=(0,) + (None,) * len(args))
     out = pmap_fn(x_sharded, *args)
     return out.reshape((n_total,) + out.shape[2:])
+
+
+_pmap_single_device_warned = False
 
 
 # ---------------------------------------------------------------------- #
@@ -104,10 +167,45 @@ class NLPBase:
     # ---- public ----
 
     def maximise(self, acq: AcquisitionFunction) -> tuple[np.ndarray, float]:
+        import time
+
         D = self._dim(acq)
+
+        t0 = time.perf_counter()
         starts, p_batch, screen_scores = self._build_starts(acq)
-        result = self._build_solver(acq).solve_batch(starts, p_batch)
-        return self._select_best(result, starts, p_batch, screen_scores, D)
+        t_starts = time.perf_counter() - t0
+
+        n_lanes = int(np.asarray(starts).shape[0])
+        logger.info(
+            "maximise_lane_layout",
+            n_lanes=n_lanes,
+            n_restarts=self.n_restarts,
+            n_combos=n_lanes // max(self.n_restarts, 1),
+            jax_devices=int(jax.local_device_count()),
+            note="solve_batch uses vmap (single device); only Sobol screen shards via pmap",
+        )
+
+        t0 = time.perf_counter()
+        factory = self._build_solver(acq)
+        t_build = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        result = factory.solve_batch(starts, p_batch)
+        t_solve = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        out = self._select_best(result, starts, p_batch, screen_scores, D)
+        t_select = time.perf_counter() - t0
+
+        logger.info(
+            "maximise_timings",
+            build_starts_sec=round(t_starts, 3),
+            build_solver_sec=round(t_build, 3),
+            solve_batch_sec=round(t_solve, 3),
+            select_best_sec=round(t_select, 3),
+            total_sec=round(t_starts + t_build + t_solve + t_select, 3),
+        )
+        return out
 
     # ---- subclass hooks ----
 
@@ -230,11 +328,16 @@ class MixedIntNLP(NLPBase):
         pow_sobol: int = 14,
         n_restarts: int = 5,
         sqp_config: Optional[SQPConfig] = None,
+        max_screen_batches: int = 1,
     ):
         super().__init__(
             seed=seed, pow_sobol=pow_sobol, n_restarts=n_restarts, sqp_config=sqp_config
         )
         self.cat_vars = [(int(i), [float(v) for v in vals]) for i, vals in cat_vars]
+        # Cap on Sobol resample batches per combo. >1 only meaningful when a
+        # subclass overrides `_sobol_screen` to do batched feasibility filtering
+        # (see ConstrainedMixedIntNLP). Defaults to 1 (one-shot screen).
+        self.max_screen_batches = int(max_screen_batches)
 
     # ---- subclass hooks (inherited maximise drives these) ----
 
@@ -310,19 +413,38 @@ class MixedIntNLP(NLPBase):
 # ---------------------------------------------------------------------- #
 
 
+class NoFeasibleScreenError(RuntimeError):
+    """Raised by ConstrainedMixedIntNLP._sobol_screen when feasible_screen
+    is True and the cap on Sobol resampling batches is exhausted without
+    finding any candidate with feas >= 0. The caller (BO layer) should
+    treat this as 'GP says nothing in the search space is feasible right
+    now' and fall back to a fresh Sobol point — there is no useful start
+    we can hand to the SQP."""
+
+
 class ConstrainedMixedIntNLP(MixedIntNLP):
     """+ explicit chance-bound feasibility constraint inside the SQP,
-    and an L1 hinge re-ranking the Sobol screen.
+    and either feasibility-filtered Sobol screen (preferred) or an
+    L1 hinge re-ranking (legacy) for the starting-point selection.
 
     Both mechanisms operate on the latent-space LHS supplied by the
     acquisition (`f(x) + z_sc·σ(x) − log_p_targ`); feasibility means
     `LHS ≥ 0`. The threshold (i.e. `p_targ`) is baked into the
-    acquisition's `log_p_targ`, so this class only carries `l1_penalty`.
+    acquisition's `log_p_targ`.
 
     SQP constraint: `0 ≤ LHS ≤ +∞`.
-    L1 hinge: `raw − l1_penalty · max(0, −LHS)` — no penalty for
-    feasible points, linear penalty proportional to the chance-bound
-    shortfall otherwise.
+
+    `feasible_screen=True` (default): Sobol-sample in batches, evaluate
+    feas, keep only candidates with feas >= 0, accumulate across up to
+    `max_screen_batches` batches until n_restarts feasible are found.
+    Among those feasible candidates, pick top-K by raw acquisition value.
+    Raises `NoFeasibleScreenError` if the cap is hit with zero feasible
+    candidates anywhere — at high z_sc the GP may say nothing is feasible
+    and we should not hand an infeasible problem to the SQP.
+
+    `feasible_screen=False`: legacy L1-hinge rescore. Always returns
+    n_restarts starts (least-infeasible if no feasible exist), which can
+    cause the SQP to spin chasing an unsatisfiable constraint.
     """
 
     def __init__(
@@ -333,6 +455,8 @@ class ConstrainedMixedIntNLP(MixedIntNLP):
         pow_sobol: int = 14,
         n_restarts: int = 5,
         sqp_config: Optional[SQPConfig] = None,
+        feasible_screen: bool = True,
+        max_screen_batches: int = 10,
     ):
         super().__init__(
             cat_vars=cat_vars,
@@ -340,8 +464,10 @@ class ConstrainedMixedIntNLP(MixedIntNLP):
             pow_sobol=pow_sobol,
             n_restarts=n_restarts,
             sqp_config=sqp_config,
+            max_screen_batches=max_screen_batches,
         )
         self.l1_penalty = float(l1_penalty)
+        self.feasible_screen = bool(feasible_screen)
 
     def _solver(self, acq):
         parent = super()._solver(acq)
@@ -362,16 +488,129 @@ class ConstrainedMixedIntNLP(MixedIntNLP):
         )
 
     def _sobol_screen(self, acq, dim, batch_fn, extra_args=(), rescore=None):
+        # Feasibility-filtered screen path: accumulate Sobol candidates with
+        # feas >= 0 until we have n_restarts. No rescore needed — the
+        # SQP gets actually-feasible starts.
+        if self.feasible_screen and rescore is None:
+            return self._feasible_screen(acq, dim, batch_fn, extra_args)
+        # Legacy L1-hinge path (or caller-supplied rescore).
         if rescore is None and self.l1_penalty > 0.0:
             rescore = self._l1_rescore(acq, extra_args)
         return super()._sobol_screen(acq, dim, batch_fn, extra_args, rescore=rescore)
 
+    def _feasible_screen(self, acq, dim, batch_fn, extra_args):
+        """Sample Sobol candidates in batches and accumulate those with
+        feas >= 0. Stops as soon as we have `n_restarts` feasible, or hits
+        `max_screen_batches` and raises `NoFeasibleScreenError`.
+
+        For each batch we evaluate `feas` first (cheaper — one GP), then
+        only evaluate the raw acquisition on the feasible subset (saves
+        2 GP-predicts on every infeasible candidate). The Sobol generator
+        carries state across batches so resampling is genuinely new
+        quasi-random points, not repeated draws."""
+        cat, _ = self._layout()
+        feas_state = acq.feasibility_state_args
+        if cat:
+            feas_fn = acq.feasibility_batch_masked_fn(cat)
+            mask_values = extra_args[0]
+            feas_args = (mask_values,) + tuple(feas_state)
+        else:
+            feas_fn = acq.feasibility_batch_fn()
+            feas_args = tuple(feas_state)
+
+        sampler = Sobol(d=dim, scramble=True, seed=self.seed)
+        per_batch = 2**self.pow_sobol
+
+        accum_x: list[np.ndarray] = []
+        accum_raw: list[np.ndarray] = []
+        n_accum = 0
+        n_sampled_total = 0
+        last_feas_min = float("inf")
+        last_feas_max = float("-inf")
+
+        for batch_idx in range(max(1, self.max_screen_batches)):
+            candidates = sampler.random(per_batch)
+            n_sampled_total += per_batch
+            x_jnp = jnp.asarray(candidates, dtype=jnp.float64)
+
+            feas = np.asarray(_pmap_batch_eval(feas_fn, x_jnp, *feas_args))
+            mask = feas >= 0
+            n_feas_this_batch = int(mask.sum())
+            last_feas_min = min(last_feas_min, float(np.min(feas)))
+            last_feas_max = max(last_feas_max, float(np.max(feas)))
+
+            if n_feas_this_batch > 0:
+                # Only evaluate raw acquisition on the feasible subset.
+                x_feas_jnp = jnp.asarray(candidates[mask], dtype=jnp.float64)
+                raw = np.asarray(
+                    _pmap_batch_eval(batch_fn, x_feas_jnp, *extra_args, *acq.state_args)
+                )
+                accum_x.append(candidates[mask])
+                accum_raw.append(raw)
+                n_accum += n_feas_this_batch
+
+            logger.info(
+                "feasible_screen_batch",
+                batch=batch_idx + 1,
+                n_batches_cap=int(self.max_screen_batches),
+                n_sampled_this_batch=per_batch,
+                n_feasible_this_batch=n_feas_this_batch,
+                n_accumulated_feasible=n_accum,
+                n_target=int(self.n_restarts),
+                feas_min_so_far=last_feas_min,
+                feas_max_so_far=last_feas_max,
+            )
+            if n_accum >= self.n_restarts:
+                break
+
+        if n_accum == 0:
+            logger.warning(
+                "feasible_screen_exhausted",
+                n_batches=batch_idx + 1,
+                n_sampled_total=n_sampled_total,
+                feas_max=last_feas_max,
+                message="no candidate has feas >= 0 after all batches; "
+                        "chance bound is unsatisfiable per the current GP",
+            )
+            raise NoFeasibleScreenError(
+                f"feasible_screen: 0 feasible candidates in {n_sampled_total} "
+                f"Sobol samples (cap={self.max_screen_batches} batches). "
+                f"feas_max={last_feas_max:.3f} — constraint unsatisfiable per GP."
+            )
+
+        all_x = np.concatenate(accum_x, axis=0)
+        all_raw = np.concatenate(accum_raw, axis=0)
+        # Top n_restarts by raw acquisition value among feasible candidates.
+        # If we accumulated < n_restarts, pad by repeating the best one so
+        # the SQP gets a fixed-shape input (shape is consumed by vmap).
+        if all_x.shape[0] < self.n_restarts:
+            best_one = int(np.argmax(all_raw))
+            pad_count = self.n_restarts - all_x.shape[0]
+            all_x = np.concatenate([all_x, np.tile(all_x[best_one:best_one+1], (pad_count, 1))], axis=0)
+            all_raw = np.concatenate([all_raw, np.full(pad_count, all_raw[best_one])], axis=0)
+            logger.info(
+                "feasible_screen_padded_starts",
+                n_feasible_found=n_accum,
+                n_restarts=int(self.n_restarts),
+                pad_count=pad_count,
+            )
+        top_idx = np.argsort(all_raw)[-self.n_restarts:]
+        return all_x[top_idx], all_raw[top_idx]
+
     def _l1_rescore(self, acq, extra_args):
         """Build the L1-hinge rescore callback: subtracts
         `l1_penalty * max(0, -LHS)` from the raw acquisition values,
-        where LHS is the latent-space chance-bound LHS."""
+        where LHS is the latent-space chance-bound LHS.
+
+        Logs a `sobol_screen_diag` per call so we can see whether the
+        top-K starts handed to SQP are actually feasible (`top_k_n_feasible
+        == n_restarts`) or are just least-infeasible (which causes the
+        SQP to spin chasing an unsatisfiable constraint).
+        """
         cat, _ = self._layout()
         feas_state = acq.feasibility_state_args
+        l1 = self.l1_penalty
+        n_restarts = self.n_restarts
         if cat:
             feas_fn = acq.feasibility_batch_masked_fn(cat)
             mask_values = extra_args[0]
@@ -380,7 +619,9 @@ class ConstrainedMixedIntNLP(MixedIntNLP):
                 feas = np.asarray(
                     _pmap_batch_eval(feas_fn, x_jnp, mask_values, *feas_state)
                 )
-                return raw - self.l1_penalty * np.maximum(0.0, -feas)
+                adjusted = raw - l1 * np.maximum(0.0, -feas)
+                _log_screen_diag(raw, feas, adjusted, l1, n_restarts)
+                return adjusted
 
         else:
             feas_fn = acq.feasibility_batch_fn()
@@ -389,7 +630,9 @@ class ConstrainedMixedIntNLP(MixedIntNLP):
                 feas = np.asarray(
                     _pmap_batch_eval(feas_fn, x_jnp, *feas_state)
                 )
-                return raw - self.l1_penalty * np.maximum(0.0, -feas)
+                adjusted = raw - l1 * np.maximum(0.0, -feas)
+                _log_screen_diag(raw, feas, adjusted, l1, n_restarts)
+                return adjusted
 
         return rescore
 

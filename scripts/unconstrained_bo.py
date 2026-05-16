@@ -313,6 +313,9 @@ def main():
         gp_lbfgs_max_iter=cfg.nlp.gp_lbfgs_max_iter,
         gp_mu_kernel=cfg.nlp.gp_mu_kernel,
         gp_log_var_kernel=cfg.nlp.gp_log_var_kernel,
+        acq_timeout_sec=cfg.nlp.acq_timeout_sec,
+        feasible_screen=cfg.nlp.feasible_screen,
+        max_screen_batches=cfg.nlp.max_screen_batches,
     )
 
     sobol_dir = resolve_sobol_dir(u.sobol_dir, SCRIPTS_DIR, g.vector)

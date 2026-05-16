@@ -72,6 +72,16 @@ class NlpCfg:
     sqp_osqp_max_iter: int
     sqp_osqp_tol: float
     sqp_max_line_search: int
+    # Wall-clock budget for one `_suggest_next` (per BO iter). When the
+    # subprocess running `solver.maximise` exceeds this, it is terminated
+    # and the BO loop falls back to a fresh Sobol point in bounds for the
+    # next x_next.
+    acq_timeout_sec: int = 300
+    # Feasibility-filtered Sobol screen (constrained BO only): instead of
+    # the L1-hinge rescore, accumulate Sobol candidates with
+    # `feas >= 0` until n_restarts are found or we exhaust the cap.
+    feasible_screen: bool = True
+    max_screen_batches: int = 10
 
     def to_sqp_config(self):
         """Build a `septal.jax.sqp.SQPConfig` from these settings."""
@@ -257,6 +267,9 @@ def load_config(
                 raw["nlp"].get("gp_bin_kernel") or "matern12",
                 key="gp_bin_kernel",
             ),
+            acq_timeout_sec=int(raw["nlp"].get("acq_timeout_sec", 300)),
+            feasible_screen=bool(raw["nlp"].get("feasible_screen", True)),
+            max_screen_batches=int(raw["nlp"].get("max_screen_batches", 10)),
         ),
         unconstrained_bo=UnconstrainedCfg(
             iter_budget=int(raw["unconstrained_bo"]["iter_budget"]),

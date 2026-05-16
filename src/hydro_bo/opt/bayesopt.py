@@ -20,6 +20,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, Sequence, Tuple
 
 import gc
+import os
 import numpy as np
 import jax.numpy as jnp
 
@@ -65,6 +66,9 @@ class BaseBayesopt(ABC):
         sqp_config=None,
         pad_initial: int = 256,
         gp_lbfgs_max_iter: int = 100,
+        acq_timeout_sec: int = 300,
+        feasible_screen: bool = True,
+        max_screen_batches: int = 10,
     ):
 
         self.f = f
@@ -79,6 +83,9 @@ class BaseBayesopt(ABC):
         self.sqp_config = sqp_config
         self.pad_initial = int(pad_initial)
         self.gp_lbfgs_max_iter = int(gp_lbfgs_max_iter)
+        self.acq_timeout_sec = int(acq_timeout_sec)
+        self.feasible_screen = bool(feasible_screen)
+        self.max_screen_batches = int(max_screen_batches)
 
         self._X: list[np.ndarray] = []
         self._samples: list[np.ndarray] = []
@@ -180,17 +187,33 @@ class BaseBayesopt(ABC):
         else:
             logger.info("bo_sobol_phase_skipped", n_preloaded=n_preloaded)
 
-        logger.info("bo_phase_start", iter_limit=self.iter_limit, lam=self.lam)
+        import jax as _jax_for_log
+        logger.info(
+            "bo_phase_start",
+            iter_limit=self.iter_limit,
+            lam=self.lam,
+            jax_local_devices=int(_jax_for_log.local_device_count()),
+            jax_default_backend=str(_jax_for_log.default_backend()),
+            xla_flags=str(os.environ.get("XLA_FLAGS", "")),
+            omp_num_threads=str(os.environ.get("OMP_NUM_THREADS", "")),
+        )
         try:
             import psutil
 
             _proc = psutil.Process()
         except Exception:
             _proc = None
+        import time as _time
         for i in range(self.iter_limit):
+            t0 = _time.perf_counter()
             self._fit_surrogates()
+            t_fit = _time.perf_counter() - t0
+            t0 = _time.perf_counter()
             x_next = self._suggest_next()
+            t_suggest = _time.perf_counter() - t0
+            t0 = _time.perf_counter()
             s = self._evaluate_and_store(x_next)
+            t_eval = _time.perf_counter() - t0
             best_x, best_score = self._best_observed()
             rss_mb = (
                 float(_proc.memory_info().rss) / (1024**2)
@@ -208,6 +231,9 @@ class BaseBayesopt(ABC):
                 var=float(np.nanvar(s, ddof=1)) if n_feas >= 2 else float("nan"),
                 best_score=float(best_score),
                 driver_rss_mb=rss_mb,
+                fit_surrogates_sec=round(t_fit, 3),
+                suggest_next_sec=round(t_suggest, 3),
+                evaluate_mpc_sec=round(t_eval, 3),
             )
 
         best_x, best_score = self._best_observed()
@@ -223,40 +249,92 @@ class BaseBayesopt(ABC):
         return self._suggest_next()
 
     def _suggest_next(self) -> np.ndarray:
+        import time as _time
+        from hydro_bo.opt.solvers import sobol_sample
+        from hydro_bo.opt.subprocess_solver import (
+            run_maximise_with_timeout,
+            serialise_acq_payload,
+        )
+
         if self.dataset is None:
             self._fit_surrogates()
-        logger.debug(
-            "bo_acquisition_optimise", lam=self.lam, n_restarts=self.n_restarts
-        )
-        acq = self._build_acquisition()
-        seed = self.seed + len(self._X)
-        solver = self._build_solver(seed=seed)
-        best_x_unit, best_val = solver.maximise(acq)
-
-        # Predicted confidence-bound g(x) = mu - lam·sigma at the chosen
-        # point, in the original (un-standardised) target space —
-        # `_ei_g_stats` undoes the GP-target scaling internally.
-        e_g, var_g = _ei_g_stats(
-            jnp.asarray(best_x_unit, dtype=jnp.float64)[None, :],
-            acq.gp_mu_state,
-            acq.gp_log_var_state,
-            acq.scaling,
-            acq.round_info,
-            acq.mu_kernel_kind,
-            acq.lv_kernel_kind,
-        )
-        cb = float(e_g[0])
-        cb_sigma = float(jnp.sqrt(jnp.clip(var_g[0], 0.0, None)))
         logger.info(
-            "bo_acquisition_optimise_complete",
-            ei_value=float(best_val),
-            confidence_bound=cb,
-            confidence_bound_sigma=cb_sigma,
-            incumbent_g_best=float(acq._g_best),
+            "bo_acquisition_optimise",
+            lam=self.lam,
+            n_restarts=self.n_restarts,
+            n_obs=len(self._X),
+            acq_timeout_sec=self.acq_timeout_sec,
         )
-        x_orig = self.dataset.to_original(np.asarray(best_x_unit))
+        seed = self.seed + len(self._X)
 
-        del acq, solver
+        # Build acq in parent for post-hoc confidence-bound logging only.
+        # The actual SQP runs in the subprocess with a freshly-rebuilt acq.
+        t0 = _time.perf_counter()
+        acq = self._build_acquisition()
+        t_acq = _time.perf_counter() - t0
+
+        # Serialise GP state + solver params, dispatch SQP to subprocess.
+        t0 = _time.perf_counter()
+        payload = serialise_acq_payload(self, seed=seed)
+        t_payload = _time.perf_counter() - t0
+        t0 = _time.perf_counter()
+        best_x_unit_np, best_val, status, detail = run_maximise_with_timeout(
+            payload, self.acq_timeout_sec
+        )
+        t_max = _time.perf_counter() - t0
+
+        if status == "ok":
+            logger.info(
+                "bo_suggest_next_timings",
+                build_acq_sec=round(t_acq, 3),
+                serialise_payload_sec=round(t_payload, 3),
+                subprocess_maximise_sec=round(t_max, 3),
+            )
+            best_x_unit = jnp.asarray(best_x_unit_np, dtype=jnp.float64)
+            # Predicted confidence-bound g(x) = mu - lam·sigma at the chosen
+            # point, in the original (un-standardised) target space —
+            # `_ei_g_stats` undoes the GP-target scaling internally.
+            e_g, var_g = _ei_g_stats(
+                best_x_unit[None, :],
+                acq.gp_mu_state,
+                acq.gp_log_var_state,
+                acq.scaling,
+                acq.round_info,
+                acq.mu_kernel_kind,
+                acq.lv_kernel_kind,
+            )
+            cb = float(e_g[0])
+            cb_sigma = float(jnp.sqrt(jnp.clip(var_g[0], 0.0, None)))
+            logger.info(
+                "bo_acquisition_optimise_complete",
+                ei_value=float(best_val),
+                confidence_bound=cb,
+                confidence_bound_sigma=cb_sigma,
+                incumbent_g_best=float(acq._g_best),
+            )
+            x_orig = self.dataset.to_original(np.asarray(best_x_unit_np))
+        else:
+            # status ∈ {"timeout", "no_feasible", "error"} — fall back to a
+            # fresh Sobol point in the original bounds. Distinct seed each
+            # fallback so we don't repeat the same point under retry.
+            logger.warning(
+                "bo_acquisition_fallback",
+                status=status,
+                detail=detail,
+                elapsed_sec=round(t_max, 3),
+            )
+            fallback_seed = self.seed + 1000003 * (len(self._X) + 1)
+            x_orig = sobol_sample(self.bounds, 1, seed=fallback_seed)[0]
+            logger.info(
+                "bo_acquisition_optimise_complete",
+                ei_value=float("nan"),
+                confidence_bound=float("nan"),
+                confidence_bound_sigma=float("nan"),
+                incumbent_g_best=float(acq._g_best),
+                fallback_status=status,
+            )
+
+        del acq
         # No `clear_jax_caches()` — observations are padded to `n_max`
         # so the JIT cache is shape-stable across BO iterations and
         # reusing it is the whole point.
@@ -378,6 +456,7 @@ class MeanVarBayesopt(BaseBayesopt):
             pow_sobol=self.pow_sobol,
             n_restarts=self.n_restarts,
             sqp_config=self.sqp_config,
+            max_screen_batches=self.max_screen_batches,
         )
 
 
@@ -464,6 +543,8 @@ class ConstrainedBayesopt(MeanVarBayesopt):
             pow_sobol=self.pow_sobol,
             n_restarts=self.n_restarts,
             sqp_config=self.sqp_config,
+            feasible_screen=self.feasible_screen,
+            max_screen_batches=self.max_screen_batches,
         )
 
     def _best_observed(self) -> tuple[np.ndarray, float]:
