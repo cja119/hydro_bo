@@ -349,10 +349,22 @@ class MixedIntNLP(NLPBase):
         D_red = D - len(cat)
         batch_fn = acq.acq_batch_masked_fn(cat)
 
+        # Skip combos whose feasible-screen exhausts (no candidate with feas>=0
+        # under this combo's cat-fixing). The feasible region is often
+        # concentrated in a subset of cat-combinations and demanding feasible
+        # starts for every combo would defeat the BO whenever any single
+        # combo is infeasible. We only raise NoFeasibleScreenError at the end
+        # if NO combo found anything — then the BO falls back to a fresh Sobol
+        # point upstream.
         starts, ps, scores = [], [], []
+        n_combos_skipped = 0
         for combo in combos:
             mv = jnp.asarray(combo, dtype=jnp.float64)
-            cand, sc = self._sobol_screen(acq, D_red, batch_fn, extra_args=(mv,))
+            try:
+                cand, sc = self._sobol_screen(acq, D_red, batch_fn, extra_args=(mv,))
+            except NoFeasibleScreenError:
+                n_combos_skipped += 1
+                continue
             starts.append(np.asarray(cand))
             ps.append(
                 np.broadcast_to(
@@ -361,6 +373,28 @@ class MixedIntNLP(NLPBase):
                 ).copy()
             )
             scores.append(np.asarray(sc))
+
+        if not starts:
+            logger.warning(
+                "build_starts_all_combos_infeasible",
+                n_combos=len(combos),
+                n_combos_skipped=n_combos_skipped,
+                message="No cat combo has feasible Sobol candidates; raising "
+                        "NoFeasibleScreenError so the BO falls back to a fresh "
+                        "Sobol point.",
+            )
+            raise NoFeasibleScreenError(
+                f"All {len(combos)} cat-combos exhausted the feasible screen — "
+                "the chance bound is unsatisfiable per the current GP."
+            )
+
+        if n_combos_skipped > 0:
+            logger.info(
+                "build_starts_combos_skipped",
+                n_combos_total=len(combos),
+                n_combos_with_feasible=len(combos) - n_combos_skipped,
+                n_combos_skipped=n_combos_skipped,
+            )
 
         return (
             jnp.asarray(np.concatenate(starts, 0), dtype=jnp.float64),
