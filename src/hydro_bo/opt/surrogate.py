@@ -24,14 +24,29 @@ def _project_integer_dims(X, round_info):
     return X
 
 
+def _warp_kumaraswamy(X, log_a, log_b, warp_mask):
+    """Per-dim Kumaraswamy CDF warp: w(x) = 1 − (1 − x^a)^b. `warp_mask`
+    (length-d, 0/1) gates which dims are warped; non-warped dims pass
+    through. Held fixed at fit time via `stop_gradient`."""
+    eps = 1e-7
+    warp_mask = jax.lax.stop_gradient(warp_mask)
+    a = jnp.exp(log_a)
+    b = jnp.exp(log_b)
+    X_safe = jnp.clip(X, eps, 1.0 - eps)
+    W = 1.0 - jnp.power(1.0 - jnp.power(X_safe, a), b)
+    return jnp.where(warp_mask, W, X)
+
+
 _KERNEL_KINDS = ("rbf", "matern12", "matern52")
 
 
 @partial(jax.jit, static_argnames=("round_info", "kernel_kind"))
-def _kernel(log_amp, log_ls, X1, X2, round_info, kernel_kind):
+def _kernel(log_amp, log_ls, log_a, log_b, warp_mask, X1, X2, round_info, kernel_kind):
     """ARD kernel dispatcher with optional projection of integer dims
-    onto a discrete unit-cube grid. `kernel_kind` is a static Python
-    string. round_info is a static Python tuple — empty skips projection.
+    onto a discrete unit-cube grid, then per-dim Kumaraswamy input warp
+    on the dims selected by `warp_mask`. `kernel_kind` is a static
+    Python string. round_info is a static Python tuple — empty skips
+    projection.
 
     Kernels (all with ARD per-dim length scales):
       - `"rbf"`      : squared-exponential, C^∞. Smoothest; for smooth
@@ -47,6 +62,8 @@ def _kernel(log_amp, log_ls, X1, X2, round_info, kernel_kind):
     if round_info:
         X1 = _project_integer_dims(X1, round_info)
         X2 = _project_integer_dims(X2, round_info)
+    X1 = _warp_kumaraswamy(X1, log_a, log_b, warp_mask)
+    X2 = _warp_kumaraswamy(X2, log_a, log_b, warp_mask)
     amp2 = jnp.exp(2.0 * log_amp)
     ls = jnp.exp(log_ls)
     diff = (X1[:, None, :] - X2[None, :, :]) / ls
@@ -70,7 +87,10 @@ def _kernel(log_amp, log_ls, X1, X2, round_info, kernel_kind):
     raise ValueError(f"unknown kernel_kind: {kernel_kind!r}; expected one of {_KERNEL_KINDS}")
 
 
-def _build_K_masked(log_amp, log_ls, X, mask, noise, jitter, round_info, kernel_kind):
+def _build_K_masked(
+    log_amp, log_ls, log_a, log_b, warp_mask, X, mask, noise, jitter,
+    round_info, kernel_kind,
+):
     """Build the (n_max, n_max) kernel matrix with padded rows/cols
     replaced by an identity block.
 
@@ -83,7 +103,7 @@ def _build_K_masked(log_amp, log_ls, X, mask, noise, jitter, round_info, kernel_
     are zero when y_c is masked, so prediction-time formulas need only
     mask the variance summation over training rows."""
     n_max = X.shape[0]
-    K = _kernel(log_amp, log_ls, X, X, round_info, kernel_kind)
+    K = _kernel(log_amp, log_ls, log_a, log_b, warp_mask, X, X, round_info, kernel_kind)
     M2 = mask[:, None] * mask[None, :]
     K = K * M2  # zero cross-terms involving any padded row/col
     diag_real = mask * (noise + jitter)  # noise+jitter on real diagonal
@@ -91,8 +111,11 @@ def _build_K_masked(log_amp, log_ls, X, mask, noise, jitter, round_info, kernel_
     return K + jnp.diag(diag_real + diag_padded)
 
 
-def _neg_log_hyper_prior(log_amp, log_ls, alpha_ls, beta_ls, alpha_amp, beta_amp):
-    """Negative log prior on (amp, ls) for type-II MAP estimation.
+def _neg_log_hyper_prior(
+    log_amp, log_ls, log_a, log_b, warp_mask,
+    alpha_ls, beta_ls, alpha_amp, beta_amp, warp_scale,
+):
+    """Negative log prior on (amp, ls, a, b) for type-II MAP estimation.
 
     Gamma priors on the natural-space (amp, ls) parameters, with the
     change-of-variable jacobian for the log-space optimisation. For ls ~
@@ -108,8 +131,13 @@ def _neg_log_hyper_prior(log_amp, log_ls, alpha_ls, beta_ls, alpha_amp, beta_amp
     avoiding the runaway-to-infinity pathology under type-II MLE; the
     amp prior is light and mostly there for numerical stability.
 
-    Set alpha=beta=0 on a parameter to disable its prior entirely
-    (recovers the unpenalised MLE/ELBO).
+    The Kumaraswamy warp parameters get a LogNormal(0, warp_scale) prior
+    centred at identity warping (a = b = 1, i.e. log_a = log_b = 0) on
+    the warped dims only — non-warped dims contribute zero so they sit
+    wherever the optimiser leaves them (a no-op via stop_gradient).
+
+    Set alpha=beta=0 (or warp_scale=0) on a parameter to disable its
+    prior entirely (recovers the unpenalised MLE/ELBO).
     """
     # ls prior: sum over ARD dims of -α·log_ls + β·exp(log_ls)
     neg_log_ls_prior = jnp.where(
@@ -123,12 +151,18 @@ def _neg_log_hyper_prior(log_amp, log_ls, alpha_ls, beta_ls, alpha_amp, beta_amp
         -alpha_amp * log_amp + beta_amp * jnp.exp(log_amp),
         0.0,
     )
-    return neg_log_ls_prior + neg_log_amp_prior
+    # warp prior: LogNormal(0, warp_scale) on a, b for warped dims only
+    neg_log_warp_prior = jnp.where(
+        warp_scale > 0,
+        0.5 * jnp.sum(warp_mask * (log_a**2 + log_b**2)) / (warp_scale**2),
+        0.0,
+    )
+    return neg_log_ls_prior + neg_log_amp_prior + neg_log_warp_prior
 
 
 @partial(jax.jit, static_argnames=("round_info", "kernel_kind"))
 def _neg_mll(params, X, y, noise, mask, jitter,
-             alpha_ls, beta_ls, alpha_amp, beta_amp,
+             alpha_ls, beta_ls, alpha_amp, beta_amp, warp_scale,
              round_info, kernel_kind):
     """Masked NMLL + neg-log-prior on hyperparameters (type-II MAP).
     Observations on `mask == 1` rows count, padded rows contribute a
@@ -138,6 +172,9 @@ def _neg_mll(params, X, y, noise, mask, jitter,
     K = _build_K_masked(
         params["log_amp"],
         params["log_ls"],
+        params["log_a"],
+        params["log_b"],
+        params["warp_mask"],
         X,
         mask,
         noise,
@@ -152,7 +189,9 @@ def _neg_mll(params, X, y, noise, mask, jitter,
     n_real = jnp.sum(mask)
     nmll = 0.5 * (jnp.dot(y_c, alpha) + log_det + n_real * jnp.log(2.0 * jnp.pi))
     prior = _neg_log_hyper_prior(
-        params["log_amp"], params["log_ls"], alpha_ls, beta_ls, alpha_amp, beta_amp,
+        params["log_amp"], params["log_ls"],
+        params["log_a"], params["log_b"], params["warp_mask"],
+        alpha_ls, beta_ls, alpha_amp, beta_amp, warp_scale,
     )
     return nmll + prior
 
@@ -162,6 +201,9 @@ def _factorise(params, X, y, noise, mask, jitter, round_info, kernel_kind):
     K = _build_K_masked(
         params["log_amp"],
         params["log_ls"],
+        params["log_a"],
+        params["log_b"],
+        params["warp_mask"],
         X,
         mask,
         noise,
@@ -181,7 +223,9 @@ def _predict(params, X_train, L, alpha, mean, mask, X_test, round_info, kernel_k
     variance summation; padded contributions to the mean are already
     zero because `alpha[padded] == 0`."""
     K_s = _kernel(
-        params["log_amp"], params["log_ls"], X_test, X_train, round_info, kernel_kind,
+        params["log_amp"], params["log_ls"],
+        params["log_a"], params["log_b"], params["warp_mask"],
+        X_test, X_train, round_info, kernel_kind,
     )
     amp2 = jnp.exp(2.0 * params["log_amp"])
     mu = mean + K_s @ alpha
@@ -219,7 +263,9 @@ def _vi_inner_loop(
     # Masked K: real-real block has the kernel + jitter on diag; padded
     # block is identity. Cross-terms zeroed.
     K = _build_K_masked(
-        params["log_amp"], params["log_ls"], X, mask,
+        params["log_amp"], params["log_ls"],
+        params["log_a"], params["log_b"], params["warp_mask"],
+        X, mask,
         jnp.zeros(n_max, dtype=X.dtype), jitter, round_info, kernel_kind,
     )
     kappa = (k - N / 2.0) * mask  # zero on padded
@@ -266,7 +312,7 @@ def _vi_inner_loop(
 @partial(jax.jit, static_argnames=("round_info", "vi_max_iters", "vi_tol", "kernel_kind"))
 def _neg_elbo(
     params, X, k, N, mask, jitter,
-    alpha_ls, beta_ls, alpha_amp, beta_amp,
+    alpha_ls, beta_ls, alpha_amp, beta_amp, warp_scale,
     round_info, vi_max_iters, vi_tol, kernel_kind,
 ):
     """Negative ELBO for PG-augmented Binomial GP + neg-log-prior on
@@ -286,7 +332,9 @@ def _neg_elbo(
     # 2. Masked kernel — same trick as the heteroscedastic path.
     n_max = X.shape[0]
     K = _build_K_masked(
-        params["log_amp"], params["log_ls"], X, mask,
+        params["log_amp"], params["log_ls"],
+        params["log_a"], params["log_b"], params["warp_mask"],
+        X, mask,
         jnp.zeros(n_max, dtype=X.dtype), jitter, round_info, kernel_kind,
     )
 
@@ -320,7 +368,9 @@ def _neg_elbo(
 
     elbo = expected_loglik - gaussian_kl - pg_kl
     prior = _neg_log_hyper_prior(
-        params["log_amp"], params["log_ls"], alpha_ls, beta_ls, alpha_amp, beta_amp,
+        params["log_amp"], params["log_ls"],
+        params["log_a"], params["log_b"], params["warp_mask"],
+        alpha_ls, beta_ls, alpha_amp, beta_amp, warp_scale,
     )
     return -elbo + prior
 
@@ -405,6 +455,12 @@ class HeteroscedasticGP(BaseGP):
         prior_ls_beta: float = 6.0,
         prior_amp_alpha: float = 2.0,
         prior_amp_beta: float = 0.5,
+        # Input warping (Snoek et al. 2014): Kumaraswamy CDF per dim on
+        # those listed in `warp_dims`. `prior_warp_scale` is the scale of
+        # a LogNormal(0, scale) prior on log_a / log_b centred at identity
+        # warping. `warp_dims=()` disables warping (default identity).
+        warp_dims: tuple = (),
+        prior_warp_scale: float = 0.5,
     ):
         if kernel_kind not in _KERNEL_KINDS:
             raise ValueError(
@@ -420,6 +476,8 @@ class HeteroscedasticGP(BaseGP):
         self.prior_ls_beta = float(prior_ls_beta)
         self.prior_amp_alpha = float(prior_amp_alpha)
         self.prior_amp_beta = float(prior_amp_beta)
+        self.warp_dims = tuple(int(i) for i in warp_dims)
+        self.prior_warp_scale = float(prior_warp_scale)
         self.params = None
         self._X = None
         self._L = None
@@ -472,17 +530,27 @@ class HeteroscedasticGP(BaseGP):
         )
 
         # Warm start from previous converged params if available; cold
-        # start otherwise.
+        # start otherwise. `warp_mask` is rebuilt from current `warp_dims`
+        # every fit so toggling warping mid-run doesn't carry stale state.
+        warp_mask = jnp.zeros(d, dtype=jnp.float64)
+        for i in self.warp_dims:
+            warp_mask = warp_mask.at[i].set(1.0)
         if self.params is not None and self.params["log_ls"].shape[0] == d:
             init = {
                 "log_amp": self.params["log_amp"],
                 "log_ls": self.params["log_ls"],
+                "log_a": self.params.get("log_a", jnp.zeros(d, dtype=jnp.float64)),
+                "log_b": self.params.get("log_b", jnp.zeros(d, dtype=jnp.float64)),
+                "warp_mask": warp_mask,
                 "mean": self.params["mean"],
             }
         else:
             init = {
                 "log_amp": jnp.array(0.0, dtype=jnp.float64),
                 "log_ls": jnp.zeros(d, dtype=jnp.float64),
+                "log_a": jnp.zeros(d, dtype=jnp.float64),
+                "log_b": jnp.zeros(d, dtype=jnp.float64),
+                "warp_mask": warp_mask,
                 "mean": jnp.array(float(np.mean(np.asarray(y_real))), dtype=jnp.float64),
             }
 
@@ -490,12 +558,13 @@ class HeteroscedasticGP(BaseGP):
         beta_ls = jnp.asarray(self.prior_ls_beta, dtype=jnp.float64)
         alpha_amp = jnp.asarray(self.prior_amp_alpha, dtype=jnp.float64)
         beta_amp = jnp.asarray(self.prior_amp_beta, dtype=jnp.float64)
+        warp_scale = jnp.asarray(self.prior_warp_scale, dtype=jnp.float64)
 
         nmll = partial(_neg_mll, round_info=round_info, kernel_kind=self.kernel_kind)
         solver = LBFGS(fun=nmll, maxiter=self.lbfgs_max_iter)
         result = solver.run(
             init, X_padded, y_padded, noise_padded, mask, jitter,
-            alpha_ls, beta_ls, alpha_amp, beta_amp,
+            alpha_ls, beta_ls, alpha_amp, beta_amp, warp_scale,
         )
 
         self._release_buffers()
@@ -567,6 +636,9 @@ class BinomialGP(BaseGP):
         prior_ls_beta: float = 6.0,
         prior_amp_alpha: float = 2.0,
         prior_amp_beta: float = 0.5,
+        # Input warping — see `HeteroscedasticGP` for parameter meaning.
+        warp_dims: tuple = (),
+        prior_warp_scale: float = 0.5,
     ):
         if kernel_kind not in _KERNEL_KINDS:
             raise ValueError(
@@ -584,6 +656,8 @@ class BinomialGP(BaseGP):
         self.prior_ls_beta = float(prior_ls_beta)
         self.prior_amp_alpha = float(prior_amp_alpha)
         self.prior_amp_beta = float(prior_amp_beta)
+        self.warp_dims = tuple(int(i) for i in warp_dims)
+        self.prior_warp_scale = float(prior_warp_scale)
         self.params = None
         self._X = None
         self._L = None
@@ -611,21 +685,31 @@ class BinomialGP(BaseGP):
         mask = jnp.concatenate([jnp.ones(n_real), jnp.zeros(pad_n)]).astype(jnp.float64)
 
         # Warm start if available; cold start otherwise.
+        warp_mask = jnp.zeros(d, dtype=jnp.float64)
+        for i in self.warp_dims:
+            warp_mask = warp_mask.at[i].set(1.0)
         if self.params is not None and self.params["log_ls"].shape[0] == d:
             init = {
                 "log_amp": self.params["log_amp"],
                 "log_ls": self.params["log_ls"],
+                "log_a": self.params.get("log_a", jnp.zeros(d, dtype=jnp.float64)),
+                "log_b": self.params.get("log_b", jnp.zeros(d, dtype=jnp.float64)),
+                "warp_mask": warp_mask,
             }
         else:
             init = {
                 "log_amp": jnp.array(0.0, dtype=jnp.float64),
                 "log_ls": jnp.zeros(d, dtype=jnp.float64),
+                "log_a": jnp.zeros(d, dtype=jnp.float64),
+                "log_b": jnp.zeros(d, dtype=jnp.float64),
+                "warp_mask": warp_mask,
             }
 
         alpha_ls = jnp.asarray(self.prior_ls_alpha, dtype=jnp.float64)
         beta_ls = jnp.asarray(self.prior_ls_beta, dtype=jnp.float64)
         alpha_amp = jnp.asarray(self.prior_amp_alpha, dtype=jnp.float64)
         beta_amp = jnp.asarray(self.prior_amp_beta, dtype=jnp.float64)
+        warp_scale = jnp.asarray(self.prior_warp_scale, dtype=jnp.float64)
 
         nelbo = partial(
             _neg_elbo,
@@ -637,7 +721,7 @@ class BinomialGP(BaseGP):
         solver = LBFGS(fun=nelbo, maxiter=self.lbfgs_max_iter)
         result = solver.run(
             init, X_padded, k_padded, N_padded, mask, jitter,
-            alpha_ls, beta_ls, alpha_amp, beta_amp,
+            alpha_ls, beta_ls, alpha_amp, beta_amp, warp_scale,
         )
 
         self._release_buffers()
