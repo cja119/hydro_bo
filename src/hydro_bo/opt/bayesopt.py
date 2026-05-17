@@ -404,6 +404,8 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         z_sc: float = 1.6449,  # Φ⁻¹(0.95) — pass directly as z-score, not as a probability.
         l1_penalty: float = 1.0,
         gp_bin_kernel: str = "matern12",
+        gp_bin_warp_dims: tuple = (),
+        gp_bin_prior_warp_scale: float = 0.5,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -411,11 +413,15 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         self.z_sc = float(z_sc)
         self.l1_penalty = float(l1_penalty)
         self.gp_bin_kernel = str(gp_bin_kernel)
+        self.gp_bin_warp_dims = tuple(int(i) for i in gp_bin_warp_dims)
+        self.gp_bin_prior_warp_scale = float(gp_bin_prior_warp_scale)
         self.gp_bin = BinomialGP(
             pad_initial=self.pad_initial,
             lbfgs_max_iter=self.gp_lbfgs_max_iter,
             seed=self.seed + 2,
             kernel_kind=self.gp_bin_kernel,
+            warp_dims=self.gp_bin_warp_dims,
+            prior_warp_scale=self.gp_bin_prior_warp_scale,
         )
 
     def _fit_surrogates(self) -> None:
