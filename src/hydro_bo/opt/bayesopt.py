@@ -404,13 +404,11 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         z_sc: float = 1.6449,  # Φ⁻¹(0.95) — pass directly as z-score, not as a probability.
         l1_penalty: float = 1.0,
         gp_bin_kernel: str = "matern12",
-        # Stuck-risk thresholds on the BinomialGP. If any of these trip
-        # after a fit, the chance-constrained SQP phase is skipped for
-        # that BO iter and the optimiser falls back to unconstrained EI
-        # on the mu / log-var GPs (the chance constraint carries no
-        # signal anyway when these trigger).
+        # Stuck-risk threshold on the BinomialGP. If g(x) varies by less
+        # than this across a Sobol pool, the chance-constrained SQP
+        # phase is skipped for that BO iter and the optimiser falls back
+        # to unconstrained EI on the mu / log-var GPs.
         stuck_g_range_min: float = 0.1,
-        stuck_sigma_ratio_min: float = 1.5,
         stuck_pool_pow: int = 10,  # 2^10 = 1024 candidates
         **kwargs,
     ):
@@ -420,7 +418,6 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         self.l1_penalty = float(l1_penalty)
         self.gp_bin_kernel = str(gp_bin_kernel)
         self.stuck_g_range_min = float(stuck_g_range_min)
-        self.stuck_sigma_ratio_min = float(stuck_sigma_ratio_min)
         self.stuck_pool_pow = int(stuck_pool_pow)
         self._stuck_skip: bool = False
         self.gp_bin = BinomialGP(
@@ -490,32 +487,19 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         g = mu - self.z_sc * sigma - log_p_targ
 
         g_range = float(g.max() - g.min())
-        sigma_ratio = float(sigma.max() / jnp.maximum(sigma.min(), 1e-12))
         sigma_mean = float(sigma.mean())
 
-        flat_g = g_range < self.stuck_g_range_min
-        flat_sigma = sigma_ratio < self.stuck_sigma_ratio_min
-        self._stuck_skip = bool(flat_g or flat_sigma)
+        self._stuck_skip = bool(g_range < self.stuck_g_range_min)
 
         if self._stuck_skip:
-            reasons = []
-            if flat_g:
-                reasons.append(
-                    f"g_range={g_range:.3g}<{self.stuck_g_range_min:g}"
-                )
-            if flat_sigma:
-                reasons.append(
-                    f"sigma_ratio={sigma_ratio:.3g}<{self.stuck_sigma_ratio_min:g}"
-                )
             logger.warning(
                 "bo_constraint_phase_skipped",
-                reason=" & ".join(reasons),
+                reason=f"g_range={g_range:.3g}<{self.stuck_g_range_min:g}",
                 message=(
                     "BinomialGP constraint surface is too flat to drive SQP; "
                     "falling back to unconstrained EI for this BO iter."
                 ),
                 g_range=g_range,
-                sigma_ratio=sigma_ratio,
                 sigma_mean=sigma_mean,
                 n_pool=n_pool,
             )
@@ -523,7 +507,6 @@ class ConstrainedBayesopt(MeanVarBayesopt):
             logger.info(
                 "bo_constraint_phase_diag",
                 g_range=g_range,
-                sigma_ratio=sigma_ratio,
                 sigma_mean=sigma_mean,
                 n_pool=n_pool,
             )

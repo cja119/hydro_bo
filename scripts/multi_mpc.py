@@ -119,6 +119,7 @@ def run_multisim(cfg: Config, args: argparse.Namespace):
                     walltime_seconds=walltime_seconds, buffer_seconds=buffer_seconds)
 
     scores = dispatcher.run_multisim(deadline=deadline)
+    total_tonnes = list(dispatcher.last_total_tonnes)
 
     scores_arr = np.array(scores, dtype=float) if scores else np.array([], dtype=float)
     finite_mask = np.isfinite(scores_arr)
@@ -132,12 +133,30 @@ def run_multisim(cfg: Config, args: argparse.Namespace):
         mean_score = float("nan")
         var_score  = float("nan")
 
+    # `total_tonnes` is the sum over the simulated year of stored +
+    # shipped vector mass in the env's native unit. Treat values from
+    # failed runs (score is NaN) as missing for the production stats.
+    tonnes_arr = np.array(total_tonnes, dtype=float) if total_tonnes else np.array([], dtype=float)
+    tonnes_finite = tonnes_arr[finite_mask] if tonnes_arr.size == finite_mask.size else tonnes_arr
+    kg_finite = tonnes_finite * 1000.0
+    if kg_finite.size > 0:
+        kg_mean = float(kg_finite.mean())
+        kg_var = float(kg_finite.var())
+        kg_min = float(kg_finite.min())
+        kg_max = float(kg_finite.max())
+    else:
+        kg_mean = kg_var = kg_min = kg_max = float("nan")
+
     logger.info("multi_mpc.complete",
                 n_workers=len(scores),
                 mean_score=mean_score,
                 var_score=var_score,
                 n_failed=n_failed,
-                scores=scores)
+                kg_h2eq_mean=kg_mean,
+                kg_h2eq_min=kg_min,
+                kg_h2eq_max=kg_max,
+                scores=scores,
+                total_tonnes=total_tonnes)
 
     result = {
         "timestamp": now.isoformat(),
@@ -151,7 +170,13 @@ def run_multisim(cfg: Config, args: argparse.Namespace):
         "n_failed": n_failed,
         "mean_score": mean_score,
         "var_score": var_score,
+        "kg_h2eq_mean": kg_mean,
+        "kg_h2eq_var": kg_var,
+        "kg_h2eq_min": kg_min,
+        "kg_h2eq_max": kg_max,
         "worker_scores": scores,
+        "worker_total_tonnes": total_tonnes,
+        "worker_kg_h2eq": [float(t) * 1000.0 for t in total_tonnes],
     }
 
     json_path = out_dir / f"results_{run_timestamp}.json"
@@ -162,20 +187,40 @@ def run_multisim(cfg: Config, args: argparse.Namespace):
     csv_path = out_dir / f"results_{run_timestamp}.csv"
     fieldnames = ["timestamp", "vector", "planning_model", "forecast_horizon",
                   "num_instances", "num_devices", "dynamic_price", "n_workers",
-                  "n_failed", "mean_score", "var_score"]
+                  "n_failed", "mean_score", "var_score",
+                  "kg_h2eq_mean", "kg_h2eq_var", "kg_h2eq_min", "kg_h2eq_max"]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerow({k: result[k] for k in fieldnames})
     logger.info("multi_mpc.csv_saved", path=str(csv_path))
 
+    workers_csv_path = out_dir / f"workers_{run_timestamp}.csv"
+    with open(workers_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["worker_idx", "score", "total_tonnes", "kg_h2eq"])
+        for i, (s, t) in enumerate(zip(scores, total_tonnes)):
+            writer.writerow([i, s, t, (float(t) * 1000.0 if t is not None else "")])
+    logger.info("multi_mpc.workers_csv_saved", path=str(workers_csv_path))
+
     import matplotlib.pyplot as plt
-    plt.hist(scores, bins=10)
-    plt.title(f"Distribution of MPC Scores — {g.vector}")
-    plt.xlabel("Score")
-    plt.ylabel("Frequency")
-    plot_path = out_dir / f"scores_{run_timestamp}.png"
-    plt.savefig(plot_path)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    axes[0].hist(finite_scores, bins=max(5, min(20, len(finite_scores) // 2 or 1)))
+    axes[0].set_title(f"MPC score (reward / tonne) — {g.vector}")
+    axes[0].set_xlabel("score [$/tonne]")
+    axes[0].set_ylabel("count")
+    axes[1].hist(kg_finite, bins=max(5, min(20, len(kg_finite) // 2 or 1)))
+    axes[1].set_title(f"Annual production — {g.vector}")
+    axes[1].set_xlabel("kg (H2-eq) per simulated year")
+    axes[1].set_ylabel("count")
+    if kg_finite.size:
+        axes[1].axvline(kg_finite.mean(), color="k", lw=1, ls="--",
+                        label=f"mean = {kg_finite.mean():.2e}")
+        axes[1].legend()
+    fig.tight_layout()
+    plot_path = out_dir / f"distribution_{run_timestamp}.png"
+    fig.savefig(plot_path, dpi=130)
+    plt.close(fig)
     logger.info("multi_mpc.plot_saved", path=str(plot_path))
 
 

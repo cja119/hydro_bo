@@ -45,7 +45,7 @@ nlp:
   sqp_max_line_search:  10           # septal default 30
   gp_mu_kernel:         rbf
   gp_log_var_kernel:    rbf
-  gp_bin_kernel:        matern12
+  gp_bin_kernel:        matern52
 
 unconstrained_bo:
   iter_budget:        500

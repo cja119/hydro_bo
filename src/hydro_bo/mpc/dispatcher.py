@@ -42,6 +42,9 @@ class RayMultiMPC:
             self._worker_log_dir = Path(log_dir) / "worker_logs"
             self._worker_log_dir.mkdir(parents=True, exist_ok=True)
 
+        # Populated by run_multisim — per-worker total_tonnes in env units.
+        self.last_total_tonnes: list = []
+
         if ray.is_initialized():
             ray.shutdown()
         ray.init(
@@ -69,10 +72,14 @@ class RayMultiMPC:
         tasks = [run_mpc.remote(self._env_args, id=f"iter_{i}", params=self._params, dump_diagnostics=self._dump_diagnostics, log_dir=worker_log_dir, master_seed=self._master_seed) for i in range(self._num_instances)]
         ref_to_idx = {ref: i for i, ref in enumerate(tasks)}
 
+        # Sentinel for cancelled / failed-ray-get rows. 4-tuple to match
+        # the worker return shape (success, score, total_tonnes, relax_info).
+        _FAILED = (False, None, 0.0, None)
+
         def _emit(idx, result):
             if progress_callback is None:
                 return
-            success, score, relax_info = result
+            success, score, _, relax_info = result
             try:
                 progress_callback(idx, success, score, relax_info)
             except Exception:
@@ -84,12 +91,12 @@ class RayMultiMPC:
                 result = ray.get([task])[0]
                 results.append(result)
                 _emit(i, result)
-                success, _, _ = result
+                success, _, _, _ = result
                 if not success:
                     logger.info("early_exit_on_failure", task_index=i, reason="Diagnostic dump requested")
                     for remaining_task in tasks[i+1:]:
                         ray.cancel(remaining_task)
-                        _emit(ref_to_idx[remaining_task], (False, None, None))
+                        _emit(ref_to_idx[remaining_task], _FAILED)
                     break
         elif deadline is not None:
             results = []
@@ -107,7 +114,7 @@ class RayMultiMPC:
                     except Exception:
                         # `None` (YAML/JSON null) marks the score field as a
                         # failed run — downstream consumers coerce to NaN.
-                        res = (False, None, None)
+                        res = _FAILED
                     results.append(res)
                     _emit(ref_to_idx[ref], res)
             if stopped_early:
@@ -115,9 +122,9 @@ class RayMultiMPC:
                 logger.info("deadline_reached", n_completed=len(results), n_cancelled=n_cancelled)
                 for ref in pending:
                     ray.cancel(ref)
-                    _emit(ref_to_idx[ref], (False, None, None))
+                    _emit(ref_to_idx[ref], _FAILED)
                 # Pad with failure entries for cancelled tasks
-                results.extend([(False, None, None)] * n_cancelled)
+                results.extend([_FAILED] * n_cancelled)
         elif progress_callback is not None:
             results = []
             pending = list(tasks)
@@ -127,17 +134,22 @@ class RayMultiMPC:
                     try:
                         res = ray.get(ref)
                     except Exception:
-                        res = (False, None, None)
+                        res = _FAILED
                     results.append(res)
                     _emit(ref_to_idx[ref], res)
         else:
             results = ray.get(tasks)
 
-        scores = [score for _, score, _ in results]
-        n_success = sum(1 for success, _, _ in results if success)
+        scores = [score for _, score, _, _ in results]
+        # Per-worker total_tonnes (raw env units; see ShippingEnv for unit
+        # semantics). Stashed for callers that want the distribution
+        # (e.g., scripts/multi_mpc.py); `run_multisim` still returns
+        # scores for backward compat with the BO scripts.
+        self.last_total_tonnes = [t for _, _, t, _ in results]
+        n_success = sum(1 for success, _, _, _ in results if success)
 
         all_relaxations = []
-        for _, _, relax_info in results:
+        for _, _, _, relax_info in results:
             if relax_info and 'relaxations_used' in relax_info:
                 all_relaxations.extend(relax_info['relaxations_used'])
 
@@ -242,7 +254,7 @@ def run_mpc(env_args, id, params, dump_diagnostics=False, log_dir=None, master_s
                 # Zero tonnes shipped → degenerate run, marked as a failure
                 # via `None` so it's distinguishable from a finite low score.
                 score = total_reward / total_tonnes if total_tonnes > 0 else None
-                return True, score, relaxation_info
+                return True, score, total_tonnes, relaxation_info
 
     except Exception as e:
         print(
@@ -267,4 +279,4 @@ def run_mpc(env_args, id, params, dump_diagnostics=False, log_dir=None, master_s
             except Exception as diag_error:
                 print(f"[Worker {id}] Failed to save diagnostics: {diag_error}", file=sys.stderr, flush=True)
 
-        return False, None, relaxation_info
+        return False, None, total_tonnes, relaxation_info
