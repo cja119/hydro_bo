@@ -52,7 +52,8 @@ class Dynamics:
 
     def _init_weather_data(self, seed):
         weather_file = self._args["weather_data"]["weather_file"]
-        self._weather_data = GetData([weather_file]).data()
+        keys = list(weather_file) if isinstance(weather_file, (list, tuple)) else [weather_file]
+        self._weather_data = GetData(keys).data()
         self._weather_data = temporal_align(self._weather_data, randomise=True, seed=seed)
 
     def _init_state_variables(self):
