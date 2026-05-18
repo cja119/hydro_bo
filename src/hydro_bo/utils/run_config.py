@@ -69,8 +69,6 @@ class NlpCfg:
     gp_mu_kernel: str
     gp_log_var_kernel: str
     gp_bin_kernel: str
-    gp_bin_warp_dims: tuple  # tuple of dim indices into PARAM_KEYS; () disables warping
-    gp_bin_prior_warp_scale: float
     sqp_osqp_max_iter: int
     sqp_osqp_tol: float
     sqp_max_line_search: int
@@ -139,40 +137,6 @@ def _resolve_kernel_kind(raw, *, key: str) -> str:
             f"nlp.{key}: unknown kernel {raw!r}; expected one of {_VALID_KERNEL_KINDS}."
         )
     return s
-
-
-def _resolve_warp_dims(raw, *, key: str) -> tuple:
-    """Resolve `nlp.<key>` into a tuple of PARAM_KEYS indices.
-
-    Accepted forms:
-      - None / [] / "none"        → ()                (warping off)
-      - "all"                     → all dims
-      - "continuous"              → non-integer dims (PARAM_KEYS \\ INTEGER_KEYS)
-      - list of PARAM_KEYS names  → explicit dim indices
-    """
-    from hydro_bo.utils.search_space import PARAM_KEYS, INTEGER_KEYS
-    if raw is None or raw == [] or (isinstance(raw, str) and raw.strip().lower() == "none"):
-        return ()
-    if isinstance(raw, str):
-        s = raw.strip().lower()
-        if s == "all":
-            return tuple(range(len(PARAM_KEYS)))
-        if s == "continuous":
-            return tuple(i for i, k in enumerate(PARAM_KEYS) if k not in INTEGER_KEYS)
-        raise ValueError(
-            f"nlp.{key}: unknown sentinel {raw!r}; expected 'all', 'continuous', "
-            "'none', or a list of PARAM_KEYS names."
-        )
-    if not isinstance(raw, (list, tuple)):
-        raise ValueError(f"nlp.{key}: expected list of names or sentinel string, got {type(raw).__name__}.")
-    out: list[int] = []
-    for name in raw:
-        if name not in PARAM_KEYS:
-            raise ValueError(
-                f"nlp.{key}: {name!r} is not in PARAM_KEYS ({list(PARAM_KEYS)})."
-            )
-        out.append(PARAM_KEYS.index(name))
-    return tuple(out)
 
 
 def _resolve_n_devices(raw) -> int:
@@ -292,12 +256,6 @@ def load_config(
             gp_bin_kernel=_resolve_kernel_kind(
                 raw["nlp"].get("gp_bin_kernel") or "matern12",
                 key="gp_bin_kernel",
-            ),
-            gp_bin_warp_dims=_resolve_warp_dims(
-                raw["nlp"].get("gp_bin_warp_dims"), key="gp_bin_warp_dims",
-            ),
-            gp_bin_prior_warp_scale=float(
-                raw["nlp"].get("gp_bin_prior_warp_scale", 0.5)
             ),
         ),
         unconstrained_bo=UnconstrainedCfg(
