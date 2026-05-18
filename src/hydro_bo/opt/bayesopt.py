@@ -404,6 +404,11 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         z_sc: float = 1.6449,  # Φ⁻¹(0.95) — pass directly as z-score, not as a probability.
         l1_penalty: float = 1.0,
         gp_bin_kernel: str = "matern12",
+        # Jeffreys-style label smoothing on (k, N): (k+α, N+2α). Pulls
+        # saturated rows back from latent ±∞ — empirically the cause of
+        # the cliff-like chance constraint that breaks SQP on
+        # near-binary feasibility data.
+        gp_bin_label_smoothing: float = 0.0,
         # Stuck-risk threshold on the BinomialGP. If g(x) varies by less
         # than this across a Sobol pool, the chance-constrained SQP
         # phase is skipped for that BO iter and the optimiser falls back
@@ -417,6 +422,7 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         self.z_sc = float(z_sc)
         self.l1_penalty = float(l1_penalty)
         self.gp_bin_kernel = str(gp_bin_kernel)
+        self.gp_bin_label_smoothing = float(gp_bin_label_smoothing)
         self.stuck_g_range_min = float(stuck_g_range_min)
         self.stuck_pool_pow = int(stuck_pool_pow)
         self._stuck_skip: bool = False
@@ -425,6 +431,7 @@ class ConstrainedBayesopt(MeanVarBayesopt):
             lbfgs_max_iter=self.gp_lbfgs_max_iter,
             seed=self.seed + 2,
             kernel_kind=self.gp_bin_kernel,
+            label_smoothing=self.gp_bin_label_smoothing,
         )
 
     def _fit_surrogates(self) -> None:
