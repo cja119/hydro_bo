@@ -443,8 +443,6 @@ def main():
         gp_mu_kernel=cfg.nlp.gp_mu_kernel,
         gp_log_var_kernel=cfg.nlp.gp_log_var_kernel,
         gp_bin_kernel=cfg.nlp.gp_bin_kernel,
-        gp_bin_warp_dims=cfg.nlp.gp_bin_warp_dims,
-        gp_bin_prior_warp_scale=cfg.nlp.gp_bin_prior_warp_scale,
     )
 
     sobol_dir = resolve_sobol_dir(c.sobol_dir, SCRIPTS_DIR, g.vector)

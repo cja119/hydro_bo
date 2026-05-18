@@ -404,8 +404,14 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         z_sc: float = 1.6449,  # Φ⁻¹(0.95) — pass directly as z-score, not as a probability.
         l1_penalty: float = 1.0,
         gp_bin_kernel: str = "matern12",
-        gp_bin_warp_dims: tuple = (),
-        gp_bin_prior_warp_scale: float = 0.5,
+        # Stuck-risk thresholds on the BinomialGP. If any of these trip
+        # after a fit, the chance-constrained SQP phase is skipped for
+        # that BO iter and the optimiser falls back to unconstrained EI
+        # on the mu / log-var GPs (the chance constraint carries no
+        # signal anyway when these trigger).
+        stuck_g_range_min: float = 0.1,
+        stuck_sigma_ratio_min: float = 1.5,
+        stuck_pool_pow: int = 10,  # 2^10 = 1024 candidates
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -413,15 +419,15 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         self.z_sc = float(z_sc)
         self.l1_penalty = float(l1_penalty)
         self.gp_bin_kernel = str(gp_bin_kernel)
-        self.gp_bin_warp_dims = tuple(int(i) for i in gp_bin_warp_dims)
-        self.gp_bin_prior_warp_scale = float(gp_bin_prior_warp_scale)
+        self.stuck_g_range_min = float(stuck_g_range_min)
+        self.stuck_sigma_ratio_min = float(stuck_sigma_ratio_min)
+        self.stuck_pool_pow = int(stuck_pool_pow)
+        self._stuck_skip: bool = False
         self.gp_bin = BinomialGP(
             pad_initial=self.pad_initial,
             lbfgs_max_iter=self.gp_lbfgs_max_iter,
             seed=self.seed + 2,
             kernel_kind=self.gp_bin_kernel,
-            warp_dims=self.gp_bin_warp_dims,
-            prior_warp_scale=self.gp_bin_prior_warp_scale,
         )
 
     def _fit_surrogates(self) -> None:
@@ -431,12 +437,14 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         ds = self.dataset
         m_bin = ds.mask_bin
         n_bin = int(m_bin.sum())
+        self._stuck_skip = False
         if n_bin < 2:
             logger.warning(
                 "bo_bin_gp_skipped",
                 n_valid=n_bin,
                 reason="need >= 2 observed points",
             )
+            self._stuck_skip = True  # no constraint surrogate at all
             return
         X_bin = ds.X_scaled[m_bin]
         k_bin = ds.k[m_bin].astype(float)
@@ -449,8 +457,86 @@ class ConstrainedBayesopt(MeanVarBayesopt):
             n_feasible_total=int(np.sum(k_bin)),
             n_trials_total=int(np.sum(N_bin)),
         )
+        self._check_stuck_risk()
 
-    def _build_acquisition(self) -> ConstrainedExpectedImprovement:
+    def _check_stuck_risk(self) -> None:
+        """Evaluate the chance constraint over a Sobol screen pool and
+        decide whether the surface is informative enough for SQP to
+        navigate. Sets `self._stuck_skip` and emits a structured log
+        line. When `_stuck_skip` is True, `_build_acquisition` /
+        `_build_solver` fall back to the unconstrained EI path for the
+        next BO iter only."""
+        from hydro_bo.opt.surrogate import _predict
+
+        n_pool = 1 << self.stuck_pool_pow
+        d = self.bounds.shape[0]
+        rng_seed = (self.seed + len(self._X)) & 0xFFFFFFFF
+        rng = np.random.default_rng(rng_seed)
+        pool = rng.uniform(size=(n_pool, d)).astype(np.float64)
+        for idx, levels in self.cat_vars:
+            denom = max(len(levels) - 1, 1)
+            pool[:, idx] = np.round(pool[:, idx] * denom) / denom
+        pool_j = jnp.asarray(pool, dtype=jnp.float64)
+
+        state = self.gp_bin.state()
+        round_info = self._build_round_info()
+        mu, var = _predict(
+            state["params"], state["X"], state["L"], state["alpha"],
+            state["mean"], state["mask"], pool_j,
+            round_info, self.gp_bin_kernel,
+        )
+        sigma = jnp.sqrt(jnp.clip(var, 1e-12, None))
+        log_p_targ = float(np.log(self.p_targ / (1.0 - self.p_targ)))
+        g = mu - self.z_sc * sigma - log_p_targ
+
+        g_range = float(g.max() - g.min())
+        sigma_ratio = float(sigma.max() / jnp.maximum(sigma.min(), 1e-12))
+        sigma_mean = float(sigma.mean())
+
+        flat_g = g_range < self.stuck_g_range_min
+        flat_sigma = sigma_ratio < self.stuck_sigma_ratio_min
+        self._stuck_skip = bool(flat_g or flat_sigma)
+
+        if self._stuck_skip:
+            reasons = []
+            if flat_g:
+                reasons.append(
+                    f"g_range={g_range:.3g}<{self.stuck_g_range_min:g}"
+                )
+            if flat_sigma:
+                reasons.append(
+                    f"sigma_ratio={sigma_ratio:.3g}<{self.stuck_sigma_ratio_min:g}"
+                )
+            logger.warning(
+                "bo_constraint_phase_skipped",
+                reason=" & ".join(reasons),
+                message=(
+                    "BinomialGP constraint surface is too flat to drive SQP; "
+                    "falling back to unconstrained EI for this BO iter."
+                ),
+                g_range=g_range,
+                sigma_ratio=sigma_ratio,
+                sigma_mean=sigma_mean,
+                n_pool=n_pool,
+            )
+        else:
+            logger.info(
+                "bo_constraint_phase_diag",
+                g_range=g_range,
+                sigma_ratio=sigma_ratio,
+                sigma_mean=sigma_mean,
+                n_pool=n_pool,
+            )
+
+    def _build_acquisition(self):
+        if self._stuck_skip:
+            return ExpectedImprovement(
+                gp_mu=self.gp_mu,
+                gp_log_var=self.gp_log_var,
+                lam=self.lam,
+                dataset=self.dataset,
+                round_info=self.gp_mu.round_info,
+            )
         return ConstrainedExpectedImprovement(
             gp_mu=self.gp_mu,
             gp_log_var=self.gp_log_var,
@@ -462,7 +548,15 @@ class ConstrainedBayesopt(MeanVarBayesopt):
             round_info=self.gp_mu.round_info,
         )
 
-    def _build_solver(self, seed: int) -> ConstrainedMixedIntNLP:
+    def _build_solver(self, seed: int):
+        if self._stuck_skip:
+            return MixedIntNLP(
+                cat_vars=self.cat_vars,
+                seed=seed,
+                pow_sobol=self.pow_sobol,
+                n_restarts=self.n_restarts,
+                sqp_config=self.sqp_config,
+            )
         return ConstrainedMixedIntNLP(
             cat_vars=self.cat_vars,
             l1_penalty=self.l1_penalty,

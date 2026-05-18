@@ -46,8 +46,6 @@ nlp:
   gp_mu_kernel:         rbf
   gp_log_var_kernel:    rbf
   gp_bin_kernel:        matern12
-  gp_bin_warp_dims:     continuous   # null | "none" | "all" | "continuous" | [param names]
-  gp_bin_prior_warp_scale: 0.5       # LogNormal(0, scale) prior on Kumaraswamy log_a/log_b
 
 unconstrained_bo:
   iter_budget:        500
