@@ -247,14 +247,16 @@ class BaseBayesopt(ABC):
         )
         cb = float(e_g[0])
         cb_sigma = float(jnp.sqrt(jnp.clip(var_g[0], 0.0, None)))
+        x_orig = self.dataset.to_original(np.asarray(best_x_unit))
         logger.info(
             "bo_acquisition_optimise_complete",
             ei_value=float(best_val),
             confidence_bound=cb,
             confidence_bound_sigma=cb_sigma,
             incumbent_g_best=float(acq._g_best),
+            x_unit=[float(v) for v in np.asarray(best_x_unit).ravel()],
+            x_orig=[float(v) for v in np.asarray(x_orig).ravel()],
         )
-        x_orig = self.dataset.to_original(np.asarray(best_x_unit))
 
         del acq, solver
         # No `clear_jax_caches()` — observations are padded to `n_max`
