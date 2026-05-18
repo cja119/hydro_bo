@@ -41,11 +41,17 @@ class Dataset:
                 ]
             )
 
-        # Computing a numerically stable log-variance
+        # Numerically stable log-variance, debiased under the asymptotic
+        # chi-square approximation. log s² ~ N(log σ² − 1/(k−1), 2/(k−1))
+        # for (k-1)·s²/σ² ~ χ²(k-1). Subtract the −1/(k-1) mean so the
+        # target is an unbiased estimator of log σ². Pairs with
+        # `noise_log_sigma2 = 2/(k-1)`, the matching asymptotic variance.
         floor = 1e-12
         log_v = np.full_like(self.sigma2, np.nan)
         valid_v = np.isfinite(self.sigma2) & (self.sigma2 > 0)
-        log_v[valid_v] = np.log(np.maximum(self.sigma2[valid_v], floor))
+        k_f = self.k.astype(float)
+        bias = np.where(k_f > 1, -1.0 / np.maximum(k_f - 1.0, 1.0), 0.0)
+        log_v[valid_v] = np.log(np.maximum(self.sigma2[valid_v], floor)) - bias[valid_v]
         self.log_sigma2 = log_v
 
         # Computing scaling parameters for mean GP target.

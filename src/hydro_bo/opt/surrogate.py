@@ -567,6 +567,12 @@ class BinomialGP(BaseGP):
         prior_ls_beta: float = 6.0,
         prior_amp_alpha: float = 2.0,
         prior_amp_beta: float = 0.5,
+        # Jeffreys-style label smoothing on the binomial counts: replace
+        # (k, N) with (k + label_smoothing, N + 2·label_smoothing) before
+        # fitting. Pulls saturated rows (k=0 or k=N) back from latent ±∞,
+        # which is what makes the chance-constraint surface cliff-like
+        # and breaks chance-constrained SQP. 0 disables.
+        label_smoothing: float = 0.0,
     ):
         if kernel_kind not in _KERNEL_KINDS:
             raise ValueError(
@@ -584,6 +590,7 @@ class BinomialGP(BaseGP):
         self.prior_ls_beta = float(prior_ls_beta)
         self.prior_amp_alpha = float(prior_amp_alpha)
         self.prior_amp_beta = float(prior_amp_beta)
+        self.label_smoothing = float(label_smoothing)
         self.params = None
         self._X = None
         self._L = None
@@ -598,6 +605,10 @@ class BinomialGP(BaseGP):
         X_real = jnp.asarray(X, dtype=jnp.float64)
         k_real = jnp.asarray(k, dtype=jnp.float64).reshape(-1)
         N_real = jnp.asarray(N, dtype=jnp.float64).reshape(-1)
+        if self.label_smoothing > 0.0:
+            alpha = jnp.asarray(self.label_smoothing, dtype=jnp.float64)
+            k_real = k_real + alpha
+            N_real = N_real + 2.0 * alpha
         n_real, d = int(X_real.shape[0]), int(X_real.shape[1])
         self.round_info = tuple(round_info)
         jitter = jnp.asarray(self.jitter, dtype=jnp.float64)

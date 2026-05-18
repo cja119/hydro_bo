@@ -69,6 +69,7 @@ class NlpCfg:
     gp_mu_kernel: str
     gp_log_var_kernel: str
     gp_bin_kernel: str
+    gp_bin_label_smoothing: float
     sqp_osqp_max_iter: int
     sqp_osqp_tol: float
     sqp_max_line_search: int
@@ -256,6 +257,9 @@ def load_config(
             gp_bin_kernel=_resolve_kernel_kind(
                 raw["nlp"].get("gp_bin_kernel") or "matern12",
                 key="gp_bin_kernel",
+            ),
+            gp_bin_label_smoothing=float(
+                raw["nlp"].get("gp_bin_label_smoothing", 0.0)
             ),
         ),
         unconstrained_bo=UnconstrainedCfg(

@@ -36,16 +36,17 @@ nlp:
   gp_lbfgs_max_iter:    300
   n_devices:            16
   blas_threads:         1
-  sqp_max_iter:         50
+  sqp_max_iter:         20           # was 50 — cliff-like chance constraints rarely benefit from more
   sqp_tol_stationarity: 1e-4
   sqp_tol_feasibility:  1e-4
   sqp_use_exact_hessian: false
   sqp_osqp_max_iter:    500          # septal default 4000
   sqp_osqp_tol:         1e-5         # septal default 1e-7
-  sqp_max_line_search:  10           # septal default 30
+  sqp_max_line_search:  5            # was 10 — fail-fast on poisoned descent directions
   gp_mu_kernel:         rbf
   gp_log_var_kernel:    rbf
   gp_bin_kernel:        matern52
+  gp_bin_label_smoothing: 0.5        # Jeffreys; (k+0.5, N+1) prevents saturated rows pushing latent → ±∞
 
 unconstrained_bo:
   iter_budget:        500

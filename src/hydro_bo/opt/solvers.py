@@ -104,9 +104,26 @@ class NLPBase:
     # ---- public ----
 
     def maximise(self, acq: AcquisitionFunction) -> tuple[np.ndarray, float]:
+        import time as _time
         D = self._dim(acq)
+        t_starts = _time.perf_counter()
         starts, p_batch, screen_scores = self._build_starts(acq)
+        starts_seconds = _time.perf_counter() - t_starts
+        n_starts = int(starts.shape[0])
+        t_sqp = _time.perf_counter()
         result = self._build_solver(acq).solve_batch(starts, p_batch)
+        sqp_seconds = _time.perf_counter() - t_sqp
+        logger.info(
+            "acq_optimise_timing",
+            solver=type(self).__name__,
+            n_starts=n_starts,
+            n_combos=int(n_starts // max(self.n_restarts, 1)),
+            sobol_pow=int(self.pow_sobol),
+            screen_seconds=float(starts_seconds),
+            sqp_seconds=float(sqp_seconds),
+            sqp_inner_timing=float(getattr(result, "timing", float("nan"))),
+            n_converged=int(np.asarray(result.success).astype(bool).sum()),
+        )
         return self._select_best(result, starts, p_batch, screen_scores, D)
 
     # ---- subclass hooks ----
