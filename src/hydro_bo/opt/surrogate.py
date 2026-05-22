@@ -304,9 +304,7 @@ def _neg_elbo(
     # PG KL — masked sum.
     pg_kl = jnp.sum(mask * (N * jnp.log(jnp.cosh(c / 2.0)) - 0.5 * c**2 * omega))
 
-    # Gaussian KL — every per-row term explicitly masked. log-det
-    # contributions on padded rows are constants (zero from L_K, log√2
-    # from L_kn) which we drop via mask.
+    # Gaussian KL 
     trace_K_inv_S = n_real - jnp.sum(mask * omega * S_diag)
     K_inv_m = jax.scipy.linalg.cho_solve((L_K, True), m)
     quad_form = jnp.dot(m, K_inv_m)  # m is already 0 on padded
