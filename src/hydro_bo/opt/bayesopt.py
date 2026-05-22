@@ -21,6 +21,7 @@ from typing import Callable, Sequence, Tuple
 
 import gc
 import numpy as np
+import jax
 import jax.numpy as jnp
 
 from hydro_bo.opt.acquisition import (
@@ -197,6 +198,16 @@ class BaseBayesopt(ABC):
                 if _proc is not None
                 else float("nan")
             )
+            # Cheap JAX-side leak telemetry alongside RSS. If `n_live_arrays`
+            # grows monotonically across iters we've got device buffers
+            # escaping `_release_buffers()` / SQP-result cleanup; if it's
+            # flat but RSS still climbs, the leak is on the XLA / compile
+            # side (or non-JAX, e.g. Python heap). Both numbers are O(1) to
+            # collect, so always-on.
+            try:
+                n_live_arrays = len(jax.live_arrays())
+            except Exception:
+                n_live_arrays = -1
             n_feas = int(np.sum(np.isfinite(s)))
             logger.info(
                 "bo_iteration",
@@ -208,6 +219,7 @@ class BaseBayesopt(ABC):
                 var=float(np.nanvar(s, ddof=1)) if n_feas >= 2 else float("nan"),
                 best_score=float(best_score),
                 driver_rss_mb=rss_mb,
+                n_live_arrays=n_live_arrays,
             )
 
         best_x, best_score = self._best_observed()
@@ -259,9 +271,8 @@ class BaseBayesopt(ABC):
         )
 
         del acq, solver
-        # No `clear_jax_caches()` — observations are padded to `n_max`
-        # so the JIT cache is shape-stable across BO iterations and
-        # reusing it is the whole point.
+.
+        jax.clear_caches()
         gc.collect()
 
         return x_orig
