@@ -350,6 +350,8 @@ def main():
         c = replace(c, n_sobol_cache=int(cli.n_sobol_cache))
 
     configure_jax_threads(cfg.nlp.n_devices, cfg.nlp.blas_threads)
+    from hydro_bo.mpc.dispatcher import ensure_ray  # noqa: E402
+    ensure_ray(num_cpus=cfg.general.num_devices)
     from hydro_bo.opt import ConstrainedBayesopt  # noqa: E402
 
     global _eval_counter, _results_log, _bayesopt_dir, _run_timestamp, _master_seed
