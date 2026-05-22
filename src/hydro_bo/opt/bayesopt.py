@@ -198,12 +198,6 @@ class BaseBayesopt(ABC):
                 if _proc is not None
                 else float("nan")
             )
-            # Cheap JAX-side leak telemetry alongside RSS. If `n_live_arrays`
-            # grows monotonically across iters we've got device buffers
-            # escaping `_release_buffers()` / SQP-result cleanup; if it's
-            # flat but RSS still climbs, the leak is on the XLA / compile
-            # side (or non-JAX, e.g. Python heap). Both numbers are O(1) to
-            # collect, so always-on.
             try:
                 n_live_arrays = len(jax.live_arrays())
             except Exception:
@@ -271,7 +265,8 @@ class BaseBayesopt(ABC):
         )
 
         del acq, solver
-.
+        # The SQP factory rebuilds a fresh jit'd closure each iter, so
+        # the compile cache grows without bound. 
         jax.clear_caches()
         gc.collect()
 
@@ -343,8 +338,6 @@ class MeanVarBayesopt(BaseBayesopt):
                 reason="need >= 2 points with n_samples >= 2",
             )
 
-        # 2) Mean GP on rows with n >= 1, with noise = predicted-pop-var / n
-        # (fall back to empirical s^2 if log-var GP couldn't be fit yet).
         m_mu = ds.mask_mu
         if int(m_mu.sum()) < 2:
             raise RuntimeError(
@@ -417,15 +410,8 @@ class ConstrainedBayesopt(MeanVarBayesopt):
         z_sc: float = 1.6449,  # Φ⁻¹(0.95) — pass directly as z-score, not as a probability.
         l1_penalty: float = 1.0,
         gp_bin_kernel: str = "matern12",
-        # Jeffreys-style label smoothing on (k, N): (k+α, N+2α). Pulls
-        # saturated rows back from latent ±∞ — empirically the cause of
-        # the cliff-like chance constraint that breaks SQP on
-        # near-binary feasibility data.
         gp_bin_label_smoothing: float = 0.0,
-        # Stuck-risk threshold on the BinomialGP. If g(x) varies by less
-        # than this across a Sobol pool, the chance-constrained SQP
-        # phase is skipped for that BO iter and the optimiser falls back
-        # to unconstrained EI on the mu / log-var GPs.
+
         stuck_g_range_min: float = 0.1,
         stuck_pool_pow: int = 10,  # 2^10 = 1024 candidates
         **kwargs,

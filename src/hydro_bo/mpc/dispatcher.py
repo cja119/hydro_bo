@@ -15,32 +15,24 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 
 
 def _resolve_ray_temp_dir() -> str:
-    """Per-task scratch directory for Ray's session state.
-
-    Fallback order:
-      1. `$TMPDIR` (always set by PBS, unique per job).
-      2. `$PBS_JOBFS` (cnode-local scratch on some Imperial queues).
-      3. `/tmp` (last resort — collisions possible on shared nodes).
-    """
-    base = os.environ.get("TMPDIR") or os.environ.get("PBS_JOBFS") or "/tmp"
-    jobid = os.environ.get("PBS_JOBID", "nopbs").replace("/", "_")
-    array_idx = os.environ.get("PBS_ARRAY_INDEX", "0")
-    path = Path(base) / f"ray-{jobid}-{array_idx}"
+    """Per-process scratch dir for Ray. Kept short so the plasma-store
+    Unix socket path stays under the AF_UNIX 107-byte limit."""
+    base = os.environ.get("TMPDIR") or os.environ.get("PBS_JOBFS")
+    if base:
+        path = Path(base) / "ray"
+    else:
+        import hashlib
+        token = os.environ.get("PBS_JOBID", "nopbs") + "-" + os.environ.get("PBS_ARRAY_INDEX", "0")
+        path = Path("/tmp") / f"ray-{hashlib.md5(token.encode()).hexdigest()[:8]}"
     path.mkdir(parents=True, exist_ok=True)
     return str(path)
 
 
 def ensure_ray(num_cpus, **kwargs):
-    """Idempotent Ray init. Call this exactly once per process, *before*
-    JAX is imported or its BLAS/XLA threads are configured — Ray forks
-    raylet/GCS subprocesses inside `ray.init()`, and forking a
-    JAX-threaded parent deadlocks the children on inherited mutex
-    state. Subsequent calls are no-ops, so it's safe to call from
-    multiple entry points.
-    """
+    """Idempotent Ray init. Must be called before JAX spins up its
+    BLAS/XLA threads — Ray forks raylet/GCS inside `ray.init()`."""
     if ray.is_initialized():
         return
-
     os.environ.setdefault("RAY_gcs_server_request_timeout_seconds", "120")
     os.environ.setdefault("RAY_raylet_start_wait_time_s", "60")
 
@@ -52,7 +44,7 @@ def ensure_ray(num_cpus, **kwargs):
         logging_level=logging.ERROR,
         _temp_dir=temp_dir,
         _plasma_directory=temp_dir,
-        object_store_memory=256 * 1024 * 1024,  # 256 MiB
+        object_store_memory=256 * 1024 * 1024,
         include_dashboard=False,
     )
     init_kwargs.update(kwargs)
