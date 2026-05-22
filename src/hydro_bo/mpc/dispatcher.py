@@ -14,20 +14,46 @@ import ray
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 
 
+def _resolve_ray_temp_dir() -> str:
+    """Per-task scratch directory for Ray's session state.
+
+    Fallback order:
+      1. `$TMPDIR` (always set by PBS, unique per job).
+      2. `$PBS_JOBFS` (cnode-local scratch on some Imperial queues).
+      3. `/tmp` (last resort — collisions possible on shared nodes).
+    """
+    base = os.environ.get("TMPDIR") or os.environ.get("PBS_JOBFS") or "/tmp"
+    jobid = os.environ.get("PBS_JOBID", "nopbs").replace("/", "_")
+    array_idx = os.environ.get("PBS_ARRAY_INDEX", "0")
+    path = Path(base) / f"ray-{jobid}-{array_idx}"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
 def ensure_ray(num_cpus, **kwargs):
     """Idempotent Ray init. Call this exactly once per process, *before*
     JAX is imported or its BLAS/XLA threads are configured — Ray forks
     raylet/GCS subprocesses inside `ray.init()`, and forking a
     JAX-threaded parent deadlocks the children on inherited mutex
     state. Subsequent calls are no-ops, so it's safe to call from
-    multiple entry points."""
+    multiple entry points.
+    """
     if ray.is_initialized():
         return
+
+    os.environ.setdefault("RAY_gcs_server_request_timeout_seconds", "120")
+    os.environ.setdefault("RAY_raylet_start_wait_time_s", "60")
+
+    temp_dir = _resolve_ray_temp_dir()
     init_kwargs = dict(
         num_cpus=int(num_cpus),
         runtime_env={"env_vars": {"PYTHONPATH": _PROJECT_ROOT}},
         _metrics_export_port=None,
         logging_level=logging.ERROR,
+        _temp_dir=temp_dir,
+        _plasma_directory=temp_dir,
+        object_store_memory=256 * 1024 * 1024,  # 256 MiB
+        include_dashboard=False,
     )
     init_kwargs.update(kwargs)
     ray.init(**init_kwargs)
