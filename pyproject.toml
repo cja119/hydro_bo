@@ -13,14 +13,19 @@ requires-python = ">=3.10"
 dependencies = [
     "meteor_py  @ git+https://github.com/cja119/meteor_py.git",
     "h2-plan @ git+https://github.com/cja119/stochasticmodel.git",
+    "septal @ git+https://github.com/mycelia-i/septal.git",
     "certifi>=2024.12.14",
     "charset-normalizer>=3.4.1",
     "et_xmlfile>=2.0.0",
     "eurostat>=1.1.1",
     "gurobipy>=12,<13",
     "idna>=3.10",
+    "gpjax",
     "jax",
+    "jaxopt",
+    "matplotlib",
     "numpy>=1.26",
+    "scipy",
     "openpyxl>=3.1.5",
     "optuna",
     "pandas>=2.2.3",
@@ -36,6 +41,7 @@ dependencies = [
     "seaborn",
     "six>=1.17.0",
     "statsmodels",
+    "structlog>=24.1.0",
     "tzdata>=2024.2",
     "urllib3>=2.3.0",
     "webdriver_manager"
@@ -48,7 +54,7 @@ where = ["src"]
 include = ["*"]
 
 [tool.setuptools.package-data]
-"h2_gym" = [
-    "data/**/*.yml",
-    "data/**/*.csv"
-            ]
+"hydro_bo" = [
+    "data/*.yml",
+    "data/*.csv"
+]
