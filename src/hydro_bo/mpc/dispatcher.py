@@ -5,13 +5,37 @@ Dispatcher for multiple MPC solves
 
 import logging
 import os
+import random
 import sys
+import time
 import traceback
 from contextlib import contextmanager
 from pathlib import Path
 import ray
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
+
+
+def _stagger_ray_start() -> None:
+    """Spread concurrent `ray.init()` boots when many PBS array tasks land on
+    one physical node.
+    """
+    idx = os.environ.get("PBS_ARRAY_INDEX")
+    if idx is None:
+        return
+    window = float(os.environ.get("RAY_START_JITTER_SECONDS", "60"))
+    if window <= 0:
+        return
+    slots = max(1, int(os.environ.get("RAY_START_JITTER_SLOTS", "8")))
+    try:
+        slot = int(idx) % slots
+    except ValueError:
+        slot = 0
+    step = window / slots
+
+    delay = slot * step + random.uniform(0.0, step)
+    if delay > 0:
+        time.sleep(delay)
 
 
 def _resolve_ray_temp_dir() -> str:
@@ -33,6 +57,7 @@ def ensure_ray(num_cpus, **kwargs):
     BLAS/XLA threads — Ray forks raylet/GCS inside `ray.init()`."""
     if ray.is_initialized():
         return
+    _stagger_ray_start()
     os.environ.setdefault("RAY_gcs_server_request_timeout_seconds", "120")
     os.environ.setdefault("RAY_raylet_start_wait_time_s", "60")
 

@@ -54,7 +54,7 @@ from scipy.special import ndtri
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hydro_bo.mpc.dispatcher import RayMultiMPC, ensure_ray
+
 from hydro_bo.utils.jax_threads import configure_jax_threads
 from hydro_bo.utils.logging_config import configure_logging, get_logger
 from hydro_bo.utils.run_config import (
@@ -80,7 +80,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 # Sweep axes. Order matters — the decode_index function below assumes
 # this exact layout, and so does the folder-naming.
 CONSTRAINT_MODES = ("none", "ci50", "ci100")
-DENSITIES = (8, 16, 32, 64)
+DENSITIES = (32, 64, 128)
 N_BATCHES = 25
 
 # z_sc for each constrained mode. "none" doesn't use this (constraint
@@ -323,6 +323,64 @@ def load_manifest_rows(
 
 
 # ---------------------------------------------------------------------------
+# Resume / warm-start helpers
+# ---------------------------------------------------------------------------
+
+def load_prior_online_evals(
+    bayesopt_dir: Path,
+    num_instances: int,
+    infeas_threshold: float,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], list, int]:
+    """Reconstruct already-completed *online* BO evaluations for a resume.
+
+    A cell saves every online evaluation to `bo_results_detailed_<ts>.json`
+    after each `objective` call, so a job killed by walltime leaves its
+    partial trajectory on disk. We read the most recent detailed log (each
+    run writes a fresh, *cumulative* one — see `_cmd_run`), rebuild the
+    masked per-worker sample array exactly as `_objective_factory` did, and
+    return:
+
+      * observations: [(x, samples)] to feed back through `bo.observe`,
+        so the BO continues from the same dataset it had before the kill.
+      * results_log: the prior entries, so the new run's CSV/JSON stay
+        cumulative rather than dropping the pre-kill history.
+      * last_eval_id: the max stored `eval_id`, so `_eval_counter` (and the
+        per-eval MPC seed offset `_master_seed + _eval_counter`) continues
+        monotonically instead of repeating seeds.
+
+    Returns ([], [], 0) when there is no prior progress (fresh cell)."""
+    detailed = sorted(bayesopt_dir.glob("bo_results_detailed_*.json"))
+    if not detailed:
+        return [], [], 0
+    with open(detailed[-1]) as f:
+        results_log = json.load(f)
+    observations: list[tuple[np.ndarray, np.ndarray]] = []
+    for entry in results_log:
+        scores = entry.get("worker_scores") or []
+        arr = np.asarray(scores, dtype=float).ravel()
+        if arr.size < num_instances:
+            arr = np.concatenate([arr, np.full(num_instances - arr.size, np.nan)])
+        infeasible = ~np.isfinite(arr) | (arr <= infeas_threshold)
+        arr = np.where(infeasible, np.nan, arr)
+        observations.append((np.asarray(entry["x"], dtype=float), arr))
+    last_eval_id = max((int(e.get("eval_id", 0)) for e in results_log), default=0)
+    logger.info(
+        "ablation.resume_loaded",
+        source=str(detailed[-1]),
+        n_prior_online=len(observations),
+        last_eval_id=last_eval_id,
+    )
+    return observations, results_log, last_eval_id
+
+
+def cell_is_complete(bayesopt_dir: Path, vector: str, label: str) -> bool:
+    """A cell is done iff its final `<vector>-<label>-best.yml` was written
+    (the very last thing `_cmd_run` does). Anything else — no dir, only a
+    partial results log — counts as incomplete and eligible for top-up."""
+    return (bayesopt_dir / f"{vector}-{label}-best.yml").exists()
+
+
+# ---------------------------------------------------------------------------
 # Objective closure & results IO
 # ---------------------------------------------------------------------------
 
@@ -332,6 +390,8 @@ def _objective_factory(cfg: Config, ref: dict, infeas_threshold: float):
     array with non-finite / catastrophic entries marked NaN. The
     ConstrainedBayesopt Dataset handles NaN samples natively for all
     three arms."""
+    from hydro_bo.mpc.dispatcher import RayMultiMPC  # heavy (Ray/JAX); run-path only
+
     g = cfg.general
 
     def objective(x: np.ndarray) -> np.ndarray:
@@ -506,11 +566,9 @@ def _cmd_run(cli) -> None:
     mode, density, batch_id = decode_index(cli.array_index)
     label = task_label(mode, density, batch_id)
 
-    # Start Ray BEFORE JAX threads spawn. JAX/XLA spawn worker threads
-    # at first use, and Ray's raylet/GCS startup forks subprocesses —
-    # forking a multi-threaded parent deadlocks the children. Once Ray
-    # is up its raylet/GCS are independent processes that don't care
-    # about our thread state.
+    # Start Ray BEFORE JAX threads spawn.
+    from hydro_bo.mpc.dispatcher import ensure_ray  # heavy (Ray/JAX); run-path only
+
     ensure_ray(num_cpus=g.num_devices)
     configure_jax_threads(cfg.nlp.n_devices, cfg.nlp.blas_threads)
     # BO classes pull jax at import — defer until after configure_jax_threads.
@@ -543,8 +601,6 @@ def _cmd_run(cli) -> None:
             return MeanVarBayesopt._best_observed(self)
 
     global _eval_counter, _results_log, _bayesopt_dir, _run_timestamp, _master_seed
-    _eval_counter = 0
-    _results_log = []
 
     now = datetime.now()
     _run_timestamp = now.strftime("%Y%m%d_%H%M%S")
@@ -553,6 +609,22 @@ def _cmd_run(cli) -> None:
     )
     _bayesopt_dir.mkdir(parents=True, exist_ok=True)
     configure_logging(log_file=_bayesopt_dir / "run.log", package_level=g.log_level)
+
+    # Resume support: if this cell already wrote a (best.yml) it's done; if
+    # it left a partial detailed-results log it was killed mid-run, so we
+    # warm-start from those evals instead of redoing them. `prior_online`
+    # are online acquisition evals only (the manifest initial design is
+    # re-observed separately below), so the remaining iteration budget is
+    # `iter_budget - len(prior_online)`.
+    prior_online, _results_log, _eval_counter = load_prior_online_evals(
+        _bayesopt_dir, g.num_instances, c.infeas_threshold
+    )
+
+    if cell_is_complete(_bayesopt_dir, g.vector, label):
+        logger.info(
+            "ablation.cell_already_complete", run_id=cli.run_id, label=label
+        )
+        return
 
     _master_seed = resolve_master_seed(g.master_seed)
     logger.info(
@@ -587,6 +659,15 @@ def _cmd_run(cli) -> None:
 
     # Snapshot resolved config + decoded ablation knobs for reproducibility.
     iter_budget = int(cli.iter_budget)
+    n_prior_online = len(prior_online)
+    remaining_iters = max(0, iter_budget - n_prior_online)
+    if n_prior_online:
+        logger.info(
+            "ablation.resume_budget",
+            iter_budget=iter_budget,
+            n_prior_online=n_prior_online,
+            remaining_iters=remaining_iters,
+        )
     z_sc = z_sc_for_mode(mode)
     with open(_bayesopt_dir / "args.json", "w") as f:
         json.dump(
@@ -603,6 +684,8 @@ def _cmd_run(cli) -> None:
                     "batch_id": batch_id,
                     "label": label,
                     "iter_budget": iter_budget,
+                    "n_prior_online": n_prior_online,
+                    "remaining_iters": remaining_iters,
                     "z_sc": z_sc,
                     "p_targ": c.p_targ,
                     "manifest_path": str(manifest_path),
@@ -635,7 +718,7 @@ def _cmd_run(cli) -> None:
         f=_objective_factory(cfg, ref, c.infeas_threshold),
         bounds=bounds,
         n_initial_points=density,
-        iter_limit=iter_budget,
+        iter_limit=remaining_iters,
         lam=g.stdev_penalty,
         n_restarts=cfg.nlp.acq_n_restarts,
         pow_sobol=cfg.nlp.acq_pow_sobol,
@@ -668,6 +751,16 @@ def _cmd_run(cli) -> None:
             "ablation.sobol_phase_skipped_via_cache", n_preloaded=len(preloaded)
         )
 
+    # Warm-start: replay the online evals completed before the last kill on
+    # top of the initial design, in chronological order. `bo.run` then runs
+    # only `remaining_iters` new acquisition steps, and because the
+    # acquisition seed is `seed + len(self._X)` the resumed trajectory
+    # matches what an uninterrupted run would have produced.
+    for x, samples in prior_online:
+        bo.observe(x, samples)
+    if prior_online:
+        logger.info("ablation.resume_replayed", n_prior_online=len(prior_online))
+
     best_x, best_score = bo.run()
     best_planning_params, best_env_overrides = params_from_x(
         best_x, ref, renewables=g.renewables, vector=g.vector
@@ -687,6 +780,41 @@ def _cmd_run(cli) -> None:
     logger.info("ablation.saved", path=str(out_path))
 
     save_results(_results_log, _bayesopt_dir, _run_timestamp)
+
+
+def _cmd_list_incomplete(cli) -> None:
+    """Print the array indices of cells in <run-id> with no best.yml.
+
+    One integer per line on stdout — consumed verbatim by ablation_topup.sh
+    as the PBS index file. A `run` task can be re-launched for any of these
+    indices and will warm-start from its own saved partial trajectory.
+    Diagnostics go to stderr so stdout stays a clean index list."""
+    cfg = load_config(
+        SCRIPTS_DIR / "config.yml",
+        vector_override=cli.vector,
+        num_devices_override=None,
+    )
+    g = cfg.general
+    size = len(CONSTRAINT_MODES) * len(DENSITIES) * N_BATCHES
+    run_root = SCRIPTS_DIR / "tmp" / "ablation" / cli.run_id / g.vector
+    if not run_root.exists():
+        print(
+            f"run dir does not exist: {run_root} — nothing to top up",
+            file=sys.stderr,
+        )
+    incomplete = []
+    for idx in range(size):
+        mode, density, batch_id = decode_index(idx)
+        label = task_label(mode, density, batch_id)
+        if not cell_is_complete(run_root / label, g.vector, label):
+            incomplete.append(idx)
+    for idx in incomplete:
+        print(idx)
+    print(
+        f"{len(incomplete)}/{size} cells incomplete in run {cli.run_id} "
+        f"({g.vector})",
+        file=sys.stderr,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +865,17 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Hydrogen vector; overrides general.vector.")
     p_run.add_argument("--ncpus", type=int, default=None,
                        help="Override general.num_devices.")
+
+    p_list = sub.add_parser(
+        "list-incomplete",
+        help="Print array indices of cells in a run that have not completed "
+             "(no best.yml). One per line on stdout; used by "
+             "ablation_topup.sh.",
+    )
+    p_list.add_argument("--run-id", type=str, required=True,
+                        help="Run id (parent dir) to scan for incomplete cells.")
+    p_list.add_argument("--vector", type=str, default=None,
+                        help="Hydrogen vector; overrides general.vector.")
     return parser
 
 
@@ -747,6 +886,8 @@ def main():
         _cmd_generate_manifest(cli)
     elif cli.cmd == "run":
         _cmd_run(cli)
+    elif cli.cmd == "list-incomplete":
+        _cmd_list_incomplete(cli)
     else:
         parser.error(f"unknown cmd {cli.cmd!r}")
 

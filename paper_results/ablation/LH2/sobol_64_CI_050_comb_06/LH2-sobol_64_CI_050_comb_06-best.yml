@@ -1,0 +1,17 @@
+capex: 19416.137844405206
+compression_capacity: 750.8597429378715
+conversion_trains_number: 17
+electrolyser_capacity: 19732.617605922318
+expected_arrival_offset: -2
+fuelcell_capacity: 2147.057740254251
+hydrogen_storage_capacity: 266865.8857072829
+hydrogen_storage_lower_backoff: 0.42835164799556374
+hydrogen_storage_upper_backoff: 0.7971946660322842
+opex: 2869.639039356156
+renewable_energy_capacity: 1850.684151186866
+renewables: wind
+vector: LH2
+vector_storage_capacity: 26.969272869517997
+vector_storage_lower_backoff: 0.24878931969201926
+vector_storage_upper_backoff: 0.5
+wind_forecast_mean: 0.6276513833426615

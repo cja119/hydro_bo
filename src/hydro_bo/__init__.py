@@ -1,10 +1,5 @@
 from hydro_bo.utils import configure_logging
-from hydro_bo.mpc import MPCController
-from hydro_bo.envs import ShippingEnv, Planning
 
-# `MeanVarBayesopt` and `ConstrainedBayesopt` are exposed lazily so that
-# `import hydro_bo` does not eagerly import jax — scripts can call
-# `configure_jax_threads` before triggering the import.
 __all__ = [
     "MeanVarBayesopt",
     "ConstrainedBayesopt",
@@ -14,13 +9,20 @@ __all__ = [
     "configure_logging",
 ]
 
+# name -> (module, attribute) resolved on first access.
+_LAZY = {
+    "MeanVarBayesopt": ("hydro_bo.opt", "MeanVarBayesopt"),
+    "ConstrainedBayesopt": ("hydro_bo.opt", "ConstrainedBayesopt"),
+    "MPCController": ("hydro_bo.mpc", "MPCController"),
+    "ShippingEnv": ("hydro_bo.envs", "ShippingEnv"),
+    "Planning": ("hydro_bo.envs", "Planning"),
+}
+
 
 def __getattr__(name):
-    if name in {"MeanVarBayesopt", "ConstrainedBayesopt"}:
-        from hydro_bo.opt import MeanVarBayesopt, ConstrainedBayesopt
+    if name in _LAZY:
+        import importlib
 
-        return {
-            "MeanVarBayesopt": MeanVarBayesopt,
-            "ConstrainedBayesopt": ConstrainedBayesopt,
-        }[name]
+        module_name, attr = _LAZY[name]
+        return getattr(importlib.import_module(module_name), attr)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
