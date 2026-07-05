@@ -49,9 +49,36 @@ ABSOLUTE_BOUNDS = {
 }
 
 # Search dims that are env-side overrides (not planning-model params).
-# Stripped from the planning_params dict and returned separately by
-# params_from_x so the BO scripts can splice them into env_args.
-ENV_OVERRIDE_KEYS = {"wind_forecast_mean"}
+
+ENV_OVERRIDE_PATHS = {
+    "wind_forecast_mean": ("weather_data", "forecast_mean_override"),
+}
+ENV_OVERRIDE_KEYS = set(ENV_OVERRIDE_PATHS)
+
+
+def _set_nested(target: dict, path: tuple, value) -> None:
+    """Set `value` at `path` (a tuple of keys) inside nested dict `target`,
+    creating intermediate dicts as needed."""
+    d = target
+    for key in path[:-1]:
+        d = d.setdefault(key, {})
+    d[path[-1]] = value
+
+
+def split_env_overrides(params: dict) -> tuple[dict, dict]:
+    """Split a flat params dict into `(planning_params, env_overrides)`.
+
+    Any key in `ENV_OVERRIDE_PATHS` is popped out of the planning params
+    and placed at its nested path in `env_overrides`, ready to deep-merge
+    into `env_args["config"]`. Mirrors what `params_from_x` does for a BO
+    sample vector, but operates on an already-decoded param dict (e.g. an
+    injected planning-model YAML for the multisim)."""
+    planning = dict(params)
+    env_overrides: dict = {}
+    for key, path in ENV_OVERRIDE_PATHS.items():
+        if key in planning:
+            _set_nested(env_overrides, path, float(planning.pop(key)))
+    return planning, env_overrides
 
 
 def build_bounds(ref: dict, expansion: float) -> np.ndarray:
@@ -114,8 +141,8 @@ def params_from_x(
             val = int(round(val))
             if key == "conversion_trains_number":
                 val = max(1, val)
-        if key == "wind_forecast_mean":
-            env_overrides.setdefault("weather_data", {})["forecast_mean_override"] = float(val)
+        if key in ENV_OVERRIDE_PATHS:
+            _set_nested(env_overrides, ENV_OVERRIDE_PATHS[key], float(val))
             continue
         p[key] = val
 
@@ -143,8 +170,11 @@ def flatten_dims(planning_params: dict, env_overrides: dict) -> dict:
     """
     out: dict = {}
     for key in PARAM_KEYS:
-        if key == "wind_forecast_mean":
-            out[key] = env_overrides["weather_data"]["forecast_mean_override"]
+        if key in ENV_OVERRIDE_PATHS:
+            d = env_overrides
+            for part in ENV_OVERRIDE_PATHS[key]:
+                d = d[part]
+            out[key] = d
         else:
             out[key] = planning_params[key]
     return out

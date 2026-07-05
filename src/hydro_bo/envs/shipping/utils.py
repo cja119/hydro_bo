@@ -426,12 +426,14 @@ def generate_weather_forecast(
     end = start_idx + horizon
     mean_weather = float(mean(weather_data))
 
-    if mean_override is not None:
-        forecast = horizon * [float(mean_override) * WIND_FORECAST_SCALE]
-    else:
-        forecast = list(weather_data[start_idx:end])
+    forecast = list(weather_data[start_idx:end])
+    tail_value = (
+        float(mean_override) * WIND_FORECAST_SCALE
+        if mean_override is not None
+        else mean_weather
+    )
     if len(forecast) < full_length:
-        forecast += (full_length - len(forecast)) * [mean_weather]
+        forecast += (full_length - len(forecast)) * [tail_value]
     return forecast
 
 

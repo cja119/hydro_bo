@@ -21,7 +21,8 @@ from datetime import datetime
 
 from hydro_bo.utils.logging_config import configure_logging, get_logger
 from hydro_bo.utils.jax_threads import configure_jax_threads
-from hydro_bo.utils.run_config import Config, env_args_from, load_config
+from hydro_bo.utils.run_config import Config, merge_env_overrides, load_config
+from hydro_bo.utils.search_space import split_env_overrides
 from hydro_bo.utils.seeding import resolve_master_seed
 
 logger = get_logger(__name__)
@@ -76,10 +77,21 @@ def run_multisim(cfg: Config, args: argparse.Namespace):
     params = load_planning_model(planning_model_path)
     logger.info("multi_mpc.loaded_model", path=str(planning_model_path))
 
-    # env_args_from(cfg) populates "Time.forecast_horizon" from
+    # An injected planning model may carry BO search dims that are env-side
+    # overrides (e.g. `wind_forecast_mean`) rather than true planning-model
+    # params. Split them out so they reach env_args via the SAME path the BO
+    # uses (`merge_env_overrides`); otherwise they'd sit unused in
+    # `param_overrides` and the multisim would silently run a different
+    # effective config than the BO that produced the design.
+    params, env_overrides = split_env_overrides(params)
+    if env_overrides:
+        logger.info("multi_mpc.env_overrides_applied", env_overrides=env_overrides)
+
+    # merge_env_overrides(cfg, ...) populates "Time.forecast_horizon" from
     # `general.forecast_horizon`, plus weather files, price-dynamics enable
-    # and vector. Apply per-CLI overrides on top.
-    env_args = env_args_from(cfg)
+    # and vector, then deep-merges the env-side overrides. Apply per-CLI
+    # overrides on top.
+    env_args = merge_env_overrides(cfg, env_overrides)
     env_args["config"]["mpc"]["planning_model"] = planning_model_filename
     if args.dynamic_price is not None:
         env_args["config"]["price_dynamics"]["enabled"] = bool(args.dynamic_price)
