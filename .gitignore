@@ -12,6 +12,7 @@ scripts/tmp/
 !**/*/.gitignore
 **/debug*
 test*.py
+!tests/test_*.py
 **/*.png
 **/tmp
 /jobs/*

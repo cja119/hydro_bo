@@ -13,7 +13,8 @@ requires-python = ">=3.10"
 dependencies = [
     "meteor_py  @ git+https://github.com/cja119/meteor_py.git",
     "h2-plan @ git+https://github.com/cja119/stochasticmodel.git",
-    "septal @ git+https://github.com/mycelia-i/septal.git",
+    # Pinned: sqp_driver uses septal's internal jax.sqp modules; re-run tests/test_sqp_driver.py on bump.
+    "septal @ git+https://github.com/mycelia-i/septal.git@0cab77e8e625840276c68f8b3cee22320919ddcb",
     "certifi>=2024.12.14",
     "charset-normalizer>=3.4.1",
     "et_xmlfile>=2.0.0",

@@ -1,20 +1,10 @@
-"""NLP solvers for acquisition-function optimisation, septal-backed.
-
-  - `NLPBase`: box-constrained multi-start SQP over the unit cube.
-  - `MixedIntNLP`: + categorical / integer branching via septal's
-    parametric `p` (one factory; `solve_batch` runs every combo in one
-    dispatch).
-  - `ConstrainedMixedIntNLP`: + explicit feasibility constraint
-    `p_targ <= P(feasible|x) <= 1` and an L1 hinge in the Sobol screen.
-
-Polymorphism is on `_solver(acq) -> ParametricNLPProblem` and
-`_build_starts(acq) -> (starts, p_batch, screen_scores)`. The shared
-`_build_solver` and `maximise` live once on the base.
+"""Acquisition maximisation: Sobol screen + multistart SQP on the direct
+driver (`run_sqp`). Integer combos are enumerated and vmapped below the
+restart axis; combo values reach the objective by closure.
 """
 
 from __future__ import annotations
 
-import dataclasses
 from itertools import product
 from typing import Optional, Sequence, Tuple
 
@@ -23,13 +13,10 @@ import jax
 import jax.numpy as jnp
 from scipy.stats.qmc import Sobol
 
-from septal.jax.sqp import (
-    ParametricNLPProblem,
-    ParametricSQPFactory,
-    SQPConfig,
-)
+from septal.jax.sqp import SQPConfig
 
 from hydro_bo.opt.acquisition import AcquisitionFunction
+from hydro_bo.opt.sqp_driver import run_sqp
 from hydro_bo.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -50,7 +37,7 @@ def sobol_sample(bounds: np.ndarray, n: int, seed: int = 0) -> np.ndarray:
 
 
 def clear_jax_caches() -> None:
-    """Drop XLA-compiled artifacts (each BO iter triggers a fresh trace)."""
+    """Drop XLA-compiled artifacts (pad growth invalidates traces)."""
     try:
         jax.clear_caches()
     except AttributeError:
@@ -63,15 +50,9 @@ def clear_jax_caches() -> None:
 
 
 def _pmap_batch_eval(batch_fn, x_batch: jnp.ndarray, *args) -> jnp.ndarray:
-    """Shard `x_batch`'s leading axis across `jax.local_device_count()`
-    logical devices via pmap; fall back to the plain (vmap-fused) call
-    when only one device is available or the batch isn't divisible.
-
-    `batch_fn(x, *args)` is expected to be a vmapped callable mapping
-    `(B, ...) -> (B,)`. The trailing args are broadcast (not sharded).
-    Static args (e.g. `round_info`) should be bound upstream via
-    `functools.partial` so we don't need to thread them through pmap.
-    """
+    """Shard `x_batch`'s leading axis across devices via pmap; fall back
+    to the plain vmapped call when only one device is available or the
+    batch isn't divisible."""
     n_dev = jax.local_device_count()
     n_total = int(x_batch.shape[0])
     if n_dev <= 1 or n_total % n_dev != 0:
@@ -83,7 +64,20 @@ def _pmap_batch_eval(batch_fn, x_batch: jnp.ndarray, *args) -> jnp.ndarray:
     return out.reshape((n_total,) + out.shape[2:])
 
 
-# ---------------------------------------------------------------------- #
+def _insert(x_cont, ints, idx: tuple):
+    """Insert `ints` into `x_cont` at static positions `idx` (ascending)."""
+    x = x_cont
+    for i, k in enumerate(idx):
+        fill = jnp.broadcast_to(ints[i].astype(x.dtype), x.shape[:-1] + (1,))
+        x = jnp.concatenate([x[..., :k], fill, x[..., k:]], axis=-1)
+    return x
+
+
+def _insert_np(x_cont: np.ndarray, ints: np.ndarray, idx: tuple) -> np.ndarray:
+    x = np.asarray(x_cont, dtype=float)
+    for i, k in enumerate(idx):
+        x = np.insert(x, k, float(ints[i]))
+    return x
 
 
 class NLPBase:
@@ -101,144 +95,118 @@ class NLPBase:
         self.n_restarts = int(n_restarts)
         self.sqp_config = sqp_config or DEFAULT_SQP_CONFIG
 
-    # ---- public ----
-
     def maximise(self, acq: AcquisitionFunction) -> tuple[np.ndarray, float]:
         import time as _time
+
         D = self._dim(acq)
-        t_starts = _time.perf_counter()
-        starts, p_batch, screen_scores = self._build_starts(acq)
-        starts_seconds = _time.perf_counter() - t_starts
-        n_starts = int(starts.shape[0])
+        cat_idx, combos = self._layout()
+        D_red = D - len(cat_idx)
+        combos_np = np.asarray(combos, dtype=float).reshape(len(combos), len(cat_idx))
+        C, R = combos_np.shape[0], self.n_restarts
+
+        t_screen = _time.perf_counter()
+        starts, screen_scores = self._screen(acq, D_red, cat_idx, combos_np)
+        screen_seconds = _time.perf_counter() - t_screen
+
         t_sqp = _time.perf_counter()
-        result = self._build_solver(acq).solve_batch(starts, p_batch)
+        states = self._solve(acq, cat_idx, starts, combos_np, D_red)
         sqp_seconds = _time.perf_counter() - t_sqp
+
+        conv = np.asarray(states.converged).reshape(C, R)
+        f_val = np.asarray(states.f_val).reshape(C, R)
+        xs = np.asarray(states.x).reshape(C, R, D_red)
+
         logger.info(
             "acq_optimise_timing",
             solver=type(self).__name__,
-            n_starts=n_starts,
-            n_combos=int(n_starts // max(self.n_restarts, 1)),
-            sobol_pow=int(self.pow_sobol),
-            screen_seconds=float(starts_seconds),
+            n_starts=C * R,
+            n_combos=C,
+            sobol_pow=self.pow_sobol,
+            screen_seconds=float(screen_seconds),
             sqp_seconds=float(sqp_seconds),
-            sqp_inner_timing=float(getattr(result, "timing", float("nan"))),
-            n_converged=int(np.asarray(result.success).astype(bool).sum()),
+            n_converged=int(conv.sum()),
         )
-        return self._select_best(result, starts, p_batch, screen_scores, D)
+
+        if not conv.any():
+            c, r = np.unravel_index(int(np.argmax(screen_scores)), (C, R))
+            x_full = _insert_np(starts[c, r], combos_np[c], cat_idx)
+            logger.warning(
+                "sqp_no_converged_starts",
+                n_starts=C * R,
+                fallback=float(screen_scores[c, r]),
+            )
+            return np.clip(x_full, 0.0, 1.0), float(screen_scores[c, r])
+
+        masked = np.where(conv, f_val, np.inf)
+        c, r = np.unravel_index(int(np.argmin(masked)), (C, R))
+        x_full = _insert_np(xs[c, r], combos_np[c], cat_idx)
+        return np.clip(x_full, 0.0, 1.0), float(-masked[c, r])
 
     # ---- subclass hooks ----
 
-    def _build_starts(
-        self,
-        acq: AcquisitionFunction,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, np.ndarray]:
-        """Returns (starts, p_batch, screen_scores). Base = single-combo
-        Sobol screen on the full unit cube; subclasses override to
-        enumerate categorical combos."""
-        D = self._dim(acq)
-        candidates, scores = self._sobol_screen(acq, D, acq.acq_batch_fn())
-        return (
-            jnp.asarray(candidates, dtype=jnp.float64),
-            jnp.zeros((self.n_restarts, 0), dtype=jnp.float64),
-            scores,
-        )
+    def _layout(self) -> tuple[tuple[int, ...], list[tuple[float, ...]]]:
+        return (), [()]
 
-    def _solver(self, acq: AcquisitionFunction) -> ParametricNLPProblem:
-        D = self._dim(acq)
-        return ParametricNLPProblem(
-            objective=self._objective(acq, ()),
-            bounds=[jnp.zeros(D, dtype=jnp.float64), jnp.ones(D, dtype=jnp.float64)],
-            n_decision=D,
-            n_params=0,
-        )
+    def _constraint(self, acq: AcquisitionFunction, cat_idx: tuple):
+        """Returns (con_fn(x_full) -> (n_g,), lhs, rhs) or None."""
+        return None
+
+    def _rescore(self, acq: AcquisitionFunction, raw: np.ndarray, x_full) -> np.ndarray:
+        return raw
 
     # ---- shared infrastructure ----
-
-    def _build_solver(self, acq: AcquisitionFunction) -> ParametricSQPFactory:
-        """Wrap `self._solver(acq)` into a septal factory. Never overridden."""
-        return ParametricSQPFactory(self._solver(acq), self.sqp_config)
 
     @staticmethod
     def _dim(acq: AcquisitionFunction) -> int:
         return int(acq.state_args[0]["X"].shape[1])
 
-    @staticmethod
-    def _objective(acq: AcquisitionFunction, cat_indices: tuple[int, ...]):
-        """Wrap acq into septal's `obj(x, p) -> scalar` (negated for SQP min)."""
-        state = acq.state_args
-        if cat_indices:
-            neg = acq.neg_acq_masked_fn(cat_indices)
-            return lambda x, p: neg(x, p, *state).reshape(())
-        neg = acq.neg_acq_fn()
-        return lambda x, p: neg(x, *state).reshape(())
-
-    def _sobol_screen(
-        self,
-        acq: AcquisitionFunction,
-        dim: int,
-        batch_fn,
-        extra_args: tuple = (),
-        rescore=None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """2**pow_sobol candidates → batch eval → top-K. Optional `rescore`
-        callback `(raw_scores, x_jnp) -> adjusted_scores` lets subclasses
-        re-rank without a full override."""
-        sampler = Sobol(d=dim, scramble=True, seed=self.seed)
+    def _screen(self, acq, D_red, cat_idx, combos_np):
+        """Sobol candidates in the continuous dims, assembled to full
+        inputs per combo, screened by the batched acquisition. Returns
+        (starts (C, R, D_red), scores (C, R))."""
+        sampler = Sobol(d=D_red, scramble=True, seed=self.seed)
         candidates = sampler.random(2**self.pow_sobol)
-        x_jnp = jnp.asarray(candidates, dtype=jnp.float64)
-        raw = np.asarray(
-            _pmap_batch_eval(batch_fn, x_jnp, *extra_args, *acq.state_args)
-        )
-        scores = rescore(raw, x_jnp) if rescore is not None else raw
-        top_idx = np.argsort(scores)[-self.n_restarts :]
-        return candidates[top_idx], scores[top_idx]
+        cand_j = jnp.asarray(candidates, dtype=jnp.float64)
+        batch_fn = acq.acq_batch_fn()
+        state = acq.state_args
 
-    def _select_best(
-        self,
-        result,
-        starts,
-        p_batch,
-        screen_scores,
-        dim_full,
-    ) -> tuple[np.ndarray, float]:
-        """Best converged start (SQP enforces feasibility internally), with
-        screen-score fallback if no start converged."""
-        success = np.asarray(result.success).astype(bool)
-        objectives = np.asarray(result.objective)
+        starts, scores = [], []
+        for combo in combos_np:
+            ints = jnp.asarray(combo, dtype=jnp.float64)
+            x_full = _insert(cand_j, ints, cat_idx)
+            raw = np.asarray(_pmap_batch_eval(batch_fn, x_full, *state))
+            adj = self._rescore(acq, raw, x_full)
+            top = np.argsort(adj)[-self.n_restarts :]
+            starts.append(candidates[top])
+            scores.append(adj[top])
+        return np.stack(starts), np.stack(scores)
 
-        if not np.any(success):
-            best = int(np.argmax(screen_scores))
-            x_full = self._expand_x(
-                np.asarray(starts)[best],
-                np.asarray(p_batch)[best],
-                dim_full,
-            )
-            logger.warning(
-                "sqp_no_converged_starts",
-                n_starts=int(success.size),
-                fallback=float(screen_scores[best]),
-            )
-            return x_full, float(screen_scores[best])
+    def _solve(self, acq, cat_idx, starts, combos_np, D_red):
+        neg = acq.neg_acq_fn()
+        state = acq.state_args
+        con = self._constraint(acq, cat_idx)
+        lb = jnp.zeros(D_red, dtype=jnp.float64)
+        ub = jnp.ones(D_red, dtype=jnp.float64)
+        cfg = self.sqp_config
 
-        best = int(np.argmin(np.where(success, objectives, np.inf)))
-        x_full = self._expand_x(
-            np.asarray(result.decision_variables)[best],
-            np.asarray(p_batch)[best],
-            dim_full,
-        )
-        return x_full, float(-objectives[best])
+        def solve_cell(x0, ints):
+            neg_obj = lambda xc: neg(_insert(xc, ints, cat_idx), *state).reshape(())
+            if con is None:
+                return run_sqp(neg_obj, x0, lb, ub, cfg)
+            con_fn, lhs, rhs = con
+            g = lambda xc: con_fn(_insert(xc, ints, cat_idx))
+            return run_sqp(neg_obj, x0, lb, ub, cfg, con=g, con_lhs=lhs, con_rhs=rhs)
 
-    def _expand_x(self, x_red, p, dim_full) -> np.ndarray:
-        """Reconstruct the full unit-cube x. Base case: x_red IS x_full."""
-        return np.clip(np.asarray(x_red, dtype=float), 0.0, 1.0)
-
-
-# ---------------------------------------------------------------------- #
+        per_restart = jax.vmap(solve_cell, in_axes=(0, None))
+        per_combo = jax.vmap(per_restart, in_axes=(0, 0))
+        starts_j = jnp.asarray(starts, dtype=jnp.float64)
+        combos_j = jnp.asarray(combos_np, dtype=jnp.float64)
+        return jax.jit(per_combo)(starts_j, combos_j)
 
 
 class MixedIntNLP(NLPBase):
-    """+ categorical/integer branching. Empty cat_vars short-circuits
-    to the continuous base path."""
+    """+ integer branching: one combo per element of the cartesian
+    product of levels, vmapped below the restart axis."""
 
     def __init__(
         self,
@@ -253,69 +221,7 @@ class MixedIntNLP(NLPBase):
         )
         self.cat_vars = [(int(i), [float(v) for v in vals]) for i, vals in cat_vars]
 
-    # ---- subclass hooks (inherited maximise drives these) ----
-
-    def _build_starts(self, acq):
-        if not self.cat_vars:
-            return super()._build_starts(acq)
-        D = self._dim(acq)
-        cat, combos = self._layout()
-        D_red = D - len(cat)
-        batch_fn = acq.acq_batch_masked_fn(cat)
-
-        starts, ps, scores = [], [], []
-        for combo in combos:
-            mv = jnp.asarray(combo, dtype=jnp.float64)
-            cand, sc = self._sobol_screen(acq, D_red, batch_fn, extra_args=(mv,))
-            starts.append(np.asarray(cand))
-            ps.append(
-                np.broadcast_to(
-                    np.asarray(combo, dtype=float),
-                    (self.n_restarts, len(cat)),
-                ).copy()
-            )
-            scores.append(np.asarray(sc))
-
-        return (
-            jnp.asarray(np.concatenate(starts, 0), dtype=jnp.float64),
-            jnp.asarray(np.concatenate(ps, 0), dtype=jnp.float64),
-            np.concatenate(scores, 0),
-        )
-
-    def _solver(self, acq):
-        if not self.cat_vars:
-            return super()._solver(acq)
-        D = self._dim(acq)
-        cat, _ = self._layout()
-        D_red = D - len(cat)
-        return ParametricNLPProblem(
-            objective=self._objective(acq, cat),
-            bounds=[
-                jnp.zeros(D_red, dtype=jnp.float64),
-                jnp.ones(D_red, dtype=jnp.float64),
-            ],
-            n_decision=D_red,
-            n_params=len(cat),
-        )
-
-    def _expand_x(self, x_red, p, dim_full):
-        if not self.cat_vars:
-            return super()._expand_x(x_red, p, dim_full)
-        cat, _ = self._layout()
-        x_red = np.asarray(x_red, dtype=float)
-        p = np.asarray(p, dtype=float)
-        x_full = np.empty(dim_full, dtype=float)
-        cat_set = set(cat)
-        cont = [i for i in range(dim_full) if i not in cat_set]
-        for i, idx in enumerate(cat):
-            x_full[idx] = p[i]
-        x_full[cont] = x_red
-        return np.clip(x_full, 0.0, 1.0)
-
-    # ---- helpers ----
-
-    def _layout(self) -> tuple[tuple[int, ...], list[tuple[float, ...]]]:
-        """Sorted cat indices + cartesian product of mask values."""
+    def _layout(self):
         if not self.cat_vars:
             return (), [()]
         idxs, vals = zip(*self.cat_vars)
@@ -324,23 +230,11 @@ class MixedIntNLP(NLPBase):
         return cat, list(product(*[list(vals[i]) for i in order]))
 
 
-# ---------------------------------------------------------------------- #
-
-
 class ConstrainedMixedIntNLP(MixedIntNLP):
-    """+ explicit chance-bound feasibility constraint inside the SQP,
-    and an L1 hinge re-ranking the Sobol screen.
-
-    Both mechanisms operate on the latent-space LHS supplied by the
-    acquisition (`f(x) + z_sc·σ(x) − log_p_targ`); feasibility means
-    `LHS ≥ 0`. The threshold (i.e. `p_targ`) is baked into the
-    acquisition's `log_p_targ`, so this class only carries `l1_penalty`.
-
-    SQP constraint: `0 ≤ LHS ≤ +∞`.
-    L1 hinge: `raw − l1_penalty · max(0, −LHS)` — no penalty for
-    feasible points, linear penalty proportional to the chance-bound
-    shortfall otherwise.
-    """
+    """+ chance-bound feasibility constraint inside the SQP and an L1
+    hinge re-ranking the Sobol screen. Both operate on the latent-space
+    LHS from the acquisition (`f(x) + z_sc·σ(x) − log_p_targ`);
+    feasibility means LHS ≥ 0."""
 
     def __init__(
         self,
@@ -360,146 +254,18 @@ class ConstrainedMixedIntNLP(MixedIntNLP):
         )
         self.l1_penalty = float(l1_penalty)
 
-    def _solver(self, acq):
-        parent = super()._solver(acq)
-        cat, _ = self._layout()
+    def _constraint(self, acq, cat_idx):
+        feas = acq.feasibility_eval_fn()
         feas_state = acq.feasibility_state_args
-        if cat:
-            feas = acq.feasibility_eval_masked_fn(cat)
-            g = lambda x, p: jnp.atleast_1d(feas(x, p, *feas_state))
-        else:
-            feas = acq.feasibility_eval_fn()
-            g = lambda x, p: jnp.atleast_1d(feas(x, *feas_state))
-        return dataclasses.replace(
-            parent,
-            constraints=g,
-            constraint_lhs=jnp.array([0.0], dtype=jnp.float64),
-            constraint_rhs=jnp.array([jnp.inf], dtype=jnp.float64),
-            n_constraints=1,
-        )
+        con_fn = lambda x_full: jnp.atleast_1d(feas(x_full, *feas_state))
+        lhs = jnp.array([0.0], dtype=jnp.float64)
+        rhs = jnp.array([jnp.inf], dtype=jnp.float64)
+        return con_fn, lhs, rhs
 
-    def _sobol_screen(self, acq, dim, batch_fn, extra_args=(), rescore=None):
-        if rescore is None and self.l1_penalty > 0.0:
-            rescore = self._l1_rescore(acq, extra_args)
-        return super()._sobol_screen(acq, dim, batch_fn, extra_args, rescore=rescore)
-
-    def _l1_rescore(self, acq, extra_args):
-        """Build the L1-hinge rescore callback: subtracts
-        `l1_penalty * max(0, -LHS)` from the raw acquisition values,
-        where LHS is the latent-space chance-bound LHS."""
-        cat, _ = self._layout()
+    def _rescore(self, acq, raw, x_full):
+        if self.l1_penalty <= 0.0:
+            return raw
+        feas_fn = acq.feasibility_batch_fn()
         feas_state = acq.feasibility_state_args
-        if cat:
-            feas_fn = acq.feasibility_batch_masked_fn(cat)
-            mask_values = extra_args[0]
-
-            def rescore(raw, x_jnp):
-                feas = np.asarray(
-                    _pmap_batch_eval(feas_fn, x_jnp, mask_values, *feas_state)
-                )
-                return raw - self.l1_penalty * np.maximum(0.0, -feas)
-
-        else:
-            feas_fn = acq.feasibility_batch_fn()
-
-            def rescore(raw, x_jnp):
-                feas = np.asarray(
-                    _pmap_batch_eval(feas_fn, x_jnp, *feas_state)
-                )
-                return raw - self.l1_penalty * np.maximum(0.0, -feas)
-
-        return rescore
-
-
-def multistart_sqp(
-    objective_fn,
-    bounds: Tuple[np.ndarray, np.ndarray],
-    *,
-    seed: int,
-    pow_sobol: int = 10,
-    n_restarts: int = 8,
-    sqp_config: Optional[SQPConfig] = None,
-    n_params: int = 0,
-    constraints: Optional[dict] = None,
-) -> tuple[np.ndarray, float, dict]:
-    """Sobol-screen + multistart septal SQP for any box-constrained NLP.
-
-    The SQP minimises `objective_fn(x, p)`. Sobol-screens 2**pow_sobol
-    candidates over the box, takes the `n_restarts` lowest-objective
-    starts, vmaps the SQP solve across them, and returns the best
-    converged result. Falls back to the best Sobol candidate if no
-    start converges.
-    """
-    cfg = sqp_config or DEFAULT_SQP_CONFIG
-    lb_np = np.asarray(bounds[0], dtype=float)
-    ub_np = np.asarray(bounds[1], dtype=float)
-    d = int(lb_np.shape[0])
-    lb = jnp.asarray(lb_np, dtype=jnp.float64)
-    ub = jnp.asarray(ub_np, dtype=jnp.float64)
-
-    # Sobol cloud over the box, screen by raw objective (lower is better).
-    sampler = Sobol(d=d, scramble=True, seed=seed)
-    candidates_unit = sampler.random(2**pow_sobol)
-    candidates = lb_np + candidates_unit * (ub_np - lb_np)
-    x_jnp = jnp.asarray(candidates, dtype=jnp.float64)
-    p_zero = jnp.zeros(n_params, dtype=jnp.float64)
-    obj_batch = jax.vmap(objective_fn, in_axes=(0, None))(x_jnp, p_zero)
-    obj_np = np.asarray(obj_batch)
-
-    top_idx = np.argsort(obj_np)[:n_restarts]
-    starts = candidates[top_idx]
-    starts_jnp = jnp.asarray(starts, dtype=jnp.float64)
-    p_batch = jnp.zeros((n_restarts, n_params), dtype=jnp.float64)
-
-    # Build problem (with optional inequality constraint).
-    problem_kwargs = dict(
-        objective=objective_fn,
-        bounds=[lb, ub],
-        n_decision=d,
-        n_params=n_params,
-    )
-    if constraints is not None:
-        lhs = jnp.asarray(constraints["lhs"], dtype=jnp.float64).reshape(-1)
-        rhs = jnp.asarray(constraints["rhs"], dtype=jnp.float64).reshape(-1)
-        problem_kwargs.update(
-            constraints=constraints["fn"],
-            constraint_lhs=lhs,
-            constraint_rhs=rhs,
-            n_constraints=int(lhs.shape[0]),
-        )
-    factory = ParametricSQPFactory(ParametricNLPProblem(**problem_kwargs), cfg)
-    result = factory.solve_batch(starts_jnp, p_batch)
-
-    success = np.asarray(result.success).astype(bool)
-    objectives = np.asarray(result.objective)
-    decisions = np.asarray(result.decision_variables)
-
-    if not np.any(success):
-        best = int(np.argmin(obj_np[top_idx]))
-        x_best = np.clip(starts[best], lb_np, ub_np)
-        val_best = float(obj_np[top_idx][best])
-        info = {
-            "converged": False,
-            "n_converged": 0,
-            "n_starts": int(n_restarts),
-            "best_screen_obj": val_best,
-            "fallback": "sobol",
-        }
-        logger.warning(
-            "multistart_sqp_no_converged_starts",
-            n_starts=int(n_restarts),
-            fallback_obj=val_best,
-        )
-        return x_best, val_best, info
-
-    masked = np.where(success, objectives, np.inf)
-    best = int(np.argmin(masked))
-    x_best = np.clip(decisions[best], lb_np, ub_np)
-    val_best = float(objectives[best])
-    info = {
-        "converged": True,
-        "n_converged": int(np.sum(success)),
-        "n_starts": int(n_restarts),
-        "best_screen_obj": float(np.min(obj_np[top_idx])),
-    }
-    return x_best, val_best, info
+        lhs = np.asarray(_pmap_batch_eval(feas_fn, x_full, *feas_state))
+        return raw - self.l1_penalty * np.maximum(0.0, -lhs)

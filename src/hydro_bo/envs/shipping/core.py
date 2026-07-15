@@ -54,6 +54,7 @@ class ShippingEnv:
             self._args["vector"],
             self._args["mpc"]["random_param"],
             random_param_seed=derive_subseed(master_seed, "random_param"),
+            param_overrides=self._args["mpc"].get("param_overrides"),
         )
 
         self._controller_data.update(
@@ -315,6 +316,7 @@ class ShippingEnvPlot(ShippingEnv):
             self._args["vector"],
             self._args["mpc"]["random_param"],
             random_param_seed=derive_subseed(master_seed, "random_param"),
+            param_overrides=self._args["mpc"].get("param_overrides"),
         )
 
         self._controller_data.update(

@@ -26,6 +26,7 @@ from pyomo.environ import (
 from pyomo.opt import TerminationCondition
 
 from hydro_bo.utils.logging_config import get_logger
+from hydro_bo.mpc.immutable import IMMUTABLE_MPC_PARAMS
 from hydro_bo.mpc.utils import ext_visualise_output, suppress_output
 from hydro_bo.mpc.contiguity import ContiguityHandler
 from hydro_bo.mpc.relaxation import RelaxationTree
@@ -508,6 +509,24 @@ class MPCController:
         self._run_count += 1
 
 
+    def apply_param_updates(self, updates: Dict[str, Any]) -> None:
+        """Set mutable parameter values on the built instance in place and
+        refresh the persistent solver — no Pyomo instance rebuild."""
+        if self.instance is None or not self._instance_bound:
+            raise RuntimeError("apply_param_updates requires a built, bound instance")
+        for name, val in updates.items():
+            if name in IMMUTABLE_MPC_PARAMS:
+                raise ValueError(f"{name!r} is structural; rebuild required")
+            param_obj = getattr(self.instance, name, None)
+            if param_obj is None:
+                raise KeyError(f"unknown MPC parameter: {name!r}")
+            if isinstance(val, dict):
+                for idx, v in val.items():
+                    param_obj[idx].set_value(v)
+            else:
+                param_obj.set_value(val)
+        self._refresh_persistent_solver_from_instance()
+
     def _refresh_persistent_solver_from_instance(self):
         """Rebuild persistent solver view from current instance state."""
         if self.instance is None or not self._instance_bound:
@@ -634,19 +653,8 @@ class MPCController:
             getattr(self.model, key).construct()
 
     def _build_params(self, params_def):
-        # Parameters that must remain immutable (used in control flow,
-        # constraint construction, or set indexing).
-        immutable_params = {
-            'mean_ship_arrival_time',
-            'mean_ship_transit_time',
-            'std_ship_transit_time',
-            'expected_arrival_offset',
-            'forecast_horizon',  # branches storage-backoff constraints
-        }
-
         for key, param in params_def.items():
-            # Determine if this parameter should be mutable
-            is_mutable = key not in immutable_params
+            is_mutable = key not in IMMUTABLE_MPC_PARAMS
 
             if isinstance(param, dict):
                 index_set_values = list(param.keys())

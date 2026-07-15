@@ -54,19 +54,44 @@ _run_timestamp: str = ""
 _master_seed: int = 0
 
 
-def _objective_factory(cfg: Config, ref: dict):
+def _deep_merge(target: dict, updates: dict) -> None:
+    for k, v in updates.items():
+        if isinstance(v, dict) and isinstance(target.get(k), dict):
+            _deep_merge(target[k], v)
+        else:
+            target[k] = v
+
+
+def _objective_factory(cfg: Config, ref: dict, theta_registry=None):
     """Build the BO `f` closure that runs N_INSTANCES MPC simulations
     and returns the per-worker sample array with non-finite /
     catastrophic entries marked NaN. The constrained BO derives k
-    (feasible) and N (total) directly from these arrays."""
+    (feasible) and N (total) directly from these arrays.
+
+    With `theta_registry`, x is the joint vector `[x_design | theta]`:
+    theta is split off, routed through the registry's cost / env / MPC
+    sinks, and logged per eval."""
     g = cfg.general
     c = cfg.constrained_bo
+    d_design = len(PARAM_KEYS)
 
     def objective(x: np.ndarray) -> np.ndarray:
         global _eval_counter
         _eval_counter += 1
 
-        planning_params, env_overrides = params_from_x(x, ref, renewables=g.renewables, vector=g.vector)
+        x = np.asarray(x, dtype=float).ravel()
+        theta = None
+        bundle = None
+        if theta_registry is not None and theta_registry.dim > 0:
+            x, theta = x[:d_design], x[d_design:]
+            bundle = theta_registry.apply(theta)
+
+        planning_params, env_overrides = params_from_x(
+            x, ref, renewables=g.renewables, vector=g.vector,
+            cost_overrides=bundle.cost_overrides if bundle else None,
+        )
+        if bundle and bundle.env_overrides:
+            _deep_merge(env_overrides, bundle.env_overrides)
 
         dispatcher = RayMultiMPC(
             env_args=merge_env_overrides(cfg, env_overrides),
@@ -117,6 +142,9 @@ def _objective_factory(cfg: Config, ref: dict):
             result_entry[key] = flat_dims[key]
         result_entry["capex"] = planning_params["capex"]
         result_entry["opex"] = planning_params["opex"]
+        if theta is not None:
+            for name, val in zip(theta_registry.names, theta):
+                result_entry[f"theta.{name}"] = float(val)
         _results_log.append(result_entry)
 
         logger.info(

@@ -119,7 +119,8 @@ def build_cat_vars(bounds: np.ndarray) -> list[tuple[int, list[float]]]:
 
 
 def params_from_x(
-    x: np.ndarray, ref: dict, *, renewables: str, vector: str
+    x: np.ndarray, ref: dict, *, renewables: str, vector: str,
+    cost_overrides: dict | None = None,
 ) -> tuple[dict, dict]:
     """Convert a BO sample vector into `(planning_params, env_overrides)`.
 
@@ -156,6 +157,7 @@ def params_from_x(
         hydrogen_storage_capacity=p["hydrogen_storage_capacity"],
         renewable_energy_capacity=p["renewable_energy_capacity"],
         vector_storage_capacity=p["vector_storage_capacity"],
+        cost_overrides=cost_overrides,
     )
     p["capex"] = costs["capex"]
     p["opex"] = costs["opex"]

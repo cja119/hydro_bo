@@ -70,8 +70,13 @@ def _traverse(mapping: Mapping[str, Any], keys: Iterable[str]) -> Any:
 def import_mpc_data(
     planning_model: str | Path | dict, vector: str, random_param: bool = False,
     random_param_seed: int = 0,
+    param_overrides: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """Import MPC input data from config, variables, and planning model files."""
+    """Import MPC input data from config, variables, and planning model files.
+
+    `param_overrides` (theta registry `MpcParam` sinks) is applied last;
+    a key the pipeline does not already consume raises, so a theta can
+    never be silently dropped."""
 
     sets: Dict[str, list[Any]] = {}
     params: Dict[str, Any] = {}
@@ -169,6 +174,16 @@ def import_mpc_data(
         forms[key] = value
 
     price_dynamics = config.get("price_dynamics", {"enabled": False})
+
+    if param_overrides:
+        unknown = [k for k in param_overrides if k not in params]
+        if unknown:
+            raise KeyError(
+                f"param_overrides {unknown} are not consumed by the MPC "
+                f"data pipeline; known params: {sorted(params)}"
+            )
+        for key, val in param_overrides.items():
+            params[key] = val
 
     mat = int(params.get("mean_ship_arrival_time", 7))
     off = int(params.get("expected_arrival_offset", 0))
@@ -292,10 +307,20 @@ def calculate_capex_opex(
     hydrogen_storage_capacity: float,
     renewable_energy_capacity: float,
     vector_storage_capacity: float,
+    cost_overrides: Optional[Mapping[str, float]] = None,
 ) -> Dict[str, float | int | str]:
-    """Compute CAPEX and OPEX based on capacity choices."""
+    """Compute CAPEX and OPEX based on capacity choices.
+
+    `cost_overrides` patches the h2_plan parameter tree by dotted path
+    (theta registry `CostCoeff` sinks) before any coefficient is read;
+    a path that does not already resolve raises."""
 
     parameters = DefaultParams().formulation_parameters
+    if cost_overrides:
+        from hydro_bo.utils.theta import set_path
+
+        for path, val in cost_overrides.items():
+            set_path(parameters, path, float(val))
     system_duration = parameters["replacement_frequencies"]["system_duration"]
     discount_factor = parameters["miscillaneous"]["discount_factor"][1]
 

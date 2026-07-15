@@ -1,12 +1,9 @@
 """Acquisition functions for the Bayesian optimiser.
 
-Each `AcquisitionFunction` subclass exposes the data the solver layer
-needs to optimise it: a jitted negative-acquisition callable for LBFGSB,
-a jitted batched callable for the Sobol screen, and a `state_args`
-tuple of pytrees that those callables accept after `x` (and any
-extra mask args from branch-no-bound). Keeping the contract uniform
-means `solvers.py` doesn't have to know which acquisition it's
-optimising — adding a new one (e.g. cEI) is just a new class.
+Each `AcquisitionFunction` subclass exposes jitted callables over the
+full input vector plus a `state_args` tuple those callables accept
+after `x`. Integer combos are inserted by the solver layer before the
+call, so there are no masked variants here.
 """
 
 from abc import ABC, abstractmethod
@@ -125,75 +122,6 @@ def _ei_batch(
     )
 
 
-@partial(
-    jax.jit,
-    static_argnames=("mask_indices", "round_info", "mu_kernel_kind", "lv_kernel_kind"),
-)
-def _ei_neg_masked(
-    x_reduced,
-    mask_values,
-    gp_mu_state,
-    gp_log_var_state,
-    scaling,
-    g_best,
-    jitter,
-    mask_indices,
-    round_info,
-    mu_kernel_kind,
-    lv_kernel_kind,
-):
-    """Insert mask_values at mask_indices in x_reduced, then evaluate
-    -EI. mask_indices is static (one trace per index pattern);
-    mask_values is a JAX array, so combos share the same compile."""
-    x = x_reduced
-    for i, idx in enumerate(mask_indices):
-        left = x[..., :idx]
-        right = x[..., idx:]
-        fill = jnp.broadcast_to(mask_values[i].astype(x.dtype), x.shape[:-1] + (1,))
-        x = jnp.concatenate([left, fill, right], axis=-1)
-    return _ei_neg(
-        x, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info,
-        mu_kernel_kind, lv_kernel_kind,
-    )
-
-
-@partial(
-    jax.jit,
-    static_argnames=("mask_indices", "round_info", "mu_kernel_kind", "lv_kernel_kind"),
-)
-def _ei_batch_masked(
-    x_batch,
-    mask_values,
-    gp_mu_state,
-    gp_log_var_state,
-    scaling,
-    g_best,
-    jitter,
-    mask_indices,
-    round_info,
-    mu_kernel_kind,
-    lv_kernel_kind,
-):
-    """Vmapped POSITIVE EI over a batch of x_reduced points."""
-
-    def expand_one(x_red_one):
-        x = x_red_one
-        for i, idx in enumerate(mask_indices):
-            left = x[..., :idx]
-            right = x[..., idx:]
-            fill = jnp.broadcast_to(mask_values[i].astype(x.dtype), x.shape[:-1] + (1,))
-            x = jnp.concatenate([left, fill, right], axis=-1)
-        return x
-
-    x_full_batch = jax.vmap(expand_one)(x_batch)
-    return jax.vmap(
-        _ei_eval, in_axes=(0, None, None, None, None, None, None, None, None),
-    )(
-        x_full_batch, gp_mu_state, gp_log_var_state, scaling, g_best, jitter, round_info,
-        mu_kernel_kind, lv_kernel_kind,
-    )
-
-
 # --------------------------------------------------------------------- #
 # Feasibility-constraint LHS — chance-bound in latent space.
 #
@@ -241,43 +169,6 @@ def _feasibility_batch(
     )
 
 
-@partial(jax.jit, static_argnames=("mask_indices", "round_info", "bin_kernel_kind"))
-def _feasibility_eval_masked(
-    x_reduced, mask_values, gp_bin_state, log_p_targ, z_sc,
-    mask_indices, round_info, bin_kernel_kind,
-):
-    """Masked single-point LHS: insert mask_values at mask_indices in
-    x_reduced, then evaluate `_feasibility_eval`."""
-    x = x_reduced
-    for i, idx in enumerate(mask_indices):
-        left = x[..., :idx]
-        right = x[..., idx:]
-        fill = jnp.broadcast_to(mask_values[i].astype(x.dtype), x.shape[:-1] + (1,))
-        x = jnp.concatenate([left, fill, right], axis=-1)
-    return _feasibility_eval(x, gp_bin_state, log_p_targ, z_sc, round_info, bin_kernel_kind)
-
-
-@partial(jax.jit, static_argnames=("mask_indices", "round_info", "bin_kernel_kind"))
-def _feasibility_batch_masked(
-    x_batch, mask_values, gp_bin_state, log_p_targ, z_sc,
-    mask_indices, round_info, bin_kernel_kind,
-):
-    """Vmapped masked LHS over a batch of x_reduced points."""
-    def expand_one(x_red_one):
-        x = x_red_one
-        for i, idx in enumerate(mask_indices):
-            left = x[..., :idx]
-            right = x[..., idx:]
-            fill = jnp.broadcast_to(mask_values[i].astype(x.dtype), x.shape[:-1] + (1,))
-            x = jnp.concatenate([left, fill, right], axis=-1)
-        return x
-
-    x_full_batch = jax.vmap(expand_one)(x_batch)
-    return jax.vmap(_feasibility_eval, in_axes=(0, None, None, None, None, None))(
-        x_full_batch, gp_bin_state, log_p_targ, z_sc, round_info, bin_kernel_kind,
-    )
-
-
 # --------------------------------------------------------------------- #
 # Acquisition objects.
 # --------------------------------------------------------------------- #
@@ -288,15 +179,11 @@ class AcquisitionFunction(ABC):
 
     Subclasses must populate `state_args` (a tuple of jax pytrees / arrays
     forwarded as the trailing arguments of the jitted callables) and
-    expose the four jitted callables. The contract for each callable is
-    described on the property docstrings below.
+    expose `neg_acq_fn` / `acq_batch_fn`.
 
     Constrained subclasses additionally populate `feasibility_state_args`
-    and supply `feasibility_batch_fn` / `feasibility_batch_masked_fn`,
-    which return jitted callables giving P(feasible | x) ∈ [0, 1] over a
-    batch. Used by `ConstrainedMixedIntNLP` to apply an L1 hinge penalty
-    in the Sobol screen. Unconstrained acquisitions (e.g. EI) leave the
-    defaults that raise NotImplementedError.
+    and supply the feasibility callables; unconstrained acquisitions
+    leave the defaults that raise NotImplementedError.
     """
 
     state_args: tuple
@@ -307,24 +194,12 @@ class AcquisitionFunction(ABC):
 
     @abstractmethod
     def neg_acq_fn(self):
-        """Returns a jitted callable `f(x, *state_args) -> scalar` for LBFGSB."""
+        """Returns a jitted callable `f(x, *state_args) -> scalar`."""
         ...
 
     @abstractmethod
     def acq_batch_fn(self):
-        """Returns a jitted callable `f(x_batch, *state_args) -> (B,)` for sobol screen."""
-        ...
-
-    @abstractmethod
-    def neg_acq_masked_fn(self, mask_indices: tuple):
-        """Returns a jitted callable
-        `f(x_red, mask_values, *state_args) -> scalar` for branch-no-bound LBFGSB."""
-        ...
-
-    @abstractmethod
-    def acq_batch_masked_fn(self, mask_indices: tuple):
-        """Returns a jitted callable
-        `f(x_batch_red, mask_values, *state_args) -> (B,)` for branch-no-bound sobol."""
+        """Returns a jitted callable `f(x_batch, *state_args) -> (B,)` for the sobol screen."""
         ...
 
     def feasibility_batch_fn(self):
@@ -343,24 +218,6 @@ class AcquisitionFunction(ABC):
         at a single point. Used by the SQP layer to express feasibility
         as an explicit inequality constraint
         `p_targ <= P(feasible | x) <= 1`. Default raises."""
-        raise NotImplementedError(
-            f"{type(self).__name__} has no feasibility model; this is an "
-            "unconstrained acquisition."
-        )
-
-    def feasibility_eval_masked_fn(self, mask_indices: tuple):
-        """Returns a jitted callable
-        `f(x_red, mask_values, *feasibility_state_args) -> scalar` for
-        the branch-no-bound case. Default raises."""
-        raise NotImplementedError(
-            f"{type(self).__name__} has no feasibility model; this is an "
-            "unconstrained acquisition."
-        )
-
-    def feasibility_batch_masked_fn(self, mask_indices: tuple):
-        """Returns a jitted callable
-        `f(x_batch_red, mask_values, *feasibility_state_args) -> (B,)`
-        for the branch-no-bound case. Default raises."""
         raise NotImplementedError(
             f"{type(self).__name__} has no feasibility model; this is an "
             "unconstrained acquisition."
@@ -446,18 +303,6 @@ class ExpectedImprovement(AcquisitionFunction):
             mu_kernel_kind=self.mu_kernel_kind, lv_kernel_kind=self.lv_kernel_kind,
         )
 
-    def neg_acq_masked_fn(self, mask_indices: tuple):
-        return partial(
-            _ei_neg_masked, mask_indices=mask_indices, round_info=self.round_info,
-            mu_kernel_kind=self.mu_kernel_kind, lv_kernel_kind=self.lv_kernel_kind,
-        )
-
-    def acq_batch_masked_fn(self, mask_indices: tuple):
-        return partial(
-            _ei_batch_masked, mask_indices=mask_indices, round_info=self.round_info,
-            mu_kernel_kind=self.mu_kernel_kind, lv_kernel_kind=self.lv_kernel_kind,
-        )
-
 
 class ConstrainedExpectedImprovement(ExpectedImprovement):
     """Standard EI on the mu/log-var GPs, plus a chance-bound feasibility
@@ -467,10 +312,9 @@ class ConstrainedExpectedImprovement(ExpectedImprovement):
     latent threshold) and `z_sc` as a standard-normal quantile (z-score)
     directly — no more icdf inside the callable.
 
-    `feasibility_state_args = ()`: the four feasibility callables are
-    fully partial-filled with `(gp_bin_state, log_p_targ, z_sc, round_info)`
-    at construction time, so the solver layer just calls them with `x`
-    (and `mask_values` for the masked variants).
+    `feasibility_state_args = ()`: the feasibility callables are fully
+    partial-filled with `(gp_bin_state, log_p_targ, z_sc, round_info)`
+    at construction time, so the solver layer just calls them with `x`.
     """
 
     feasibility_state_args: tuple = ()
@@ -521,25 +365,4 @@ class ConstrainedExpectedImprovement(ExpectedImprovement):
             bin_kernel_kind=self.bin_kernel_kind,
         )
 
-    def feasibility_eval_masked_fn(self, mask_indices: tuple):
-        return partial(
-            _feasibility_eval_masked,
-            gp_bin_state=self.gp_bin_state,
-            log_p_targ=self.log_p_targ,
-            z_sc=self.z_sc,
-            mask_indices=tuple(mask_indices),
-            round_info=self.round_info,
-            bin_kernel_kind=self.bin_kernel_kind,
-        )
-
-    def feasibility_batch_masked_fn(self, mask_indices: tuple):
-        return partial(
-            _feasibility_batch_masked,
-            gp_bin_state=self.gp_bin_state,
-            log_p_targ=self.log_p_targ,
-            z_sc=self.z_sc,
-            mask_indices=tuple(mask_indices),
-            round_info=self.round_info,
-            bin_kernel_kind=self.bin_kernel_kind,
-        )
 
