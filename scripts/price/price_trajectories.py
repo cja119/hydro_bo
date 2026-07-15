@@ -14,7 +14,7 @@ DT = 1.0 / 365.0
 
 
 def load_price_config():
-    cfg_path = Path(__file__).resolve().parents[1] / "src" / "hydro_bo" / "data" / "config.yml"
+    cfg_path = Path(__file__).resolve().parents[2] / "src" / "hydro_bo" / "data" / "config.yml"
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f)
     return cfg.get("price_dynamics", {})
@@ -83,7 +83,7 @@ def main():
 
     fig.tight_layout()
 
-    out_dir = Path(__file__).resolve().parents[1] / "png"
+    out_dir = Path(__file__).resolve().parents[2] / "png"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "price_trajectories.png"
     fig.savefig(out_path, dpi=200)

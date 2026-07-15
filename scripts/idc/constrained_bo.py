@@ -1,9 +1,12 @@
-"""Unconstrained Bayesian optimisation over the MPC planning model parameters.
+"""Constrained Bayesian optimisation over the MPC planning model parameters.
+
+Same shape as `unconstrained_bo.py` but pairs the noisy-EI objective
+with a Polya-Gamma BinomialGP feasibility surrogate and a chance-bound
+constraint enforced inside the SQP. Failed solves are preserved as NaN
+samples (rather than substituted with a penalty value) so the
+BinomialGP picks up the feasibility signal directly.
 
 Reads `scripts/config.yml` for everything — no argparse, no CAPS-block.
-The Sobol initial design and any cached MPC observations are pulled in
-deterministically from the same config (sobol seed + pow_n shared with
-`sobol_mpc.py`).
 """
 
 import argparse
@@ -17,7 +20,7 @@ from typing import Optional
 import numpy as np
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from hydro_bo.mpc.dispatcher import RayMultiMPC
 from hydro_bo.utils.jax_threads import configure_jax_threads
@@ -28,6 +31,7 @@ from hydro_bo.utils.run_config import (
     merge_env_overrides,
     planning_model_path,
     resolve_sobol_dir,
+    resolve_warm_start_dirs,
 )
 from hydro_bo.utils.search_space import (
     INTEGER_KEYS,
@@ -43,8 +47,6 @@ logger = get_logger(__name__)
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 
-# Per-run mutable state. Module-level so the lambda passed to BO.f
-# can write to the results log without threading another arg through.
 _eval_counter: int = 0
 _results_log: list = []
 _bayesopt_dir: Optional[Path] = None
@@ -54,11 +56,11 @@ _master_seed: int = 0
 
 def _objective_factory(cfg: Config, ref: dict):
     """Build the BO `f` closure that runs N_INSTANCES MPC simulations
-    and returns the per-worker sample array. Failed solves get folded
-    into a single FAILURE_PENALTY sample when too few survive (the
-    unconstrained BO can't see NaN samples)."""
+    and returns the per-worker sample array with non-finite /
+    catastrophic entries marked NaN. The constrained BO derives k
+    (feasible) and N (total) directly from these arrays."""
     g = cfg.general
-    u = cfg.unconstrained_bo
+    c = cfg.constrained_bo
 
     def objective(x: np.ndarray) -> np.ndarray:
         global _eval_counter
@@ -78,24 +80,24 @@ def _objective_factory(cfg: Config, ref: dict):
 
         raw_scores = dispatcher.run_multisim()
         arr = np.asarray(raw_scores, dtype=float).ravel() if raw_scores else np.array([], dtype=float)
-        valid_mask = np.isfinite(arr) & (arr > -10.0)
-        valid_scores = arr[valid_mask]
-        n_valid = int(valid_scores.size)
-        n_failed = int(arr.size - n_valid)
+        # Pad missing workers with NaN — a worker that never reported back
+        # is still a feasibility signal at this x (timeout / OOM).
+        if arr.size < g.num_instances:
+            arr = np.concatenate([arr, np.full(g.num_instances - arr.size, np.nan)])
+        infeasible = ~np.isfinite(arr) | (arr <= c.infeas_threshold)
+        arr = np.where(infeasible, np.nan, arr)
 
-        if n_valid >= u.min_valid_samples:
-            bo_samples = valid_scores
-            mean_score = float(valid_scores.mean())
-            var_score = float(valid_scores.var(ddof=1)) if n_valid >= 2 else float("nan")
-            sd_score = float(np.sqrt(var_score)) if np.isfinite(var_score) else 0.0
-            objective_value = mean_score - g.stdev_penalty * sd_score
-            penalty_applied = False
-        else:
-            bo_samples = np.array([u.failure_penalty], dtype=float)
-            mean_score = u.failure_penalty
-            var_score = float("nan")
-            objective_value = u.failure_penalty
-            penalty_applied = True
+        n_total = int(arr.size)
+        k_feasible = int(n_total - int(infeasible.sum()))
+        feasibility_rate = k_feasible / max(n_total, 1)
+        mean_score = float(np.nanmean(arr)) if k_feasible >= 1 else float("nan")
+        var_score = float(np.nanvar(arr, ddof=1)) if k_feasible >= 2 else float("nan")
+        sd_score = float(np.sqrt(var_score)) if np.isfinite(var_score) else 0.0
+        objective_value = (
+            mean_score - g.stdev_penalty * sd_score
+            if np.isfinite(mean_score)
+            else float("nan")
+        )
 
         result_entry = {
             "eval_id": _eval_counter,
@@ -104,10 +106,11 @@ def _objective_factory(cfg: Config, ref: dict):
             "mean_score": mean_score,
             "var_score": var_score,
             "num_workers": len(raw_scores),
-            "n_valid": n_valid,
-            "n_failed": n_failed,
-            "penalty_applied": penalty_applied,
+            "k_feasible": k_feasible,
+            "n_total": n_total,
+            "feasibility_rate": feasibility_rate,
             "worker_scores": list(raw_scores),
+            "x": [float(v) for v in np.asarray(x, dtype=float).ravel()],
         }
         flat_dims = flatten_dims(planning_params, env_overrides)
         for key in PARAM_KEYS:
@@ -122,13 +125,13 @@ def _objective_factory(cfg: Config, ref: dict):
             objective=objective_value,
             mean=mean_score,
             variance=var_score,
-            n_valid=n_valid,
-            n_failed=n_failed,
-            penalty_applied=penalty_applied,
+            k_feasible=k_feasible,
+            n_total=n_total,
+            feasibility_rate=feasibility_rate,
         )
         if _bayesopt_dir is not None:
             save_results(_results_log, _bayesopt_dir, _run_timestamp)
-        return bo_samples
+        return arr
 
     return objective
 
@@ -137,17 +140,18 @@ def load_sobol_cache(
     sobol_dir: Path,
     cfg: Config,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Load cached `(x, valid_worker_scores)` pairs from a sobol_mpc
-    results directory matching this run's general config (vector,
-    bounds_expansion, dynamic_price). Rows with fewer than
-    `min_valid_samples` survivors are dropped — they don't seed the GP.
-    If `unconstrained_bo.n_sobol_cache` is set, stop after that many
-    matched rows have been loaded (sorted-row order, so subset is
-    stable)."""
-    g, u = cfg.general, cfg.unconstrained_bo
-    cap = u.n_sobol_cache
+    """Load matching cached rows from a sobol_mpc results directory.
+
+    Non-finite / catastrophic worker scores become NaN, and rows are
+    NaN-padded to `num_instances` so `N` is consistent. If
+    `constrained_bo.n_sobol_cache` is set, stop after that many matched
+    rows have been loaded — rows are visited in sorted order so the
+    subset is stable across runs.
+    """
+    g, c = cfg.general, cfg.constrained_bo
+    cap = c.n_sobol_cache
     observations: list[tuple[np.ndarray, np.ndarray]] = []
-    n_missing_result = n_mismatched = n_failed = 0
+    n_missing_result = n_mismatched = 0
 
     row_dirs = sorted(sobol_dir.glob("row_*"))
     for rd in row_dirs:
@@ -169,17 +173,13 @@ def load_sobol_cache(
         scores = data.get("worker_scores")
         if scores is None:
             obj = data.get("objective")
-            if obj is None or not np.isfinite(obj) or obj <= -10.0:
-                n_failed += 1
-                continue
-            scores = [obj]
-
-        arr = np.asarray(scores, dtype=float).ravel()
-        valid_arr = arr[np.isfinite(arr) & (arr > -10.0)]
-        if valid_arr.size < u.min_valid_samples:
-            n_failed += 1
-            continue
-        observations.append((np.asarray(data["x"], dtype=float), valid_arr))
+            scores = [obj] if obj is not None else []
+        arr = np.asarray(scores, dtype=float).ravel() if scores else np.array([], dtype=float)
+        if arr.size < g.num_instances:
+            arr = np.concatenate([arr, np.full(g.num_instances - arr.size, np.nan)])
+        infeasible = ~np.isfinite(arr) | (arr <= c.infeas_threshold)
+        arr = np.where(infeasible, np.nan, arr)
+        observations.append((np.asarray(data["x"], dtype=float), arr))
 
     logger.info(
         "bayesopt.sobol_cache_loaded",
@@ -188,19 +188,91 @@ def load_sobol_cache(
         n_loaded=len(observations),
         n_missing_result=n_missing_result,
         n_mismatched=n_mismatched,
-        n_failed=n_failed,
         cap=cap,
     )
     return observations
 
 
+def load_bo_observations(
+    warm_start_dirs: list,
+    cfg: Config,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Load observations from prior `constrained_bo` run directories.
+
+    Each entry in `bo_results_detailed_*.json` records one BO evaluation:
+    the flat per-dim values (one column per `PARAM_KEYS` entry) and the
+    raw `worker_scores`. We rebuild `x` in `PARAM_KEYS` order, NaN-pad
+    short sample arrays to `num_instances`, and re-apply the current
+    `infeas_threshold` — so resuming with a stricter threshold reclassifies
+    borderline points correctly. Only the most-recent
+    `bo_results_detailed_*.json` per directory is used (mirroring how the
+    BO script overwrites the file each iteration).
+    """
+    g, c = cfg.general, cfg.constrained_bo
+    observations: list[tuple[np.ndarray, np.ndarray]] = []
+    n_missing = n_no_scores = 0
+
+    for wsd in warm_start_dirs:
+        if not wsd.exists():
+            logger.warning("bayesopt.warm_start_dir_missing", path=str(wsd))
+            n_missing += 1
+            continue
+        detailed_files = sorted(wsd.glob("bo_results_detailed_*.json"))
+        if not detailed_files:
+            logger.warning("bayesopt.warm_start_no_detailed", path=str(wsd))
+            n_missing += 1
+            continue
+        with open(detailed_files[-1]) as f:
+            entries = json.load(f)
+
+        n_loaded_dir = 0
+        for entry in entries:
+            scores = entry.get("worker_scores")
+            if not scores:
+                n_no_scores += 1
+                continue
+            try:
+                x = np.asarray([float(entry[k]) for k in PARAM_KEYS], dtype=float)
+            except KeyError as missing:
+                logger.warning(
+                    "bayesopt.warm_start_missing_dim",
+                    path=str(detailed_files[-1]),
+                    eval_id=entry.get("eval_id"),
+                    missing=str(missing),
+                )
+                continue
+            arr = np.asarray(scores, dtype=float).ravel()
+            if arr.size < g.num_instances:
+                arr = np.concatenate([arr, np.full(g.num_instances - arr.size, np.nan)])
+            infeasible = ~np.isfinite(arr) | (arr <= c.infeas_threshold)
+            arr = np.where(infeasible, np.nan, arr)
+            observations.append((x, arr))
+            n_loaded_dir += 1
+
+        logger.info(
+            "bayesopt.warm_start_loaded",
+            path=str(wsd),
+            file=str(detailed_files[-1].name),
+            n_entries=len(entries),
+            n_loaded=n_loaded_dir,
+        )
+
+    logger.info(
+        "bayesopt.warm_start_total",
+        n_dirs=len(warm_start_dirs),
+        n_missing=n_missing,
+        n_no_scores=n_no_scores,
+        n_loaded=len(observations),
+    )
+    return observations
+
+
 def save_results(results_log: list, bayesopt_dir: Path, run_timestamp: str):
-    """CSV + detailed JSON, overwriting on each call for crash-safety."""
     if not results_log:
         return
     fieldnames = [
         "eval_id", "timestamp", "objective", "mean_score", "var_score",
-        "num_workers", "n_valid", "n_failed", "penalty_applied",
+        "num_workers", "k_feasible", "n_total", "feasibility_rate",
     ] + PARAM_KEYS + ["capex", "opex"]
     csv_path = bayesopt_dir / f"bo_results_{run_timestamp}.csv"
     with open(csv_path, "w", newline="") as f:
@@ -233,14 +305,12 @@ def main():
         vector_override=cli.vector,
         num_devices_override=cli.ncpus,
     )
-    g, u, s = cfg.general, cfg.unconstrained_bo, cfg.sobol
+    g, c, s = cfg.general, cfg.constrained_bo, cfg.sobol
 
     configure_jax_threads(cfg.nlp.n_devices, cfg.nlp.blas_threads)
-
-    # BO classes pull jax at import — defer until after configure_jax_threads.
     from hydro_bo.mpc.dispatcher import ensure_ray  # noqa: E402
     ensure_ray(num_cpus=cfg.general.num_devices)
-    from hydro_bo.opt import MeanVarBayesopt  # noqa: E402
+    from hydro_bo.opt import ConstrainedBayesopt  # noqa: E402
 
     global _eval_counter, _results_log, _bayesopt_dir, _run_timestamp, _master_seed
     _eval_counter = 0
@@ -256,13 +326,19 @@ def main():
 
     _master_seed = resolve_master_seed(g.master_seed)
     logger.info("bayesopt.master_seed", master_seed=_master_seed, cli_seed=g.master_seed)
+    logger.info(
+        "bayesopt.constrained_config",
+        p_targ=c.p_targ,
+        z_sc=c.z_sc,
+        l1_penalty=c.l1_penalty,
+        infeas_threshold=c.infeas_threshold,
+    )
 
-    # Snapshot full resolved config for reproducibility.
     with open(_bayesopt_dir / "args.json", "w") as f:
         json.dump(
             {
                 "general": g.__dict__,
-                "unconstrained_bo": u.__dict__,
+                "constrained_bo": c.__dict__,
                 "sobol": s.__dict__,
                 "nlp": cfg.nlp.__dict__,
                 "master_seed_resolved": _master_seed,
@@ -288,36 +364,31 @@ def main():
     logger.info("bayesopt.search_space", dims=len(PARAM_KEYS))
     for key, (lo, hi) in zip(PARAM_KEYS, bounds):
         logger.info("bayesopt.parameter_bounds", parameter=key, lower=lo, upper=hi)
-    for dim_idx, positions in cat_vars:
-        logger.info(
-            "bayesopt.cat_var",
-            parameter=PARAM_KEYS[dim_idx],
-            dim=dim_idx,
-            integer_levels=[
-                int(round(bounds[dim_idx, 0] + p * (bounds[dim_idx, 1] - bounds[dim_idx, 0])))
-                for p in positions
-            ],
-            unit_positions=positions,
-        )
 
-    bo = MeanVarBayesopt(
+    bo = ConstrainedBayesopt(
         f=_objective_factory(cfg, ref),
         bounds=bounds,
-        n_initial_points=u.n_initial_points,
-        iter_limit=u.iter_budget,
+        n_initial_points=c.n_initial_points,
+        iter_limit=c.iter_budget,
         lam=g.stdev_penalty,
         n_restarts=cfg.nlp.acq_n_restarts,
         pow_sobol=cfg.nlp.acq_pow_sobol,
         seed=_master_seed % (2**31),
         cat_vars=cat_vars,
+        p_targ=c.p_targ,
+        z_sc=c.z_sc,
+        l1_penalty=c.l1_penalty,
         sqp_config=cfg.nlp.to_sqp_config(),
         pad_initial=cfg.nlp.pad_initial,
         gp_lbfgs_max_iter=cfg.nlp.gp_lbfgs_max_iter,
         gp_mu_kernel=cfg.nlp.gp_mu_kernel,
         gp_log_var_kernel=cfg.nlp.gp_log_var_kernel,
+        gp_bin_kernel=cfg.nlp.gp_bin_kernel,
+        gp_bin_label_smoothing=cfg.nlp.gp_bin_label_smoothing,
     )
 
-    sobol_dir = resolve_sobol_dir(u.sobol_dir, SCRIPTS_DIR, g.vector)
+    sobol_dir = resolve_sobol_dir(c.sobol_dir, SCRIPTS_DIR, g.vector)
+    n_preloaded = 0
     if sobol_dir is not None:
         if not sobol_dir.exists():
             logger.error("bayesopt.sobol_dir_missing", path=str(sobol_dir))
@@ -325,9 +396,18 @@ def main():
             preloaded = load_sobol_cache(sobol_dir, cfg)
             for x, samples in preloaded:
                 bo.observe(x, samples)
-            if preloaded:
-                bo.n_initial_points = len(preloaded)
-                logger.info("bayesopt.sobol_phase_skipped_via_cache", n_preloaded=len(preloaded))
+            n_preloaded += len(preloaded)
+
+    warm_start_dirs = resolve_warm_start_dirs(c.warm_start_dirs, SCRIPTS_DIR, g.vector)
+    if warm_start_dirs:
+        warm = load_bo_observations(warm_start_dirs, cfg)
+        for x, samples in warm:
+            bo.observe(x, samples)
+        n_preloaded += len(warm)
+
+    if n_preloaded:
+        bo.n_initial_points = n_preloaded
+        logger.info("bayesopt.sobol_phase_skipped_via_cache", n_preloaded=n_preloaded)
 
     best_x, best_score = bo.run()
     best_planning_params, best_env_overrides = params_from_x(
@@ -337,14 +417,10 @@ def main():
 
     logger.info("bayesopt.complete")
     logger.info("bayesopt.best_score", score=best_score)
-    logger.info("bayesopt.best_parameters")
     for k, v in best_flat.items():
         logger.info("bayesopt.parameter", name=k, value=v)
 
-    # Snapshot all best dims into the artifact YAML — planning params plus
-    # the env-side wind override. import_mpc_data ignores unknown keys, so
-    # the planning side stays consumable.
-    out_path = SCRIPTS_DIR / "tmp" / "planning" / f"{g.vector}-Chile-bo.yml"
+    out_path = SCRIPTS_DIR / "tmp" / "planning" / f"{g.vector}-Chile-cbo.yml"
     snapshot = dict(best_planning_params)
     snapshot["wind_forecast_mean"] = best_flat["wind_forecast_mean"]
     with open(out_path, "w") as f:

@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from hydro_bo.mpc.dispatcher import RayMultiMPC
 from hydro_bo.utils.logging_config import configure_logging, get_logger

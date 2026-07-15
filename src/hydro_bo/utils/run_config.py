@@ -35,6 +35,10 @@ class GeneralCfg:
     dynamic_price: bool
     stdev_penalty: float
     log_level: int  # stdlib logging level for the hydro_bo namespace.
+    # Where the planning-model reference YAML lives; relative paths resolve
+    # against the config's directory. Lets the parametric scripts reuse the
+    # IDC planning solve rather than repeating it.
+    planning_dir: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -112,12 +116,22 @@ class ConstrainedCfg:
 
 
 @dataclass(frozen=True)
+class ThetaCfg:
+    """Uncertain-parameter block. Absent from a config → `Config.theta` is
+    None and the run is a plain IDC run over the design space alone."""
+
+    params: List[str]  # names resolved against `hydro_bo.utils.theta.default_catalog`.
+    seed: int          # Sobol seed for drawing the per-iteration theta nodes.
+
+
+@dataclass(frozen=True)
 class Config:
     general: GeneralCfg
     sobol: SobolCfg
     nlp: NlpCfg
     unconstrained_bo: UnconstrainedCfg
     constrained_bo: ConstrainedCfg
+    theta: Optional[ThetaCfg] = None
 
 
 def _optional_int(raw) -> Optional[int]:
@@ -193,7 +207,17 @@ def _resolve_general(g: dict) -> GeneralCfg:
         dynamic_price=bool(g.get("dynamic_price", False)),
         stdev_penalty=float(g["stdev_penalty"]),
         log_level=_resolve_log_level(g.get("log_level")),
+        planning_dir=g.get("planning_dir"),
     )
+
+
+def _resolve_theta(t: Optional[dict]) -> Optional[ThetaCfg]:
+    if not t:
+        return None
+    params = list(t.get("params") or [])
+    if not params:
+        raise ValueError("theta.params is empty; omit the theta block entirely for an IDC run.")
+    return ThetaCfg(params=[str(p) for p in params], seed=int(t.get("seed", 0)))
 
 
 def load_config(
@@ -281,13 +305,24 @@ def load_config(
             n_sobol_cache=_optional_int(raw["constrained_bo"].get("n_sobol_cache")),
             warm_start_dirs=list(raw["constrained_bo"].get("warm_start_dirs") or []),
         ),
+        theta=_resolve_theta(raw.get("theta")),
     )
 
 
-def planning_model_path(scripts_dir: Path, vector: str) -> Path:
-    """Standard planning-model location, anchored at the supplied
-    scripts directory (typically the directory holding config.yml)."""
-    return Path(scripts_dir) / "tmp" / "planning" / f"{vector}-Chile.yml"
+def planning_model_path(
+    scripts_dir: Path, vector: str, planning_dir: Optional[str] = None
+) -> Path:
+    """Planning-model location, anchored at the supplied scripts directory
+    (typically the directory holding config.yml). `planning_dir` overrides
+    the default `<scripts_dir>/tmp/planning`; relative overrides resolve
+    against `scripts_dir`."""
+    if planning_dir:
+        base = Path(str(planning_dir))
+        if not base.is_absolute():
+            base = Path(scripts_dir) / base
+    else:
+        base = Path(scripts_dir) / "tmp" / "planning"
+    return base / f"{vector}-Chile.yml"
 
 
 def env_args_from(cfg: Config) -> dict:

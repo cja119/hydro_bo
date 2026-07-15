@@ -52,7 +52,7 @@ import numpy as np
 import yaml
 from scipy.special import ndtri
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 from hydro_bo.utils.jax_threads import configure_jax_threads

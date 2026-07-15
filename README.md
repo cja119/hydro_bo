@@ -26,23 +26,45 @@ pip install git+https://github.com/cja119/hydro_bo.git
 
 Please note a licence for Gurobi is required.
 
+Run scripts live under two directories. `scripts/idc/` holds the original
+integrated-design-and-control problem; `scripts/parametric/` holds the
+parametric (uncertain-parameter) work. Each is self-contained, with its own
+`config.yml` and `tmp/` output tree.
+
 ### Run the Planning Optimisation
 
-Navigate to ./scripts/ and run the following:
-
 ```sh
-python planning.py "NH3" # Or LH2
+python scripts/idc/planning_model.py "NH3" # Or LH2
 ```
 
-This will generate a results file in ./scripts/tmp/planning that will then be accessed by your optimisation run.
+This generates a results file in `./scripts/idc/tmp/planning` that is then
+accessed by your optimisation run. Both flavours share it — the parametric
+config points at this directory via `general.planning_dir`.
 
 ## Run the Bayesian Optimisation
 
 ```sh
-python bayesopt.py "NH3" # Or LH2
+python scripts/idc/constrained_bo.py            # chance-constrained IDC run
+python scripts/idc/unconstrained_bo.py          # unconstrained variant
 ```
 
-This will save results in ./scripts/tmp/ray_results.
+Everything else is configured in `scripts/idc/config.yml`; the only CLI
+overrides are `--vector` and `--ncpus`. Results are saved under
+`./scripts/idc/tmp/<date>/<time>/<vector>/`.
+
+## Run the Parametric (theta) Optimisation
+
+```sh
+python scripts/parametric/parametric_bo.py
+```
+
+The uncertain parameters are named in the `theta:` block of
+`scripts/parametric/config.yml` and resolved against the catalog in
+`hydro_bo.utils.theta`. The GP is fit over the joint space
+`[x_design | theta]`, and each iteration optimises the design at a
+Sobol-drawn theta node. Results are saved under
+`./scripts/parametric/tmp/<date>/<time>/<vector>/`, with one `theta.<name>`
+column per uncertain parameter.
 
 ## Visualising Trajectories
 

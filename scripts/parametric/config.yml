@@ -1,0 +1,86 @@
+# Configuration for the parametric (theta) run scripts.
+#
+# Mirrors scripts/idc/config.yml, plus a `theta:` block naming the
+# uncertain parameters. The BO runs over the joint space [x | theta]:
+# the GP is fit on the joint input, and each iteration optimises the
+# design at a Sobol-drawn theta node rather than maximising over theta.
+#
+# `planning_dir` points at the IDC planning solve so the reference model
+# is not regenerated — run `python scripts/idc/planning_model.py NH3`
+# once and both flavours share it.
+
+general:
+  vector:           NH3
+  renewables:       wind
+  weather_file:
+    - CoastalChile_05-10_Wind.csv
+    - CoastalChile_10-15_Wind.csv
+    - CoastalChile_15-20_Wind.csv
+    - CoastalChile_20-21_Wind.csv
+    - CoastalChile_21-22_Wind.csv
+    - CoastalChile_23-24_Wind.csv
+  bounds_expansion: 0.5
+  num_devices:      16
+  num_instances:    32
+  timeout:          900
+  forecast_horizon: 24
+  master_seed:      null
+  dynamic_price:    false
+  stdev_penalty:    0.5
+  log_level:        DEBUG
+  planning_dir:     ../idc/tmp/planning   # shared with the IDC runs
+
+# Uncertain parameters. Names resolve against
+# `hydro_bo.utils.theta.default_catalog`; bounds come from h2_plan's own
+# [optimistic, nominal, pessimistic] data triples. Keep this list short —
+# the optimizer-map estimate degrades quickly with theta dimension.
+theta:
+  params:
+    - electrolyser_capex
+    - discount_factor
+  seed: 7          # Sobol seed for the per-iteration theta nodes
+
+sobol:
+  pow_n:            14
+  seed:             42
+  walltime_seconds: null
+  buffer_seconds:   300
+  sobol_dir:        tmp/sobol/{vector}
+
+nlp:
+  acq_pow_sobol:        14
+  acq_n_restarts:       4
+  pad_initial:          512
+  gp_lbfgs_max_iter:    300
+  n_devices:            16
+  blas_threads:         1
+  sqp_max_iter:         20
+  sqp_tol_stationarity: 1e-4
+  sqp_tol_feasibility:  1e-4
+  sqp_use_exact_hessian: false
+  sqp_osqp_max_iter:    500
+  sqp_osqp_tol:         1e-5
+  sqp_max_line_search:  5
+  gp_mu_kernel:         rbf
+  gp_log_var_kernel:    rbf
+  gp_bin_kernel:        matern52
+  gp_bin_label_smoothing: 0.5
+
+unconstrained_bo:
+  iter_budget:        500
+  n_initial_points:   4
+  failure_penalty:    -10.0
+  min_valid_samples:  4
+  sobol_dir:          tmp/sobol/{vector}
+  n_sobol_cache:      null
+
+constrained_bo:
+  iter_budget:        500
+  n_initial_points:   8            # joint space is wider than IDC's — seed it harder
+  infeas_threshold:   -10.0
+  p_targ:             0.9
+  z_sc:               1.6449
+  l1_penalty:         50.0
+  sobol_dir:          tmp/sobol/{vector}
+  n_sobol_cache:      null         # IDC Sobol cache is design-only; not replayable here
+  warm_start_dirs:    null
