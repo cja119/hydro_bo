@@ -36,9 +36,28 @@ general:
 # the optimizer-map estimate degrades quickly with theta dimension.
 theta:
   params:
-    - electrolyser_capex
-    - discount_factor
-  seed: 7          # Sobol seed for the per-iteration theta nodes
+    - ramp_up_limit           # vector production ramp-up rate
+    - ramp_down_limit         # vector production ramp-down rate
+    - hydrogen_storage_capex  # cost of hydrogen storage
+  seed: 7          # Sobol seed for the per-iteration theta nodes (EI runner)
+
+# Parametric knowledge-gradient settings.
+#   mode: strict     -> a real mixed-integer inner solve per Hermite node
+#   mode: index_set  -> inner max over a fixed design set, (A_i,B_i) reused
+# theta_quad_per_dim is per dimension: 5**3 = 125 nodes for d_theta = 3.
+# inner_pow_sobol is deliberately far below nlp.acq_pow_sobol, since the
+# inner screen runs once per z node inside every outer evaluation.
+kg:
+  mode:                        strict
+  theta_quad_per_dim:          5
+  z_quad_points:               9
+  inner_pow_sobol:             6        # 2**6 = 64
+  inner_n_restarts:            1
+  inner_sqp_max_iter:          20
+  inner_sqp_use_exact_hessian: true
+  index_set_pow:               8        # 2**8 = 256, mode: index_set
+  seed:                        0
+  profile:                     false
 
 sobol:
   pow_n:            14

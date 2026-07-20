@@ -190,6 +190,31 @@ def _predict(params, X_train, L, alpha, mean, mask, X_test, round_info, kernel_k
     var = jnp.clip(var, 1e-12, None)
     return mu, var
 
+@partial(
+    jax.jit,
+    static_argnames=("round_info", "kernel_kind"),
+)
+def _predict_covariance(params, X_train, L, mask, X_test, X_cand, round_info, kernel_kind):
+    """Posterior covariance k_n(X_test, X_cand) for a padded GP:
+
+        k(X_test, x) - k(X_test, X) K^-1 k(X, x)
+
+    `mask` zeros padded training rows out of the correction term, exactly
+    as `_predict` does for the variance. Returns shape (n_test,)."""
+
+    def kernel_fn(A, B):
+        return _kernel(
+            params["log_amp"], params["log_ls"], A, B, round_info, kernel_kind,
+        )
+
+    K_test = kernel_fn(X_test, X_train)               # (n_test, n_train)
+    K_cand = kernel_fn(X_cand[None, :], X_train)      # (1, n_train)
+    K_cross = kernel_fn(X_test, X_cand[None, :]).squeeze(-1)   # (n_test,)
+
+    v = jax.scipy.linalg.cho_solve((L, True), K_cand.T)        # (n_train, 1)
+
+    return K_cross - jnp.sum(K_test * v.T * mask[None, :], axis=1)
+
 
 @partial(jax.jit, static_argnames=("round_info", "kernel_kind"))
 def _predict_zero_mean(params, X_train, L, alpha, mask, X_test, round_info, kernel_kind):

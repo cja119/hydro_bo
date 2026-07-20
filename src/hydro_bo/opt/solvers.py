@@ -6,7 +6,7 @@ restart axis; combo values reach the objective by closure.
 from __future__ import annotations
 
 from itertools import product
-from typing import Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 import numpy as np
 import jax
@@ -15,7 +15,7 @@ from scipy.stats.qmc import Sobol
 
 from septal.jax.sqp import SQPConfig
 
-from hydro_bo.opt.acquisition import AcquisitionFunction
+
 from hydro_bo.opt.sqp_driver import run_sqp
 from hydro_bo.utils.logging_config import get_logger
 
@@ -29,7 +29,9 @@ DEFAULT_SQP_CONFIG = SQPConfig(
     tol_feasibility=1e-6,
 )
 
-
+if TYPE_CHECKING:
+    from hydro_bo.opt.acquisition import AcquisitionFunction
+    
 def sobol_sample(bounds: np.ndarray, n: int, seed: int = 0) -> np.ndarray:
     """Quasi-random points in `bounds` for the BO initial-design phase."""
     sampler = Sobol(d=bounds.shape[0], scramble=True, seed=seed)
@@ -95,7 +97,7 @@ class NLPBase:
         self.n_restarts = int(n_restarts)
         self.sqp_config = sqp_config or DEFAULT_SQP_CONFIG
 
-    def maximise(self, acq: AcquisitionFunction) -> tuple[np.ndarray, float]:
+    def maximise(self, acq: 'AcquisitionFunction') -> tuple[np.ndarray, float]:
         import time as _time
 
         D = self._dim(acq)
@@ -147,17 +149,17 @@ class NLPBase:
     def _layout(self) -> tuple[tuple[int, ...], list[tuple[float, ...]]]:
         return (), [()]
 
-    def _constraint(self, acq: AcquisitionFunction, cat_idx: tuple):
+    def _constraint(self, acq: 'AcquisitionFunction', cat_idx: tuple):
         """Returns (con_fn(x_full) -> (n_g,), lhs, rhs) or None."""
         return None
 
-    def _rescore(self, acq: AcquisitionFunction, raw: np.ndarray, x_full) -> np.ndarray:
+    def _rescore(self, acq: 'AcquisitionFunction', raw: np.ndarray, x_full) -> np.ndarray:
         return raw
 
     # ---- shared infrastructure ----
 
     @staticmethod
-    def _dim(acq: AcquisitionFunction) -> int:
+    def _dim(acq: 'AcquisitionFunction') -> int:
         return int(acq.state_args[0]["X"].shape[1])
 
     def _screen(self, acq, D_red, cat_idx, combos_np):
@@ -269,3 +271,88 @@ class ConstrainedMixedIntNLP(MixedIntNLP):
         feas_state = acq.feasibility_state_args
         lhs = np.asarray(_pmap_batch_eval(feas_fn, x_full, *feas_state))
         return raw - self.l1_penalty * np.maximum(0.0, -lhs)
+
+
+# ---------------------------------------------------------------------- #
+# Traceable mixed-integer driver.
+#
+# Functional twin of `NLPBase.maximise` for use *inside* a trace — the
+# class driver above is untouched and still serves EI/cEI. The difference
+# is that scipy/numpy host calls are hoisted out (Sobol cloud and combo
+# grid become literals built once), so the solve is pure jnp with static
+# shapes and can be vmapped over an outer axis (KG's Hermite nodes).
+# ---------------------------------------------------------------------- #
+
+
+def sobol_cloud(dim: int, pow_sobol: int, seed: int = 0) -> jnp.ndarray:
+    """Sobol screen cloud as a literal, built host-side once."""
+    if int(dim) == 0:
+        return jnp.zeros((1, 0), dtype=jnp.float64)
+    sampler = Sobol(d=int(dim), scramble=True, seed=int(seed))
+    return jnp.asarray(sampler.random(2 ** int(pow_sobol)), dtype=jnp.float64)
+
+
+def combo_grid(cat_vars: Sequence[Tuple[int, Sequence[float]]]):
+    """Array form of `MixedIntNLP._layout`: (cat_idx, combos (C, n_int))."""
+    cat = [(int(i), [float(v) for v in vals]) for i, vals in cat_vars]
+    if not cat:
+        return (), jnp.zeros((1, 0), dtype=jnp.float64)
+    order = sorted(range(len(cat)), key=lambda j: cat[j][0])
+    cat_idx = tuple(cat[j][0] for j in order)
+    combos = np.asarray(list(product(*[cat[j][1] for j in order])), dtype=float)
+    return cat_idx, jnp.asarray(combos, dtype=jnp.float64)
+
+
+def mip_solve(
+    neg_obj,
+    cloud: jnp.ndarray,
+    combos: jnp.ndarray,
+    cat_idx: tuple,
+    lb: jnp.ndarray,
+    ub: jnp.ndarray,
+    cfg: SQPConfig,
+    n_restarts: int = 1,
+    warm_starts: Optional[jnp.ndarray] = None,
+):
+    """Traceable mixed-integer maximisation of `-neg_obj`.
+
+    `neg_obj(x_full) -> scalar` is minimised, as everywhere else in the
+    solver layer; the returned value is the corresponding maximum.
+    Screens `cloud` per integer combo, takes the `n_restarts` best as SQP
+    starts (prepending `warm_starts` when given), then solves every
+    (combo, restart) cell with `run_sqp`.
+
+    Returns (x_full_best (d,), value_best scalar).
+    """
+    C = int(combos.shape[0])
+    d_red = int(lb.shape[0])
+
+    def screen_combo(ints):
+        return jax.vmap(lambda xr: -neg_obj(_insert(xr, ints, cat_idx)))(cloud)
+
+    scores = jax.vmap(screen_combo)(combos)                    # (C, S)
+    _, top = jax.lax.top_k(scores, int(n_restarts))            # (C, R_s)
+    starts = jnp.take(cloud, top, axis=0)                      # (C, R_s, d_red)
+    if warm_starts is not None:
+        starts = jnp.concatenate([warm_starts, starts], axis=1)
+    R = int(starts.shape[1])
+
+    def solve_cell(x0, ints):
+        return run_sqp(
+            lambda xr: neg_obj(_insert(xr, ints, cat_idx)), x0, lb, ub, cfg,
+        )
+
+    per_restart = jax.vmap(solve_cell, in_axes=(0, None))
+    per_combo = jax.vmap(per_restart, in_axes=(0, 0))
+    st = per_combo(starts, combos)
+
+    # Prefer converged cells; fall back to the raw best if none converged.
+    raw = (-st.f_val).reshape(-1)
+    masked = jnp.where(st.converged.reshape(-1), raw, -jnp.inf)
+    any_conv = jnp.any(jnp.isfinite(masked))
+    best = jnp.where(any_conv, jnp.argmax(masked), jnp.argmax(raw))
+    val = raw[best]
+
+    ci, ri = best // R, best % R
+    x_red = st.x.reshape(C, R, d_red)[ci, ri]
+    return _insert(x_red, combos[ci], cat_idx), val

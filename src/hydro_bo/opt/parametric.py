@@ -19,7 +19,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.stats.qmc import Sobol
 
-from hydro_bo.opt.bayesopt import ConstrainedBayesopt
+from hydro_bo.opt.bayesopt import ConstrainedBayesopt, MeanVarBayesopt
 from hydro_bo.opt.solvers import ConstrainedMixedIntNLP, MixedIntNLP
 from hydro_bo.utils.logging_config import get_logger
 
@@ -110,3 +110,60 @@ class ParametricBayesopt(ConstrainedBayesopt):
         if self._stuck_skip:
             return ThetaFrozenMixedIntNLP(**common)
         return ThetaFrozenConstrainedNLP(l1_penalty=self.l1_penalty, **common)
+
+
+class KnowledgeGradientBayesopt(MeanVarBayesopt):
+    """Unconstrained parametric BO driven by the knowledge gradient.
+
+    The GP is fit on the joint [x | theta] input, exactly as for
+    `ParametricBayesopt`, but the acquisition is KG rather than EI and
+    theta is *not* frozen: the outer optimisation chooses (x*, theta*)
+    jointly, theta* being the contextual query with the most information
+    to give.
+
+    Feasibility is deliberately absent at this stage — this subclasses
+    `MeanVarBayesopt`, not `ConstrainedBayesopt`.
+    """
+
+    def __init__(self, *args, d_theta: int, kg_args: dict, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.d_theta = int(d_theta)
+        if self.d_theta <= 0:
+            raise ValueError("d_theta must be positive")
+        self.d_design = self.bounds.shape[0] - self.d_theta
+        self.kg_args = dict(kg_args)
+        bad = [i for i, _ in self.cat_vars if i >= self.d_design]
+        if bad:
+            raise ValueError(f"integer dims {bad} fall inside the theta block")
+
+    def _build_acquisition(self):
+        from hydro_bo.opt.acquisition import KnowledgeGradient
+
+        acq = KnowledgeGradient(
+            gp_mu=self.gp_mu,
+            gp_log_var=self.gp_log_var,
+            dataset=self.dataset,
+            d_theta=self.d_theta,
+            round_info=self.gp_mu.round_info,
+            cat_vars=self.cat_vars,
+            kg_args=self.kg_args,
+        )
+        logger.info("kg_acquisition_built", mode=acq.mode,
+                    n_theta_nodes=int(acq._inner_obj._theta_vals.shape[0]),
+                    n_z_nodes=int(acq._z_nodes.shape[0]))
+        return acq
+
+    def _build_solver(self, seed: int):
+        """Outer optimisation: the existing mixed-integer driver.
+
+        `use_exact_hessian` should be False here (set via nlp config) —
+        an exact Hessian would have to be formed through the nested inner
+        solves, which is the cost the limited-memory update avoids.
+        """
+        return MixedIntNLP(
+            cat_vars=self.cat_vars,
+            seed=seed,
+            pow_sobol=self.pow_sobol,
+            n_restarts=self.n_restarts,
+            sqp_config=self.sqp_config,
+        )

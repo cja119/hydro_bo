@@ -125,6 +125,54 @@ class ThetaCfg:
 
 
 @dataclass(frozen=True)
+class KgCfg:
+    """Parametric knowledge-gradient settings.
+
+    `mode` selects the inner maximisation: "strict" runs a real
+    mixed-integer solve per Hermite node; "index_set" restricts the inner
+    max to a fixed set of designs and reuses (A_i, B_i) across nodes.
+    Absent from a config -> `Config.kg` is None and KG is unavailable.
+    """
+
+    mode: str
+    theta_quad_per_dim: int      # nodes per theta dim; total = n**d_theta
+    z_quad_points: int           # Gauss-Hermite nodes for E_z
+    inner_pow_sobol: int         # inner screen budget (deliberately << outer)
+    inner_n_restarts: int
+    inner_sqp_max_iter: int
+    inner_sqp_use_exact_hessian: bool
+    index_set_pow: int
+    seed: int
+    profile: bool
+
+    def to_inner_sqp_config(self):
+        """Inner-solve SQP settings; mirrors `NlpCfg.to_sqp_config`."""
+        from septal.jax.sqp import SQPConfig
+        return SQPConfig(
+            max_iter=self.inner_sqp_max_iter,
+            use_exact_hessian=self.inner_sqp_use_exact_hessian,
+            tol_stationarity=1e-6,
+            tol_feasibility=1e-6,
+        )
+
+    def to_kg_args(self) -> dict:
+        """The `kg_args` dict consumed by `KnowledgeGradient`."""
+        return {
+            "mode": self.mode,
+            "theta_quad_per_dim": self.theta_quad_per_dim,
+            "z_quad_points": self.z_quad_points,
+            "inner_pow_sobol": self.inner_pow_sobol,
+            "inner_n_restarts": self.inner_n_restarts,
+            "index_set_pow": self.index_set_pow,
+            "seed": self.seed,
+            "inner_sqp_config": self.to_inner_sqp_config(),
+        }
+
+
+_VALID_KG_MODES = ("strict", "index_set")
+
+
+@dataclass(frozen=True)
 class Config:
     general: GeneralCfg
     sobol: SobolCfg
@@ -132,6 +180,7 @@ class Config:
     unconstrained_bo: UnconstrainedCfg
     constrained_bo: ConstrainedCfg
     theta: Optional[ThetaCfg] = None
+    kg: Optional[KgCfg] = None
 
 
 def _optional_int(raw) -> Optional[int]:
@@ -220,6 +269,26 @@ def _resolve_theta(t: Optional[dict]) -> Optional[ThetaCfg]:
     return ThetaCfg(params=[str(p) for p in params], seed=int(t.get("seed", 0)))
 
 
+def _resolve_kg(k: Optional[dict]) -> Optional[KgCfg]:
+    if not k:
+        return None
+    mode = str(k.get("mode", "strict")).strip().lower()
+    if mode not in _VALID_KG_MODES:
+        raise ValueError(f"kg.mode: unknown mode {mode!r}; expected one of {_VALID_KG_MODES}.")
+    return KgCfg(
+        mode=mode,
+        theta_quad_per_dim=int(k.get("theta_quad_per_dim", 5)),
+        z_quad_points=int(k.get("z_quad_points", 9)),
+        inner_pow_sobol=int(k.get("inner_pow_sobol", 8)),
+        inner_n_restarts=int(k.get("inner_n_restarts", 1)),
+        inner_sqp_max_iter=int(k.get("inner_sqp_max_iter", 20)),
+        inner_sqp_use_exact_hessian=bool(k.get("inner_sqp_use_exact_hessian", True)),
+        index_set_pow=int(k.get("index_set_pow", 8)),
+        seed=int(k.get("seed", 0)),
+        profile=bool(k.get("profile", False)),
+    )
+
+
 def load_config(
     path: str | Path,
     *,
@@ -306,6 +375,7 @@ def load_config(
             warm_start_dirs=list(raw["constrained_bo"].get("warm_start_dirs") or []),
         ),
         theta=_resolve_theta(raw.get("theta")),
+        kg=_resolve_kg(raw.get("kg")),
     )
 
 

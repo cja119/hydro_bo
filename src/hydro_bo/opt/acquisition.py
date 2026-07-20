@@ -8,18 +8,131 @@ call, so there are no masked variants here.
 
 from abc import ABC, abstractmethod
 from functools import partial
+from typing import Callable
 
+import numpy as np
 import jax
 import jax.numpy as jnp
+from numpy.polynomial.hermite import hermgauss
+from numpy.polynomial.legendre import leggauss
 from jax.scipy.stats.norm import cdf, pdf
 
 from hydro_bo.opt.dataset import Dataset
-from hydro_bo.opt.surrogate import HeteroscedasticGP, BinomialGP, _predict
+from hydro_bo.opt.surrogate import HeteroscedasticGP, BinomialGP, _predict, _predict_covariance
+from hydro_bo.opt.solvers import (
+    DEFAULT_SQP_CONFIG, MixedIntNLP, _insert, combo_grid, mip_solve, sobol_cloud,
+)
 
 
 # --------------------------------------------------------------------- #
 # Pure jitted helpers — keyed on static `round_info`.
 # --------------------------------------------------------------------- #
+
+
+def _build_mu(gp_mu_state, scaling, round_info, mu_kernel_kind):
+    """Returns a jitted callable mu(X) -> (mean, var) in objective units.
+
+    Not jitted itself: a jitted function cannot return a Python callable.
+    """
+    mu_y, sigma_y, _, _, _ = scaling
+
+    def mu_and_var(X):
+        mu_s, var_mu_s = _predict(
+            gp_mu_state["params"], gp_mu_state["X"], gp_mu_state["L"],
+            gp_mu_state["alpha"], gp_mu_state["mean"], gp_mu_state["mask"],
+            X, round_info, mu_kernel_kind,
+        )
+        return mu_s * sigma_y + mu_y, var_mu_s * sigma_y**2
+
+    return jax.jit(mu_and_var)
+
+
+def _build_beta(gp_mu_state, gp_log_var_state, scaling, round_info,
+                lv_kernel_kind, mu_kernel_kind):
+    """Returns a jitted callable beta(X_prime, x_cand, var_cand) -> (n,).
+
+        beta = k_n((x',theta'), (x,theta)) / sqrt(sigma_f^2 + sigma_eps^2)
+
+    Numerator is the *posterior* covariance between the prime points and
+    the candidate; both denominator terms are evaluated at the CANDIDATE,
+    which is where the hypothetical observation is taken. The
+    heteroscedastic sigma_eps^2 comes from the log-variance GP.
+    """
+    _, sigma_y, mu_lv, sigma_lv, _ = scaling
+
+    def beta(X_prime, x_cand, var_cand):
+        lv_s, var_lv_s = _predict(
+            gp_log_var_state["params"], gp_log_var_state["X"],
+            gp_log_var_state["L"], gp_log_var_state["alpha"],
+            gp_log_var_state["mean"], gp_log_var_state["mask"],
+            x_cand[None, :], round_info, lv_kernel_kind,
+        )
+        m_lv = lv_s[0] * sigma_lv + mu_lv
+        v_lv = var_lv_s[0] * sigma_lv**2
+        noise = jnp.exp(m_lv + 0.5 * v_lv)          # E[exp(log var)]
+
+        cov = _predict_covariance(
+            gp_mu_state["params"], gp_mu_state["X"], gp_mu_state["L"],
+            gp_mu_state["mask"], X_prime, x_cand, round_info, mu_kernel_kind,
+        ) * sigma_y**2
+
+        return cov / jnp.sqrt(jnp.clip(var_cand + noise, 1e-12, None))
+
+    return jax.jit(beta)
+
+
+def _kg_prime_points(x_new, quad_points):
+    """Broadcast a design x' against the theta' quadrature nodes."""
+    q = quad_points.shape[0]
+    return jnp.concatenate(
+        [jnp.broadcast_to(x_new, (q, x_new.shape[-1])), quad_points], axis=-1,
+    )
+
+
+def _kg_inner(x_new, x_cand, var_cand, mu, beta, z, quad_points):
+    """mu_{n+1}(x', theta' | z, cand) at every theta' node.
+
+    mu_n is evaluated at the PRIME point (x', theta'); beta carries the
+    candidate dependence.
+    """
+    prime = _kg_prime_points(x_new, quad_points)
+    mu_prime, _ = mu(prime)
+    return mu_prime + beta(prime, x_cand, var_cand) * z
+
+
+def _theta_integral(x_new, x_cand, var_cand, mu, beta, z, quad_points, quad_weights):
+    """E_theta'[mu_{n+1}] = A(x') + z * B(x').
+
+    A and B are separate weighted sums, so the z dependence is affine and
+    only the argmax over x' varies with z.
+    """
+    prime = _kg_prime_points(x_new, quad_points)
+    mu_prime, _ = mu(prime)
+    A = jnp.sum(quad_weights * mu_prime)
+    B = jnp.sum(quad_weights * beta(prime, x_cand, var_cand))
+    return A + z * B
+
+
+def _kg_ab(x_prime_set, x_cand, var_cand, mu, beta, quad_points, quad_weights):
+    """(A_i, B_i) over an index set of designs — the `index_set` mode.
+
+    A_i does not depend on the candidate, so it can be hoisted out of the
+    acquisition loop; B_i does.
+    """
+    def one(x_new):
+        prime = _kg_prime_points(x_new, quad_points)
+        mu_prime, _ = mu(prime)
+        return (
+            jnp.sum(quad_weights * mu_prime),
+            jnp.sum(quad_weights * beta(prime, x_cand, var_cand)),
+        )
+
+    return jax.vmap(one)(x_prime_set)
+
+
+def _kg_index_value(A, B, z):
+    """max_i (A_i + z B_i) — the inner max restricted to the index set."""
+    return jnp.max(A + z * B)
 
 
 @partial(
@@ -366,3 +479,279 @@ class ConstrainedExpectedImprovement(ExpectedImprovement):
         )
 
 
+class KnowledgeGradientInner:
+    """Holder for the theta' quadrature and the inner objective.
+
+    No longer an `AcquisitionFunction`: the inner problem is solved
+    *inside* a trace (once per Hermite node), whereas the
+    `AcquisitionFunction` + `maximise` contract assumes one objective per
+    BO iteration driven from the host. `KnowledgeGradient` below remains
+    an `AcquisitionFunction` and is driven by `MixedIntNLP` as before.
+    """
+
+    def __init__(
+        self,
+        mu: Callable,
+        beta: Callable,
+        round_info: tuple = (),
+        quad_per_dim: int = 5,
+        num_theta: int = 0,
+    ):
+        self.mu = mu
+        self.beta = beta
+        self.round_info = tuple(round_info)
+        self.quad_per_dim = int(quad_per_dim)
+        self.num_theta = int(num_theta)
+        self._theta_vals, self._quad_weights = self._quad_points(
+            self.num_theta, self.quad_per_dim
+        )
+
+    def value(self, x_new, x_cand, var_cand, z):
+        """E_theta'[mu_{n+1}(x', theta' | z)] — pure, z passed explicitly."""
+        return _theta_integral(
+            x_new, x_cand, var_cand, self.mu, self.beta, z,
+            self._theta_vals, self._quad_weights,
+        )
+
+    def ab(self, x_prime_set, x_cand, var_cand):
+        return _kg_ab(
+            x_prime_set, x_cand, var_cand, self.mu, self.beta,
+            self._theta_vals, self._quad_weights,
+        )
+
+    def _quad_points(self, dim: int, quad_per_dim: int):
+        """Tensor-product Gauss-Legendre on [0,1]^dim through the
+        triangular inverse CDF. Weights sum to 1.
+
+        Gauss-Legendre lives on [-1,1]; mapping to [0,1] is u=(t+1)/2 with
+        weights halved for the Jacobian.
+        """
+        if dim == 0:
+            return (
+                jnp.zeros((1, 0), dtype=jnp.float64),
+                jnp.ones(1, dtype=jnp.float64),
+            )
+        t, w = leggauss(int(quad_per_dim))
+        u_1d = 0.5 * (t + 1.0)
+        w_1d = 0.5 * w
+
+        grids = np.meshgrid(*([u_1d] * dim), indexing="ij")
+        u = np.stack([g.reshape(-1) for g in grids], axis=-1)
+        wg = np.meshgrid(*([w_1d] * dim), indexing="ij")
+        weights = np.prod(np.stack([g.reshape(-1) for g in wg], axis=-1), axis=-1)
+
+        return (
+            self._theta_from_quad(jnp.asarray(u, dtype=jnp.float64)),
+            jnp.asarray(weights, dtype=jnp.float64),
+        )
+
+    def _theta_from_quad(self, quad_points):
+        """Map quadrature points from [0,1]^dim to triangular theta space."""
+        return self._inv_cdf(quad_points)
+
+    @staticmethod
+    def _inv_cdf(p):
+        """Inverse CDF of symmetric triangular distribution.
+
+        Applied in standardised space: theta is scaled by
+        (theta - lo)/(hi - lo), which is the triangular's own support, and
+        an affine map carries a symmetric triangular on [lo,hi] to one on
+        [0,1]. So the physical bounds cancel and never enter here.
+        """
+        return jnp.where(p < 0.5, jnp.sqrt(p / 2), 1 - jnp.sqrt((1 - p) / 2))
+
+
+def _outer_integral(x_cand, inner_obj, z_nodes, z_weights, solve_inner):
+    """E_z[ max_x' E_theta'[mu_{n+1}] ] — `strict` mode.
+
+    The max sits inside E_z: one inner solve per Hermite node, since the
+    argmax moves with z (that movement is exactly what KG measures). The
+    z reduction is the weighted sum afterwards.
+
+    Inner maximisers are frozen with `stop_gradient` before the value is
+    recomputed, so differentiating this gives the envelope (Danskin)
+    gradient without unrolling the inner SQP scans.
+    """
+    _, var_c = inner_obj.mu(x_cand[None, :])
+    var_cand = var_c[0]
+
+    x_stars = jax.vmap(lambda z: solve_inner(x_cand, var_cand, z))(z_nodes)
+    x_stars = jax.lax.stop_gradient(x_stars)
+
+    vals = jax.vmap(
+        lambda xs, z: inner_obj.value(xs, x_cand, var_cand, z)
+    )(x_stars, z_nodes)
+    return jnp.sum(z_weights * vals)
+
+
+def _outer_integral_index(x_cand, inner_obj, z_nodes, z_weights, x_prime_set):
+    """E_z[ max_i (A_i + z B_i) ] — `index_set` mode.
+
+    A and B are evaluated once per index-set entry, then reused across
+    every Hermite node. Integer dims are attributes of the index entries,
+    so no combo enumeration appears here.
+    """
+    _, var_c = inner_obj.mu(x_cand[None, :])
+    var_cand = var_c[0]
+    A, B = inner_obj.ab(x_prime_set, x_cand, var_cand)
+    vals = jax.vmap(lambda z: _kg_index_value(A, B, z))(z_nodes)
+    return jnp.sum(z_weights * vals)
+
+
+class KnowledgeGradient(AcquisitionFunction):
+    """Parametric knowledge gradient over the joint space [x | theta].
+
+        KG(x,theta) = E_z[ max_x' E_theta'[ mu_{n+1}(x',theta' | z,x,theta) ] ]
+
+    Implements the `AcquisitionFunction` contract, so the existing
+    `MixedIntNLP` driver maximises it exactly as it does EI.
+
+    `mode`:
+      "strict"     — a real inner maximisation per Hermite node, via the
+                     traceable `mip_solve` (integer dims enumerated).
+      "index_set"  — inner max restricted to a fixed index set of designs,
+                     reusing (A_i, B_i) across z nodes.
+
+    KG uses the plain posterior mean: no `mu - lam*sigma` penalty, which
+    would double-count the uncertainty KG already integrates over.
+    The constant baseline max_x' E_theta'[mu_n] is not subtracted — it is
+    candidate-independent and so leaves the argmax unchanged.
+    """
+
+    def __init__(
+        self,
+        gp_mu: HeteroscedasticGP,
+        gp_log_var: HeteroscedasticGP,
+        dataset: Dataset,
+        d_theta: int,
+        jitter: float = 1e-9,
+        round_info: tuple = (),
+        cat_vars=(),
+        kg_args: dict = {},
+    ) -> None:
+
+        self.round_info = tuple(round_info)
+        self.mu_kernel_kind = str(gp_mu.kernel_kind)
+        self.lv_kernel_kind = str(gp_log_var.kernel_kind)
+        self.jitter = jnp.asarray(jitter, dtype=jnp.float64)
+
+        self.mode = str(kg_args.get("mode", "strict"))
+        self.seed = int(kg_args.get("seed", 0))
+        self.quad_per_dim = int(kg_args.get("theta_quad_per_dim", 5))
+        self.z_quad_points = int(kg_args.get("z_quad_points", 9))
+        self.inner_pow_sobol = int(kg_args.get("inner_pow_sobol", 8))
+        self.inner_n_restarts = int(kg_args.get("inner_n_restarts", 1))
+        self.index_set_pow = int(kg_args.get("index_set_pow", 8))
+        self.sqp_config_inner = kg_args.get("inner_sqp_config", None)
+
+        self.d_total = int(dataset.X_scaled.shape[1])
+        self.d_theta = int(d_theta)
+        self.d_design = self.d_total - self.d_theta
+
+        # Scaling tuple consumed by _build_mu / _build_beta. lam is carried
+        # for signature compatibility only; KG does not use it.
+        self.scaling = (
+            jnp.asarray(dataset._mu_y, dtype=jnp.float64),
+            jnp.asarray(dataset._sigma_y, dtype=jnp.float64),
+            jnp.asarray(dataset._mu_lv, dtype=jnp.float64),
+            jnp.asarray(dataset._sigma_lv, dtype=jnp.float64),
+            jnp.asarray(0.0, dtype=jnp.float64),
+        )
+
+        self.gp_mu_state = gp_mu.state()
+        self.gp_log_var_state = gp_log_var.state()
+        self.state_args = (self.gp_mu_state,)
+        # `BaseBayesopt._suggest_next` logs the EI incumbent. KG has no
+        # incumbent (it scores information, not improvement over a best),
+        # so expose NaN rather than fork the shared BO loop.
+        self._g_best = jnp.asarray(jnp.nan, dtype=jnp.float64)
+
+        self.mu = _build_mu(
+            self.gp_mu_state, self.scaling, self.round_info, self.mu_kernel_kind,
+        )
+        self.beta = _build_beta(
+            self.gp_mu_state, self.gp_log_var_state, self.scaling,
+            self.round_info, self.lv_kernel_kind, self.mu_kernel_kind,
+        )
+        self._inner_obj = KnowledgeGradientInner(
+            self.mu, self.beta, self.round_info, self.quad_per_dim, self.d_theta,
+        )
+
+        # Integer dims belong to the design block only.
+        self.cat_idx, self.combos = combo_grid(cat_vars)
+        bad = [i for i in self.cat_idx if i >= self.d_design]
+        if bad:
+            raise ValueError(f"integer dims {bad} fall inside the theta block")
+        self.d_red = self.d_design - len(self.cat_idx)
+
+        self._z_nodes, self._z_weights = self._gauss_hermite_quadrature(
+            n_points=self.z_quad_points,
+        )
+        self._cloud = sobol_cloud(self.d_red, self.inner_pow_sobol, self.seed)
+        self._lb = jnp.zeros(self.d_red, dtype=jnp.float64)
+        self._ub = jnp.ones(self.d_red, dtype=jnp.float64)
+        self._x_prime_set = sobol_cloud(
+            self.d_design, self.index_set_pow, self.seed + 1,
+        )
+        self._value = jax.jit(self._kg_value)
+        self._batch = jax.jit(jax.vmap(self._kg_value))
+
+    # ---- inner solve ----
+
+    def _solve_inner(self, x_cand, var_cand, z):
+        """argmax_x' E_theta'[mu_{n+1}] for one Hermite node."""
+        def neg(x_full):
+            return -self._inner_obj.value(x_full, x_cand, var_cand, z)
+
+        x_best, _ = mip_solve(
+            neg, self._cloud, self.combos, self.cat_idx,
+            self._lb, self._ub,
+            self.sqp_config_inner or DEFAULT_SQP_CONFIG,
+            n_restarts=self.inner_n_restarts,
+        )
+        return x_best
+
+    def _kg_value(self, x_cand):
+        if self.mode == "index_set":
+            return _outer_integral_index(
+                x_cand, self._inner_obj, self._z_nodes, self._z_weights,
+                self._x_prime_set,
+            )
+        return _outer_integral(
+            x_cand, self._inner_obj, self._z_nodes, self._z_weights,
+            self._solve_inner,
+        )
+
+    # ---- AcquisitionFunction contract ----
+
+    def evaluate(self, x_theta_new):
+        return self._value(jnp.asarray(x_theta_new, dtype=jnp.float64).ravel())
+
+    def neg_acq_fn(self):
+        value = self._value
+
+        def neg(x, *_state):
+            return -value(x).reshape(())
+
+        return neg
+
+    def acq_batch_fn(self):
+        batch = self._batch
+
+        def f(x_batch, *_state):
+            return batch(x_batch)
+
+        return f
+
+    def _gauss_hermite_quadrature(self, n_points: int):
+        """Gauss-Hermite for E_{Z~N(0,1)}.
+
+        Physicists' nodes are scaled by sqrt(2) and weights by 1/sqrt(pi);
+        the weights then sum to 1. The sqrt(2) belongs on the nodes — it is
+        the change of variables, not a transform of the candidate.
+        """
+        points, weights = hermgauss(int(n_points))
+        return (
+            jnp.asarray(np.sqrt(2.0) * points, dtype=jnp.float64),
+            jnp.asarray(weights / np.sqrt(np.pi), dtype=jnp.float64),
+        )

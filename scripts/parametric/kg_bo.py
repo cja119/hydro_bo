@@ -1,17 +1,18 @@
-"""Parametric BO over the joint space [x_design | theta].
+"""Unconstrained parametric BO driven by the knowledge gradient.
 
-Same MPC objective and chance-constrained feasibility model as
-`scripts/idc/constrained_bo.py`, but the uncertain parameters named in
-`theta.params` become extra GP input dimensions. Every evaluation then
-informs the surrogate across the whole theta-space through the kernel,
-rather than averaging theta away.
+The GP is fit over the joint space [x_design | theta], and the
+acquisition is
 
-Theta is drawn per iteration (Sobol over the theta box) and frozen while
-the acquisition optimises the design — see `hydro_bo.opt.parametric`.
-Maximising over theta instead would search for the single best theta,
-which is not the question this run asks.
+    KG(x,theta) = E_z[ max_x' E_theta'[ mu_{n+1}(x',theta' | z,x,theta) ] ]
 
-Reads `scripts/parametric/config.yml`.
+so the outer optimisation returns (x*, theta*) jointly — theta* being the
+contextual query expected to be most informative, rather than a value
+drawn from a schedule.
+
+Feasibility / chance constraints are deliberately not applied at this
+stage: this is the end-to-end validation run for the KG pipeline.
+
+Reads `scripts/parametric/config.yml` (`kg:` block).
 """
 
 import argparse
@@ -35,6 +36,7 @@ from hydro_bo.utils.run_config import (
     load_config,
     merge_env_overrides,
     planning_model_path,
+    resolve_sobol_dir,
 )
 from hydro_bo.utils.search_space import (
     PARAM_KEYS,
@@ -139,7 +141,7 @@ def _objective_factory(cfg: Config, ref: dict, registry):
         _results_log.append(entry)
 
         logger.info(
-            "parametric.evaluation",
+            "kg.evaluation",
             eval_id=_eval_counter,
             objective=objective_value,
             k_feasible=k_feasible,
@@ -153,6 +155,59 @@ def _objective_factory(cfg: Config, ref: dict, registry):
     return objective
 
 
+def load_sobol_cache(sobol_dir: Path, cfg: Config, registry) -> list:
+    """Replay `sobol_parametric.py` rows as initial BO observations.
+
+    Rows are matched on vector / bounds_expansion / dynamic_price *and*
+    on the theta parameter list — a cache built for a different theta set
+    describes a different joint space and must not be mixed in. `x` is
+    the joint [x_design | theta] vector. Non-finite worker scores become
+    NaN and rows are NaN-padded to `num_instances` so N is consistent.
+    """
+    g, c = cfg.general, cfg.constrained_bo
+    cap = c.n_sobol_cache
+    observations, n_missing, n_mismatch, n_theta_mismatch = [], 0, 0, 0
+
+    row_dirs = sorted(sobol_dir.glob("row_*"))
+    for rd in row_dirs:
+        if cap is not None and len(observations) >= cap:
+            break
+        files = sorted(rd.glob("result_*.json"))
+        if not files:
+            n_missing += 1
+            continue
+        data = json.loads(files[-1].read_text())
+
+        if (data.get("vector") != g.vector
+                or float(data.get("bounds_expansion", -1)) != float(g.bounds_expansion)
+                or bool(data.get("dynamic_price", False)) != bool(g.dynamic_price)):
+            n_mismatch += 1
+            continue
+        if list(data.get("theta_params") or []) != list(registry.names):
+            n_theta_mismatch += 1
+            continue
+
+        scores = data.get("worker_scores") or []
+        arr = np.asarray([np.nan if v is None else v for v in scores], dtype=float).ravel()
+        if arr.size < g.num_instances:
+            arr = np.concatenate([arr, np.full(g.num_instances - arr.size, np.nan)])
+        arr = np.where(np.isfinite(arr), arr, np.nan)
+
+        x = np.asarray(data["x"], dtype=float)
+        if x.size != len(PARAM_KEYS) + registry.dim:
+            n_mismatch += 1
+            continue
+        observations.append((x, arr))
+
+    logger.info(
+        "kg.sobol_cache_loaded",
+        dir=str(sobol_dir), n_rows_found=len(row_dirs), n_loaded=len(observations),
+        n_missing_result=n_missing, n_mismatched=n_mismatch,
+        n_theta_mismatched=n_theta_mismatch, cap=cap,
+    )
+    return observations
+
+
 def save_results(results_log: list, bayesopt_dir: Path, run_timestamp: str, registry):
     if not results_log:
         return
@@ -160,13 +215,13 @@ def save_results(results_log: list, bayesopt_dir: Path, run_timestamp: str, regi
         "eval_id", "timestamp", "objective", "mean_score", "var_score",
         "num_workers", "k_feasible", "n_total", "feasibility_rate",
     ] + PARAM_KEYS + ["capex", "opex"] + [f"theta.{n}" for n in registry.names]
-    csv_path = bayesopt_dir / f"parametric_results_{run_timestamp}.csv"
+    csv_path = bayesopt_dir / f"kg_results_{run_timestamp}.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for entry in results_log:
             writer.writerow({k: v for k, v in entry.items() if k != "worker_scores"})
-    with open(bayesopt_dir / f"parametric_results_detailed_{run_timestamp}.json", "w") as f:
+    with open(bayesopt_dir / f"kg_results_detailed_{run_timestamp}.json", "w") as f:
         json.dump(results_log, f, indent=2)
 
 
@@ -192,13 +247,18 @@ def main():
             "config.yml has no `theta:` block — this is the parametric runner. "
             "Use scripts/idc/constrained_bo.py for a design-only run."
         )
+    if cfg.kg is None:
+        raise SystemExit(
+            "config.yml has no `kg:` block — required by the KG runner. "
+            "Use scripts/parametric/parametric_bo.py for the EI-based run."
+        )
 
     registry = registry_from_names(cfg.theta.params, vector=g.vector)
 
     configure_jax_threads(cfg.nlp.n_devices, cfg.nlp.blas_threads)
     from hydro_bo.mpc.dispatcher import ensure_ray  # noqa: E402
     ensure_ray(num_cpus=cfg.general.num_devices)
-    from hydro_bo.opt.parametric import ParametricBayesopt  # noqa: E402
+    from hydro_bo.opt.parametric import KnowledgeGradientBayesopt  # noqa: E402
 
     global _eval_counter, _results_log, _bayesopt_dir, _run_timestamp, _master_seed
     _eval_counter = 0
@@ -213,12 +273,12 @@ def main():
     configure_logging(log_file=_bayesopt_dir / "run.log", package_level=g.log_level)
 
     _master_seed = resolve_master_seed(g.master_seed)
-    logger.info("parametric.master_seed", master_seed=_master_seed)
+    logger.info("kg.master_seed", master_seed=_master_seed)
 
     ref_path = planning_model_path(SCRIPTS_DIR, g.vector, g.planning_dir)
     if not ref_path.exists():
         logger.error(
-            "parametric.missing_planning_model",
+            "kg.missing_planning_model",
             path=str(ref_path),
             message=f"Run: python scripts/idc/planning_model.py {g.vector}",
         )
@@ -240,11 +300,11 @@ def main():
     )
 
     logger.info(
-        "parametric.search_space",
+        "kg.search_space",
         design_dims=len(PARAM_KEYS), theta_dims=registry.dim, joint_dims=bounds.shape[0],
     )
     for key, (lo, hi) in zip(PARAM_KEYS + registry.names, bounds):
-        logger.info("parametric.parameter_bounds", parameter=key, lower=lo, upper=hi)
+        logger.info("kg.parameter_bounds", parameter=key, lower=lo, upper=hi)
 
     with open(_bayesopt_dir / "args.json", "w") as f:
         json.dump(
@@ -254,16 +314,25 @@ def main():
                 "nlp": cfg.nlp.__dict__,
                 "theta": {"params": registry.names, "seed": cfg.theta.seed,
                           "bounds": registry.bounds().tolist()},
+                "kg": cfg.kg.__dict__,
                 "master_seed_resolved": _master_seed,
             },
             f, indent=2, default=str,
         )
 
-    bo = ParametricBayesopt(
+    if cfg.nlp.sqp_use_exact_hessian:
+        logger.warning(
+            "kg.outer_exact_hessian",
+            message=("nlp.sqp_use_exact_hessian is true; the outer solve would "
+                     "form Hessians through the nested inner solves. Set it "
+                     "false for a limited-memory update."),
+        )
+
+    bo = KnowledgeGradientBayesopt(
         f=_objective_factory(cfg, ref, registry),
         bounds=bounds,
         d_theta=registry.dim,
-        theta_seed=cfg.theta.seed,
+        kg_args=cfg.kg.to_kg_args(),
         n_initial_points=c.n_initial_points,
         iter_limit=c.iter_budget,
         lam=g.stdev_penalty,
@@ -271,17 +340,25 @@ def main():
         pow_sobol=cfg.nlp.acq_pow_sobol,
         seed=_master_seed % (2**31),
         cat_vars=cat_vars,
-        p_targ=c.p_targ,
-        z_sc=c.z_sc,
-        l1_penalty=c.l1_penalty,
         sqp_config=cfg.nlp.to_sqp_config(),
         pad_initial=cfg.nlp.pad_initial,
         gp_lbfgs_max_iter=cfg.nlp.gp_lbfgs_max_iter,
         gp_mu_kernel=cfg.nlp.gp_mu_kernel,
         gp_log_var_kernel=cfg.nlp.gp_log_var_kernel,
-        gp_bin_kernel=cfg.nlp.gp_bin_kernel,
-        gp_bin_label_smoothing=cfg.nlp.gp_bin_label_smoothing,
     )
+
+    sobol_dir = resolve_sobol_dir(c.sobol_dir, SCRIPTS_DIR, g.vector)
+    if sobol_dir is not None:
+        if not sobol_dir.exists():
+            logger.warning("kg.sobol_dir_missing", path=str(sobol_dir))
+        else:
+            preloaded = load_sobol_cache(sobol_dir, cfg, registry)
+            for x, samples in preloaded:
+                bo.observe(x, samples)
+            if preloaded:
+                bo.n_initial_points = len(preloaded)
+                logger.info("kg.sobol_phase_skipped_via_cache",
+                            n_preloaded=len(preloaded))
 
     best_x, best_score = bo.run()
     best_design, best_theta = best_x[:len(PARAM_KEYS)], best_x[len(PARAM_KEYS):]
@@ -291,20 +368,20 @@ def main():
     )
     best_flat = flatten_dims(best_planning_params, best_env_overrides)
 
-    logger.info("parametric.complete")
-    logger.info("parametric.best_score", score=best_score)
+    logger.info("kg.complete")
+    logger.info("kg.best_score", score=best_score)
     for k, v in best_flat.items():
         logger.info("parametric.parameter", name=k, value=v)
     for name, val in zip(registry.names, best_theta):
-        logger.info("parametric.theta", name=name, value=float(val))
+        logger.info("kg.theta", name=name, value=float(val))
 
     snapshot = dict(best_planning_params)
     snapshot["wind_forecast_mean"] = best_flat["wind_forecast_mean"]
     snapshot["theta"] = dict(zip(registry.names, (float(v) for v in best_theta)))
-    out_path = _bayesopt_dir / f"{g.vector}-Chile-parametric.yml"
+    out_path = _bayesopt_dir / f"{g.vector}-Chile-kg.yml"
     with open(out_path, "w") as f:
         yaml.dump(snapshot, f, default_flow_style=False)
-    logger.info("parametric.saved", path=str(out_path))
+    logger.info("kg.saved", path=str(out_path))
 
     save_results(_results_log, _bayesopt_dir, _run_timestamp, registry)
     return snapshot, best_score

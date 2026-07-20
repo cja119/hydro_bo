@@ -198,9 +198,13 @@ def triple_bounds(parameter_tree: Mapping, path: str) -> tuple[float, float, flo
     return lo, mid, hi
 
 
-def default_catalog() -> dict[str, ThetaParam]:
+def default_catalog(vector: str = "NH3") -> dict[str, ThetaParam]:
     """Verified uncertain parameters, bounds from h2_plan's own
-    [lo, mid, hi] data triples. Select by name to build a registry."""
+    [lo, mid, hi] data triples. Select by name to build a registry.
+
+    `vector` selects the branch of vector-keyed triples (the ramp limits
+    differ between LH2 and NH3), so bounds are never duplicated here —
+    they are read from the planning model's own parameter tree."""
     from h2_plan.data import DefaultParams
 
     tree = DefaultParams("default").formulation_parameters
@@ -235,11 +239,25 @@ def default_catalog() -> dict[str, ThetaParam]:
         "compression_efficiency", "efficiencies.compressor",
         [MpcParam("compression_efficiency")],
     )
+
+    # --- hydrogen-export case study: the three contextual parameters ---
+    catalog["ramp_up_limit"] = from_triple(
+        "ramp_up_limit", f"vector_production.ramp_up_limit.{vector}",
+        [MpcParam("ramp_up_limit")],
+    )
+    catalog["ramp_down_limit"] = from_triple(
+        "ramp_down_limit", f"vector_production.ramp_down_limit.{vector}",
+        [MpcParam("ramp_down_limit")],
+    )
+    catalog["hydrogen_storage_capex"] = from_triple(
+        "hydrogen_storage_capex", "capital_costs.hydrogen_storage",
+        [CostCoeff("capital_costs.hydrogen_storage.1")],
+    )
     return catalog
 
 
-def registry_from_names(names: Sequence[str]) -> ThetaRegistry:
-    catalog = default_catalog()
+def registry_from_names(names: Sequence[str], vector: str = "NH3") -> ThetaRegistry:
+    catalog = default_catalog(vector)
     unknown = [n for n in names if n not in catalog]
     if unknown:
         raise KeyError(f"unknown theta params {unknown}; catalog has {sorted(catalog)}")

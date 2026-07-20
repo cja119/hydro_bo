@@ -182,16 +182,22 @@ def flatten_dims(planning_params: dict, env_overrides: dict) -> dict:
     return out
 
 
-def sobol_unit_sample(seed: int, pow_n: int, index_row: int) -> np.ndarray:
+def sobol_unit_sample(
+    seed: int, pow_n: int, index_row: int, dim: int | None = None
+) -> np.ndarray:
     """Regenerate the Sobol sequence with `seed` and return row
     `index_row`. Replaces sobol_indices.csv — every script run with the
     same `(seed, pow_n)` sees the same hypercube point at the same
     index, so PBS array tasks (and downstream BO loaders) stay in sync
-    without a shared CSV."""
+    without a shared CSV.
+
+    `dim` defaults to the design space; pass the joint dimension
+    (design + theta) for the parametric runs."""
     n = 2**pow_n
     if index_row < 0 or index_row >= n:
         raise IndexError(f"index_row={index_row} out of range [0, {n})")
-    sampler = Sobol(d=len(PARAM_KEYS), scramble=True, seed=seed)
+    sampler = Sobol(d=dim if dim is not None else len(PARAM_KEYS),
+                    scramble=True, seed=seed)
     return sampler.random(n)[index_row]
 
 
