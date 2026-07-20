@@ -38,6 +38,7 @@ from hydro_bo.utils.run_config import (
 )
 from hydro_bo.utils.search_space import (
     PARAM_KEYS,
+    resolve_design_keys,
     build_bounds,
     build_cat_vars,
     flatten_dims,
@@ -71,7 +72,10 @@ def _objective_factory(cfg: Config, ref: dict, registry):
     the design half decodes exactly as it does for an IDC run."""
     g = cfg.general
     c = cfg.constrained_bo
-    d_design = len(PARAM_KEYS)
+    design_keys = resolve_design_keys(
+        cfg.design.include if cfg.design else None
+    )
+    d_design = len(design_keys)
 
     def objective(x_joint: np.ndarray) -> np.ndarray:
         global _eval_counter
@@ -83,7 +87,7 @@ def _objective_factory(cfg: Config, ref: dict, registry):
 
         planning_params, env_overrides = params_from_x(
             x, ref, renewables=g.renewables, vector=g.vector,
-            cost_overrides=bundle.cost_overrides,
+            cost_overrides=bundle.cost_overrides, keys=design_keys,
         )
         if bundle.env_overrides:
             _deep_merge(env_overrides, bundle.env_overrides)
@@ -129,8 +133,8 @@ def _objective_factory(cfg: Config, ref: dict, registry):
             "worker_scores": list(raw_scores),
             "x": [float(v) for v in x_joint],
         }
-        flat_dims = flatten_dims(planning_params, env_overrides)
-        for key in PARAM_KEYS:
+        flat_dims = flatten_dims(planning_params, env_overrides, keys=design_keys)
+        for key in design_keys:
             entry[key] = flat_dims[key]
         entry["capex"] = planning_params["capex"]
         entry["opex"] = planning_params["opex"]
@@ -226,8 +230,9 @@ def main():
     with open(ref_path) as f:
         ref = yaml.safe_load(f)
 
-    bounds_x = build_bounds(ref, g.bounds_expansion)
-    cat_vars = build_cat_vars(bounds_x)          # design integer dims only
+    design_keys = resolve_design_keys(cfg.design.include if cfg.design else None)
+    bounds_x = build_bounds(ref, g.bounds_expansion, keys=design_keys)
+    cat_vars = build_cat_vars(bounds_x, keys=design_keys)          # design integer dims only
     bounds = np.vstack([bounds_x, registry.bounds()])
 
     # Fail loudly now if a theta sink no longer resolves, rather than
@@ -241,9 +246,10 @@ def main():
 
     logger.info(
         "parametric.search_space",
-        design_dims=len(PARAM_KEYS), theta_dims=registry.dim, joint_dims=bounds.shape[0],
+        design_dims=len(design_keys), theta_dims=registry.dim,
+        design_keys=design_keys, held_fixed=[k for k in PARAM_KEYS if k not in design_keys], joint_dims=bounds.shape[0],
     )
-    for key, (lo, hi) in zip(PARAM_KEYS + registry.names, bounds):
+    for key, (lo, hi) in zip(design_keys + registry.names, bounds):
         logger.info("parametric.parameter_bounds", parameter=key, lower=lo, upper=hi)
 
     with open(_bayesopt_dir / "args.json", "w") as f:
@@ -284,12 +290,12 @@ def main():
     )
 
     best_x, best_score = bo.run()
-    best_design, best_theta = best_x[:len(PARAM_KEYS)], best_x[len(PARAM_KEYS):]
+    best_design, best_theta = best_x[:len(design_keys)], best_x[len(design_keys):]
     best_planning_params, best_env_overrides = params_from_x(
         best_design, ref, renewables=g.renewables, vector=g.vector,
-        cost_overrides=registry.apply(best_theta).cost_overrides,
+        cost_overrides=registry.apply(best_theta).cost_overrides, keys=design_keys,
     )
-    best_flat = flatten_dims(best_planning_params, best_env_overrides)
+    best_flat = flatten_dims(best_planning_params, best_env_overrides, keys=design_keys)
 
     logger.info("parametric.complete")
     logger.info("parametric.best_score", score=best_score)

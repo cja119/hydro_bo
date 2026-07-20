@@ -125,6 +125,16 @@ class ThetaCfg:
 
 
 @dataclass(frozen=True)
+class DesignCfg:
+    """Restricts which `PARAM_KEYS` dims the BO searches.
+
+    Absent -> all of them (the IDC behaviour). Omitted dims are not
+    optimised and take their `variables.yml` / planning-model defaults."""
+
+    include: List[str]
+
+
+@dataclass(frozen=True)
 class KgCfg:
     """Parametric knowledge-gradient settings.
 
@@ -181,6 +191,7 @@ class Config:
     constrained_bo: ConstrainedCfg
     theta: Optional[ThetaCfg] = None
     kg: Optional[KgCfg] = None
+    design: Optional[DesignCfg] = None
 
 
 def _optional_int(raw) -> Optional[int]:
@@ -267,6 +278,15 @@ def _resolve_theta(t: Optional[dict]) -> Optional[ThetaCfg]:
     if not params:
         raise ValueError("theta.params is empty; omit the theta block entirely for an IDC run.")
     return ThetaCfg(params=[str(p) for p in params], seed=int(t.get("seed", 0)))
+
+
+def _resolve_design(d: Optional[dict]) -> Optional[DesignCfg]:
+    if not d:
+        return None
+    inc = list(d.get("include") or [])
+    if not inc:
+        raise ValueError("design.include is empty; omit the design block to search all dims.")
+    return DesignCfg(include=[str(k) for k in inc])
 
 
 def _resolve_kg(k: Optional[dict]) -> Optional[KgCfg]:
@@ -376,6 +396,7 @@ def load_config(
         ),
         theta=_resolve_theta(raw.get("theta")),
         kg=_resolve_kg(raw.get("kg")),
+        design=_resolve_design(raw.get("design")),
     )
 
 

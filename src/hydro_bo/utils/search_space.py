@@ -81,11 +81,28 @@ def split_env_overrides(params: dict) -> tuple[dict, dict]:
     return planning, env_overrides
 
 
-def build_bounds(ref: dict, expansion: float) -> np.ndarray:
+def resolve_design_keys(include=None) -> list[str]:
+    """Active BO design dims, in `PARAM_KEYS` order.
+
+    `None` (the default) means every dim — the IDC behaviour. Passing a
+    subset restricts what the BO searches; the omitted dims are not
+    optimised and fall back to the planning model / `variables.yml`
+    defaults inside `import_mpc_data`. Used by the parametric runs to
+    search the capacity design only, holding MPC tuning fixed."""
+    if not include:
+        return list(PARAM_KEYS)
+    unknown = [k for k in include if k not in PARAM_KEYS]
+    if unknown:
+        raise ValueError(f"unknown design keys {unknown}; expected from {PARAM_KEYS}")
+    keep = set(include)
+    return [k for k in PARAM_KEYS if k in keep]
+
+
+def build_bounds(ref: dict, expansion: float, keys=None) -> np.ndarray:
     """`ABSOLUTE_BOUNDS` keys use their fixed ranges; everything else
     gets ±expansion around the planning-model reference value."""
     bounds = []
-    for key in PARAM_KEYS:
+    for key in (keys if keys is not None else PARAM_KEYS):
         if key in ABSOLUTE_BOUNDS:
             bounds.append(list(ABSOLUTE_BOUNDS[key]))
             continue
@@ -98,11 +115,11 @@ def build_bounds(ref: dict, expansion: float) -> np.ndarray:
     return np.array(bounds)
 
 
-def build_cat_vars(bounds: np.ndarray) -> list[tuple[int, list[float]]]:
+def build_cat_vars(bounds: np.ndarray, keys=None) -> list[tuple[int, list[float]]]:
     """Enumerate integer levels of each integer dim and project them to
     unit-cube positions for the BO branch optimiser."""
     cat_vars: list[tuple[int, list[float]]] = []
-    for i, key in enumerate(PARAM_KEYS):
+    for i, key in enumerate(keys if keys is not None else PARAM_KEYS):
         if key not in INTEGER_KEYS:
             continue
         lo, hi = float(bounds[i, 0]), float(bounds[i, 1])
@@ -120,7 +137,7 @@ def build_cat_vars(bounds: np.ndarray) -> list[tuple[int, list[float]]]:
 
 def params_from_x(
     x: np.ndarray, ref: dict, *, renewables: str, vector: str,
-    cost_overrides: dict | None = None,
+    cost_overrides: dict | None = None, keys=None,
 ) -> tuple[dict, dict]:
     """Convert a BO sample vector into `(planning_params, env_overrides)`.
 
@@ -136,7 +153,7 @@ def params_from_x(
 
     p = dict(ref)
     env_overrides: dict = {}
-    for i, key in enumerate(PARAM_KEYS):
+    for i, key in enumerate(keys if keys is not None else PARAM_KEYS):
         val = float(x[i])
         if key in INTEGER_KEYS:
             val = int(round(val))
@@ -164,14 +181,14 @@ def params_from_x(
     return p, env_overrides
 
 
-def flatten_dims(planning_params: dict, env_overrides: dict) -> dict:
+def flatten_dims(planning_params: dict, env_overrides: dict, keys=None) -> dict:
     """Flat dict keyed by `PARAM_KEYS`, sourcing values from
     `planning_params` for planning-side dims and from `env_overrides`
     for env-side dims. Used by the BO/Sobol scripts so the per-eval log
     rows have one column per BO dim regardless of where the value lives.
     """
     out: dict = {}
-    for key in PARAM_KEYS:
+    for key in (keys if keys is not None else PARAM_KEYS):
         if key in ENV_OVERRIDE_PATHS:
             d = env_overrides
             for part in ENV_OVERRIDE_PATHS[key]:

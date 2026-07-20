@@ -41,6 +41,7 @@ from hydro_bo.utils.run_config import (
 )
 from hydro_bo.utils.search_space import (
     PARAM_KEYS,
+    resolve_design_keys,
     build_bounds,
     flatten_dims,
     params_from_x,
@@ -96,7 +97,8 @@ def main():
         raise SystemExit("config.yml has no `theta:` block — required here.")
 
     registry = registry_from_names(cfg.theta.params, vector=g.vector)
-    d_design, d_theta = len(PARAM_KEYS), registry.dim
+    design_keys = resolve_design_keys(cfg.design.include if cfg.design else None)
+    d_design, d_theta = len(design_keys), registry.dim
     d_total = d_design + d_theta
 
     array_index = int(os.environ.get("PBS_ARRAY_INDEX", "0"))
@@ -138,7 +140,9 @@ def main():
         )
     ref = yaml.safe_load(ref_path.read_text())
 
-    bounds = np.vstack([build_bounds(ref, g.bounds_expansion), registry.bounds()])
+    bounds = np.vstack([
+        build_bounds(ref, g.bounds_expansion, keys=design_keys), registry.bounds()
+    ])
     unit = sobol_unit_sample(
         seed=s.seed, pow_n=s.pow_n, index_row=index_row, dim=d_total,
     )
@@ -148,11 +152,11 @@ def main():
     bundle = registry.apply(theta)
     planning_params, env_overrides = params_from_x(
         x_design, ref, renewables=g.renewables, vector=g.vector,
-        cost_overrides=bundle.cost_overrides,
+        cost_overrides=bundle.cost_overrides, keys=design_keys,
     )
     if bundle.env_overrides:
         _deep_merge(env_overrides, bundle.env_overrides)
-    flat_dims = flatten_dims(planning_params, env_overrides)
+    flat_dims = flatten_dims(planning_params, env_overrides, keys=design_keys)
 
     json_path = out_dir / f"result_{run_timestamp}.json"
     result = {
@@ -167,6 +171,7 @@ def main():
         "num_instances": g.num_instances,
         "num_devices": g.num_devices,
         "theta_params": registry.names,
+        "design_keys": design_keys,
         "objective": None,
         "mean_score": None,
         "var_score": None,
@@ -178,7 +183,7 @@ def main():
         "x_design": x_design.tolist(),
         "theta": theta.tolist(),
     }
-    for key in PARAM_KEYS:
+    for key in design_keys:
         result[key] = flat_dims[key]
     for name, val in zip(registry.names, theta):
         result[f"theta.{name}"] = float(val)
@@ -186,7 +191,7 @@ def main():
     result["opex"] = planning_params["opex"]
     _atomic_write_json(json_path, result)
 
-    for key, (lo, hi) in zip(PARAM_KEYS + registry.names, bounds):
+    for key, (lo, hi) in zip(design_keys + registry.names, bounds):
         logger.info("sobol_parametric.bounds", parameter=key, lower=lo, upper=hi)
 
     if s.walltime_seconds is not None:

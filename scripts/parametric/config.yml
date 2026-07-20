@@ -30,6 +30,22 @@ general:
   log_level:        DEBUG
   planning_dir:     ../idc/tmp/planning   # shared with the IDC runs
 
+# BO design dims. Omit this block to search all 13 PARAM_KEYS (the IDC
+# space). Here we search the capacity design only: the MPC tuning knobs
+# (storage backoffs, wind_forecast_mean, expected_arrival_offset) are held
+# at their variables.yml defaults, so the kernel is 7 design + 3 theta.
+# Dropping expected_arrival_offset also keeps the MPC instance structural
+# across iterations, since it is the one rebuild-forcing parameter.
+design:
+  include:
+    - compression_capacity
+    - conversion_trains_number
+    - electrolyser_capacity
+    - fuelcell_capacity
+    - hydrogen_storage_capacity
+    - renewable_energy_capacity
+    - vector_storage_capacity
+
 # Uncertain parameters. Names resolve against
 # `hydro_bo.utils.theta.default_catalog`; bounds come from h2_plan's own
 # [optimistic, nominal, pessimistic] data triples. Keep this list short —
