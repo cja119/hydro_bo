@@ -37,8 +37,9 @@ class Dynamics:
                 jump_sigma=float(pd_cfg.get("jump_sigma", 0.2)),
                 initial_price=float(pd_cfg.get("initial_price", 5.0)),
                 seed=derive_subseed(seed, "price"),
+                fundamental=pd_cfg.get("fundamental"),
             )
-            self.h2_price = float(pd_cfg.get("initial_price", 5.0))
+            self.h2_price = float(self._price_dynamics.price)
         else:
             self._price_dynamics = None
             self.h2_price = 5.0
@@ -279,6 +280,22 @@ class Dynamics:
         }
     
 class PriceDynamics:
+    """
+    Log-price OU + compound-Poisson jump process.
+
+    Without `fundamental`, the log-price reverts to `long_run_log_price`
+    (original behaviour). With a `fundamental` dict (keys `h_g`, `P_NG`,
+    `k_g`, `e_g`, `lambda_0`, `lambda_inf`, `kappa_lambda`), the price is
+    P_f(t) * exp(y): P_f is the grey-hydrogen cost floor
+
+        lambda(t) = lambda_inf + (lambda_0 - lambda_inf) * exp(-kappa_lambda * t)
+        P_f(t)    = h_g * P_NG + k_g + e_g * lambda(t)        (t in years)
+
+    and y follows the same OU + jump step, reverting to `theta`, chosen so
+    that the stationary E[exp(y)] = 1. `initial_price` and
+    `long_run_log_price` are unused in that mode; y starts at theta.
+    """
+
     def __init__(
         self,
         volatility,         # annual sigma
@@ -288,7 +305,8 @@ class PriceDynamics:
         jump_mu,            # mean jump (log space)
         jump_sigma,         # jump volatility (log space)
         initial_price,
-        seed=None
+        seed=None,
+        fundamental=None,   # optional grey-hydrogen floor parameters
     ):
         self.sigma = volatility
         self.mu = long_run_log_price
@@ -298,14 +316,71 @@ class PriceDynamics:
         self.jump_mu = jump_mu
         self.jump_sigma = jump_sigma
 
-        self.price = initial_price
-
         self._rng = make_rng(seed) if seed is not None else make_rng(0)
+
+        self.fundamental = None if fundamental is None else {
+            k: float(fundamental[k])
+            for k in ("h_g", "P_NG", "k_g", "e_g", "lambda_0", "lambda_inf", "kappa_lambda")
+        }
+        if self.fundamental is None:
+            self.price = initial_price
+        else:
+            self.t = 0.0
+            self.theta = self.compensated_theta()
+            self.y = self.theta
+            self.price = self.floor_price(self.t) * np.exp(self.y)
+
+    def compensated_theta(self):
+        """theta = -sigma^2/(4 kappa)
+                   - (lambda/kappa) * int_0^1 (exp(jump_mu*v + jump_sigma^2*v^2/2) - 1) / v dv,
+        which sets the stationary E[exp(y)] of the continuous-time process to 1."""
+        from scipy.integrate import quad
+
+        integral, _ = quad(
+            lambda v: np.expm1(self.jump_mu * v + 0.5 * self.jump_sigma**2 * v**2) / v,
+            0.0, 1.0,
+        )
+        return -self.sigma**2 / (4 * self.kappa) - (self.lambda_ / self.kappa) * integral
+
+    def conditional_mean(self, h):
+        """E[S(t+h) | y_t] for horizon `h` years from the current state:
+
+            P_f(t+h) * exp(m + v + j)
+            m = theta + (y_t - theta) * exp(-kappa h)
+            v = sigma^2 (1 - exp(-2 kappa h)) / (4 kappa)
+            j = (lambda/kappa) * int_{exp(-kappa h)}^1
+                    (exp(jump_mu u + jump_sigma^2 u^2 / 2) - 1) / u du
+
+        Continuous-time result; fundamental mode only."""
+        if self.fundamental is None:
+            raise ValueError("conditional_mean needs the fundamental price block")
+        from scipy.integrate import quad
+
+        decay = np.exp(-self.kappa * h)
+        m = self.theta + (self.y - self.theta) * decay
+        v = self.sigma**2 * (1 - np.exp(-2 * self.kappa * h)) / (4 * self.kappa)
+        integral, _ = quad(
+            lambda u: np.expm1(self.jump_mu * u + 0.5 * self.jump_sigma**2 * u**2) / u,
+            decay, 1.0,
+        )
+        j = (self.lambda_ / self.kappa) * integral
+        return self.floor_price(self.t + h) * np.exp(m + v + j)
+
+    def carbon_price(self, t):
+        f = self.fundamental
+        return f["lambda_inf"] + (f["lambda_0"] - f["lambda_inf"]) * np.exp(-f["kappa_lambda"] * t)
+
+    def floor_price(self, t):
+        f = self.fundamental
+        return f["h_g"] * f["P_NG"] + f["k_g"] + f["e_g"] * self.carbon_price(t)
 
     def step(self, dt=1/365):
         """
         Exact OU discretisation + jump diffusion
         """
+        if self.fundamental is not None:
+            return self._fundamental_step(dt)
+
         X = np.log(self.price)
 
         # Precompute constants
@@ -329,6 +404,21 @@ class PriceDynamics:
 
         # Back to price
         self.price = np.exp(X_new)
+
+        return self.price
+
+    def _fundamental_step(self, dt):
+        """Same OU + jump step as `step`, on y with long-run level theta;
+        price = P_f(t) * exp(y)."""
+        exp_kdt = np.exp(-self.kappa * dt)
+        mean = self.y * exp_kdt + self.theta * (1 - exp_kdt)
+        var = (self.sigma**2) * (1 - np.exp(-2 * self.kappa * dt)) / (2 * self.kappa)
+        diffusion = np.sqrt(var) * self._rng.normal()
+        jump = self._jump_step(dt)
+
+        self.y = mean + diffusion + jump
+        self.t += dt
+        self.price = self.floor_price(self.t) * np.exp(self.y)
 
         return self.price
 

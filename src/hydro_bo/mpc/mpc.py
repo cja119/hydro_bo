@@ -85,7 +85,6 @@ class MPCController:
         self._last_handoff_cache = None
         self._current_uncertain_cache = None
         self._prev_uncertain_cache = None
-        self._first_solve = True
 
     # --- Public Interface Methods --- #
 
@@ -323,36 +322,12 @@ class MPCController:
         return None
 
     def output(self, time_step: int = 24):
-        """This grabs the conditional variables for the uncertainty."""
+        """This grabs the end states used to warm start the next solve."""
 
         solve = self.instance
 
-        # Extract end states and outputs
+        # Extract end states
         end_states = {}
-        stochastic_output = {}
-        stored_val = 0.0
-
-        # Extract ships sent / ordered.
-        # t=0 is only counted on the first window (no prior window to inherit from).
-        t_start = 0 if self._first_solve else 24
-        self._first_solve = False
-        ordered_ship, sent_ship = self._ship_orders(solve, time_step, t_start)
-        sent_vol_by_ship = self._sent_volumes(solve, time_step, t_start)
-
-        # Setting these in outputs
-        stochastic_output["ordered_ship"] = ordered_ship
-        stochastic_output["sent_ship"] = sent_ship
-
-        # Total sent volume (scalar)
-        last_t = time_step
-        hs, vs, cc, cv, hs0, vs0, cc0 = self._storage_terms(solve, last_t)
-
-        # Calculate stored value
-        stored_val += (hs - hs0) / 120.0
-        stored_val += ((vs - vs0) * 1000.0 * cv) / 120.0
-        stored_val += (cc - cc0) * cv / 120.0
-
-        sent_vol = (sum(sent_vol_by_ship.values()) * cv) / 120
 
         end_states.update(
             self._end_states_at_time(solve, time_step=time_step, target_time=0)
@@ -376,7 +351,7 @@ class MPCController:
         else:
             getattr(self.model, "fixed").set_value(True)
 
-        return end_states, stochastic_output, stored_val, sent_vol
+        return end_states
 
     # --- Internal Helper Methods --- #
 
@@ -770,43 +745,6 @@ class MPCController:
             opts["Seed"] = _clamp_gurobi_seed(self._gurobi_seed)
         self._solver_configured = True
 
-    def _ship_orders(self, solve, time_step, t_start):
-        ordered_ship = {
-            s: sum(
-                value(getattr(solve, "n_ship_ordered")[s, t])
-                for t in range(t_start, time_step + 1, 24)
-            )
-            for s in getattr(solve, "ships", [])
-        }
-        sent_ship = {
-            s: sum(
-                value(getattr(solve, "n_ship_sent")[s, t])
-                for t in range(t_start, time_step + 1, 24)
-            )
-            for s in getattr(solve, "ships", [])
-        }
-        return ordered_ship, sent_ship
-
-    def _sent_volumes(self, solve, time_step, t_start):
-        return {
-            s: sum(
-                value(getattr(solve, "n_ship_sent")[s, t])
-                for t in range(t_start, time_step + 1, 24)
-            )
-            * value(getattr(solve, "ship_capacity")[s])
-            for s in getattr(solve, "ships", [])
-        }
-
-    def _storage_terms(self, solve, last_t):
-        hs = value(getattr(solve, "hydrogen_storage")[last_t])
-        vs = value(getattr(solve, "vector_storage")[last_t])
-        cc = value(getattr(solve, "cumulative_charge")[last_t])
-        cv = value(getattr(solve, "calorific_value"))
-        hs0 = value(getattr(solve, "hydrogen_storage")[0])
-        vs0 = value(getattr(solve, "vector_storage")[0])
-        cc0 = value(getattr(solve, "cumulative_charge")[0])
-        return hs, vs, cc, cv, hs0, vs0, cc0
-
     def _extract_uncertain_vectors(self, stochastic_values):
         """Serialise a stochastic-values dict for JSON storage.
 
@@ -1053,4 +991,84 @@ class MPCController:
                     )
         except Exception as e:
             logger.warning("feasibility_relaxation_report_failed", error=str(e))
+
+
+class ShippingMPCController(MPCController):
+    """MPC controller for the shipping problem."""
+
+    def __init__(self, gurobi_seed=None):
+        super().__init__(gurobi_seed=gurobi_seed)
+        self._first_solve = True
+
+    def output(self, time_step: int = 24):
+        """This grabs the conditional variables for the uncertainty."""
+
+        solve = self.instance
+
+        # Extract outputs
+        stochastic_output = {}
+        stored_val = 0.0
+
+        # Extract ships sent / ordered.
+        # t=0 is only counted on the first window (no prior window to inherit from).
+        t_start = 0 if self._first_solve else 24
+        self._first_solve = False
+        ordered_ship, sent_ship = self._ship_orders(solve, time_step, t_start)
+        sent_vol_by_ship = self._sent_volumes(solve, time_step, t_start)
+
+        # Setting these in outputs
+        stochastic_output["ordered_ship"] = ordered_ship
+        stochastic_output["sent_ship"] = sent_ship
+
+        # Total sent volume (scalar)
+        last_t = time_step
+        hs, vs, cc, cv, hs0, vs0, cc0 = self._storage_terms(solve, last_t)
+
+        # Calculate stored value
+        stored_val += (hs - hs0) / 120.0
+        stored_val += ((vs - vs0) * 1000.0 * cv) / 120.0
+        stored_val += (cc - cc0) * cv / 120.0
+
+        sent_vol = (sum(sent_vol_by_ship.values()) * cv) / 120
+
+        end_states = super().output(time_step)
+
+        return end_states, stochastic_output, stored_val, sent_vol
+
+    def _ship_orders(self, solve, time_step, t_start):
+        ordered_ship = {
+            s: sum(
+                value(getattr(solve, "n_ship_ordered")[s, t])
+                for t in range(t_start, time_step + 1, 24)
+            )
+            for s in getattr(solve, "ships", [])
+        }
+        sent_ship = {
+            s: sum(
+                value(getattr(solve, "n_ship_sent")[s, t])
+                for t in range(t_start, time_step + 1, 24)
+            )
+            for s in getattr(solve, "ships", [])
+        }
+        return ordered_ship, sent_ship
+
+    def _sent_volumes(self, solve, time_step, t_start):
+        return {
+            s: sum(
+                value(getattr(solve, "n_ship_sent")[s, t])
+                for t in range(t_start, time_step + 1, 24)
+            )
+            * value(getattr(solve, "ship_capacity")[s])
+            for s in getattr(solve, "ships", [])
+        }
+
+    def _storage_terms(self, solve, last_t):
+        hs = value(getattr(solve, "hydrogen_storage")[last_t])
+        vs = value(getattr(solve, "vector_storage")[last_t])
+        cc = value(getattr(solve, "cumulative_charge")[last_t])
+        cv = value(getattr(solve, "calorific_value"))
+        hs0 = value(getattr(solve, "hydrogen_storage")[0])
+        vs0 = value(getattr(solve, "vector_storage")[0])
+        cc0 = value(getattr(solve, "cumulative_charge")[0])
+        return hs, vs, cc, cv, hs0, vs0, cc0
 

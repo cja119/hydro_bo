@@ -18,3 +18,4 @@ test*.py
 *.txt
 **/*.log
 **/*.csv
+paper_results/contract/*

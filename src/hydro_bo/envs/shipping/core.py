@@ -6,7 +6,7 @@ control optimiser for the shipping problem.
 from __future__ import annotations
 
 from hydro_bo.utils.logging_config import get_logger
-from hydro_bo.mpc.mpc import MPCController, MPCSolveError
+from hydro_bo.mpc.mpc import MPCSolveError, ShippingMPCController
 from .utils import (
     PlotTheme,
     apply_theme,
@@ -28,7 +28,7 @@ class ShippingEnv:
     def __init__(self) -> None:
         self.idx = 0
         self._args = args_dict()
-        self._controller = MPCController()
+        self._controller = ShippingMPCController()
         self._slow_data = {
             "params": {
                 "storage_capacity": 10,
@@ -48,12 +48,13 @@ class ShippingEnv:
         # rebuild controller/dynamics from current args
         from hydro_bo.utils.seeding import derive_subseed
         master_seed = int(self._args.get("seed", 0))
-        self._controller = MPCController(gurobi_seed=derive_subseed(master_seed, "gurobi"))
+        self._controller = ShippingMPCController(gurobi_seed=derive_subseed(master_seed, "gurobi"))
         self._controller_data = import_mpc_data(
             self._args["mpc"]["planning_model"],
             self._args["vector"],
             self._args["mpc"]["random_param"],
             random_param_seed=derive_subseed(master_seed, "random_param"),
+            data_folder=self._args["mpc"]["data_folder"],
         )
 
         self._controller_data.update(
@@ -292,7 +293,7 @@ class ShippingEnvPlot(ShippingEnv):
     def __init__(self) -> None:
         self.idx = 0
         self._args = args_dict()
-        self._controller = MPCController()
+        self._controller = ShippingMPCController()
         self._slow_data = {
             "params": {
                 "storage_capacity": 10,
@@ -309,12 +310,13 @@ class ShippingEnvPlot(ShippingEnv):
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         from hydro_bo.utils.seeding import derive_subseed
         master_seed = int(self._args.get("seed", 0))
-        self._controller = MPCController(gurobi_seed=derive_subseed(master_seed, "gurobi"))
+        self._controller = ShippingMPCController(gurobi_seed=derive_subseed(master_seed, "gurobi"))
         self._controller_data = import_mpc_data(
             self._args["mpc"]["planning_model"],
             self._args["vector"],
             self._args["mpc"]["random_param"],
             random_param_seed=derive_subseed(master_seed, "random_param"),
+            data_folder=self._args["mpc"]["data_folder"],
         )
 
         self._controller_data.update(

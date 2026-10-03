@@ -30,9 +30,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 TMP_DIR = PROJECT_ROOT / "tmp"
 EQUATIONS_PATH = Path(__file__).parent / "equations.py"
-FUNCTIONS_PATH = DATA_DIR / "functions.yml"
-CONFIG_PATH = DATA_DIR / "config.yml"
-VARIABLES_PATH = DATA_DIR / "variables.yml"
 
 
 def _load_yaml(path: Path) -> MutableMapping[str, Any]:
@@ -70,6 +67,7 @@ def _traverse(mapping: Mapping[str, Any], keys: Iterable[str]) -> Any:
 def import_mpc_data(
     planning_model: str | Path | dict, vector: str, random_param: bool = False,
     random_param_seed: int = 0,
+    data_folder: Optional[str | Path] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Import MPC input data from config, variables, and planning model files."""
 
@@ -78,8 +76,9 @@ def import_mpc_data(
     vars: Dict[str, Any] = {}
     forms: Dict[str, Any] = {}
 
-    config = _load_yaml(CONFIG_PATH)
-    variables = _load_yaml(VARIABLES_PATH)
+    data_folder = Path(data_folder) if data_folder is not None else DATA_DIR
+    config = _load_yaml(data_folder / "config.yml")
+    variables = _load_yaml(data_folder / "variables.yml")
 
     planning_model_path = None
     if isinstance(planning_model, dict):
@@ -187,25 +186,31 @@ def import_mpc_data(
     }
 
 
-def import_mpc_functions(data_folder: str, sets: Mapping[str, Sequence[Any]]) -> Dict[str, Dict[str, Any]]:
-    """Import callable MPC components defined in equations.py and functions.yml."""
+def import_mpc_functions(
+    data_folder: Optional[str | Path],
+    sets: Mapping[str, Sequence[Any]],
+    equations_path: Optional[str | Path] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Import callable MPC components defined in the equations module and functions.yml."""
 
-    _ = data_folder  # placeholder for future use; keeps API stable
+    data_folder = Path(data_folder) if data_folder is not None else DATA_DIR
+    equations_path = Path(equations_path) if equations_path is not None else EQUATIONS_PATH
+    functions_path = data_folder / "functions.yml"
 
     funcs: Dict[str, Dict[str, Any]] = {"equations": {}, "constraints": {}, "objectives": {}}
 
-    if not EQUATIONS_PATH.exists():
-        raise FileNotFoundError(f"Equations file {EQUATIONS_PATH} does not exist.")
+    if not equations_path.exists():
+        raise FileNotFoundError(f"Equations file {equations_path} does not exist.")
 
-    if not FUNCTIONS_PATH.exists():
-        raise FileNotFoundError(f"Functions file {FUNCTIONS_PATH} does not exist.")
+    if not functions_path.exists():
+        raise FileNotFoundError(f"Functions file {functions_path} does not exist.")
 
-    functions = _load_yaml(FUNCTIONS_PATH)
+    functions = _load_yaml(functions_path)
 
-    mod_name = EQUATIONS_PATH.stem
-    spec = importlib.util.spec_from_file_location(mod_name, EQUATIONS_PATH)
+    mod_name = equations_path.stem
+    spec = importlib.util.spec_from_file_location(mod_name, equations_path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"Unable to load module specification from {EQUATIONS_PATH}")
+        raise ImportError(f"Unable to load module specification from {equations_path}")
 
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)  # type: ignore[operator]
