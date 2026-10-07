@@ -285,11 +285,11 @@ class PriceDynamics:
 
     Without `fundamental`, the log-price reverts to `long_run_log_price`
     (original behaviour). With a `fundamental` dict (keys `h_g`, `P_NG`,
-    `k_g`, `e_g`, `lambda_0`, `lambda_inf`, `kappa_lambda`), the price is
-    P_f(t) * exp(y): P_f is the grey-hydrogen cost floor
+    `k_g`, `e_g`, `lambda_0`, `lambda_inf`, `kappa_lambda`, optional `t_0`),
+    the price is P_f(t) * exp(y): P_f is the grey-hydrogen cost floor
 
-        lambda(t) = lambda_inf + (lambda_0 - lambda_inf) * exp(-kappa_lambda * t)
-        P_f(t)    = h_g * P_NG + k_g + e_g * lambda(t)        (t in years)
+        lambda(t) = lambda_inf + (lambda_0 - lambda_inf) * exp(-kappa_lambda * (t_0 + t))
+        P_f(t)    = h_g * P_NG + k_g + e_g * lambda(t)        (t in years of simulation)
 
     and y follows the same OU + jump step, reverting to `theta`, chosen so
     that the stationary E[exp(y)] = 1. `initial_price` and
@@ -319,8 +319,11 @@ class PriceDynamics:
         self._rng = make_rng(seed) if seed is not None else make_rng(0)
 
         self.fundamental = None if fundamental is None else {
-            k: float(fundamental[k])
-            for k in ("h_g", "P_NG", "k_g", "e_g", "lambda_0", "lambda_inf", "kappa_lambda")
+            **{
+                k: float(fundamental[k])
+                for k in ("h_g", "P_NG", "k_g", "e_g", "lambda_0", "lambda_inf", "kappa_lambda")
+            },
+            "t_0": float(fundamental.get("t_0", 0.0)),  # years from today to the start of the simulation
         }
         if self.fundamental is None:
             self.price = initial_price
@@ -368,7 +371,7 @@ class PriceDynamics:
 
     def carbon_price(self, t):
         f = self.fundamental
-        return f["lambda_inf"] + (f["lambda_0"] - f["lambda_inf"]) * np.exp(-f["kappa_lambda"] * t)
+        return f["lambda_inf"] + (f["lambda_0"] - f["lambda_inf"]) * np.exp(-f["kappa_lambda"] * (f["t_0"] + t))
 
     def floor_price(self, t):
         f = self.fundamental
@@ -429,3 +432,76 @@ class PriceDynamics:
         if self._rng.random() < self.lambda_ * dt:
             return float(self._rng.normal(self.jump_mu, self.jump_sigma))
         return 0.0
+
+
+class BluePriceDynamics(PriceDynamics):
+    """
+    Green-hydrogen price anchored on the blue-hydrogen cost, on the basis y:
+
+        P_b = h * P_NG + k + e * lambda + q * c_TS
+        P_g = P_b + premium
+        S_g = P_b * exp(y) + min(premium * exp(y), penalty)
+
+    `blue` holds `h`, `k`, `e`, `q`, `c_TS`, `P_NG` and `lambda`; y follows the
+    fundamental-mode OU + jump step with the compensated theta. `conditional_mean`
+    is that of P_g * exp(y), without the cap.
+    """
+
+    def __init__(
+        self,
+        volatility,         # annual sigma
+        speed,              # mean reversion speed (kappa)
+        jump_intensity,     # annual lambda
+        jump_mu,            # mean jump (log space)
+        jump_sigma,         # jump volatility (log space)
+        seed=None,
+        blue=None,          # blue-hydrogen cost parameters
+        premium=0.0,        # green premium over blue ($/kg)
+        penalty=9.0,        # cap on the premium in the spot price ($/kg)
+    ):
+        super().__init__(volatility, None, speed, jump_intensity, jump_mu, jump_sigma, None, seed=seed)
+        self.fundamental = {
+            **{k: float(blue[k]) for k in ("h", "k", "e", "q", "c_TS", "P_NG", "lambda")},
+            "premium": float(premium),
+            "penalty": float(penalty),
+        }
+        self.t = 0.0
+        self.theta = self.compensated_theta()
+        self.y = self.theta
+        self.price = self.green_spot()
+
+    def blue_price(self, t):
+        f = self.fundamental
+        return f["h"] * f["P_NG"] + f["k"] + f["e"] * f["lambda"] + f["q"] * f["c_TS"]
+
+    def floor_price(self, t):
+        return self.blue_price(t) + self.fundamental["premium"]
+
+    def cap_binds(self):
+        return self.fundamental["premium"] * np.exp(self.y) > self.fundamental["penalty"]
+
+    def capped_mean(self, h):
+        """E[S_g(t+h) | y_t]: the uncapped mean less the Black call value of the cap, with y(t+h) Gaussian."""
+        from scipy.stats import norm
+
+        f = self.fundamental
+        mean = self.conditional_mean(h)
+        if f["premium"] == 0:
+            return mean
+        F = mean / self.floor_price(self.t + h)
+        s = np.sqrt(
+            (self.sigma**2 + self.lambda_ * (self.jump_mu**2 + self.jump_sigma**2))
+            * (1 - np.exp(-2 * self.kappa * h)) / (2 * self.kappa)
+        )
+        d1 = (np.log(f["premium"] * F / f["penalty"]) + s**2 / 2) / s
+        d2 = d1 - s
+        return mean - (f["premium"] * F * norm.cdf(d1) - f["penalty"] * norm.cdf(d2))
+
+    def green_spot(self):
+        f = self.fundamental
+        return self.blue_price(self.t) * np.exp(self.y) + min(f["premium"] * np.exp(self.y), f["penalty"])
+
+    def step(self, dt=1/365):
+        super().step(dt)
+        self.price = self.green_spot()
+        return self.price

@@ -144,7 +144,7 @@ def import_mpc_data(
     # BO can supply values (e.g. storage backoffs) that override the
     # defaults via `param_overrides` rather than being clobbered by them.
     for key, param in variables.get("parameters", {}).items():
-        params[key] = param
+        params[key] = param[vector] if isinstance(param, dict) and vector in param else param
 
     if planning_model_path is not None:
         planning_model_data = _load_yaml(planning_model_path)
@@ -183,6 +183,9 @@ def import_mpc_data(
         "forms": forms,
         "price_dynamics": price_dynamics,
         "forecast_horizon": forecast_horizon,
+        "solver": config.get("solver", {}),
+        "logistics": config.get("logistics", {}),
+        "contract": config.get("contract", {}),
     }
 
 

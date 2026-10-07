@@ -56,5 +56,6 @@ include = ["*"]
 [tool.setuptools.package-data]
 "hydro_bo" = [
     "data/*.yml",
+    "data/site/*.yml",
     "data/*.csv"
 ]

@@ -1,0 +1,36 @@
+equations:
+  eqn1:
+    name: "vector_storage_balance"
+    domain: ["grid0"]
+  eqn2:
+    name: "port_capacity"
+    domain: ["ships","grid0"]
+  eqn3:
+    name: "ship_holding_balance"
+    domain: ["ships","grid0"]
+  eqn4:
+    name: "buyer_inventory_balance"
+    domain: ["grid0"]
+  eqn5:
+    name: "daily_profit"
+    domain: ["grid0"]
+  eqn6:
+    name: "initial_spot_trades"
+    domain: ["grid0"]
+constraints:
+  cons1:
+    name: "lower_vector_storage_limit"
+    domain: ["grid0"]
+  cons2:
+    name: "upper_vector_storage_limit"
+    domain: ["grid0"]
+  cons3:
+    name: "lower_buyer_inventory_limit"
+    domain: ["grid0"]
+  cons4:
+    name: "upper_buyer_inventory_limit"
+    domain: ["grid0"]
+objectives:
+  obj1:
+    name: "logistics_profit_target"
+    sense: "max"

@@ -15,11 +15,14 @@ from typing import Optional, Dict, Any
 from pyomo.environ import (
     AbstractModel,
     Any,
+    Binary,
     Constraint,
+    NonNegativeReals,
     Objective,
     Param,
     Set,
     SolverFactory,
+    UnitInterval,
     Var,
     value,
 )
@@ -85,6 +88,7 @@ class MPCController:
         self._last_handoff_cache = None
         self._current_uncertain_cache = None
         self._prev_uncertain_cache = None
+        self._solver_options = {}
 
     # --- Public Interface Methods --- #
 
@@ -103,6 +107,7 @@ class MPCController:
         :param data: Data dictionary containing model definitions
         :type data: dict
         """
+        self._solver_options = data.get("solver", {})
         self._build_sets(data["sets"])
         self._build_params(data["params"])
         self._build_stochastic_params(data["sets"])  # Add placeholder stochastic params
@@ -131,7 +136,8 @@ class MPCController:
 
         if not self._instance_bound:
             instance_start = time.perf_counter()
-            self.instance = self.model.create_instance()
+            if self.instance is None:
+                self.instance = self.model.create_instance()
             instance_time = time.perf_counter() - instance_start
 
             bind_start = time.perf_counter()
@@ -249,6 +255,9 @@ class MPCController:
                 "instance_rebuilt_for_fixed_mode",
                 rebuild_ms=ms(rebuild_time)
             )
+
+        if self.instance is None:
+            self.instance = self.model.create_instance()
 
         # If no start values, just do stochastic update
         if start_values is None:
@@ -731,7 +740,7 @@ class MPCController:
 
         # Configure Gurobi options
         opts = self.solver.options
-        opts["mipgap"] = 0.05
+        opts["mipgap"] = self._solver_options.get("mip_gap", 0.05)
         opts["FeasibilityTol"] = 1e-6
         opts["OptimalityTol"] = 1e-9
         opts["Presolve"] = 2
@@ -1071,4 +1080,103 @@ class ShippingMPCController(MPCController):
         vs0 = value(getattr(solve, "vector_storage")[0])
         cc0 = value(getattr(solve, "cumulative_charge")[0])
         return hs, vs, cc, cv, hs0, vs0, cc0
+
+
+class SiteMPCController(MPCController):
+    """MPC controller for the site production problem."""
+
+    def output(self, time_step: int = 24):
+        """This grabs the end states and the delivered vector."""
+
+        solve = self.instance
+
+        # Planned delivered vector per hour over the horizon [t]
+        planned_delivered = {
+            t: value(getattr(solve, "vector_flux")[t])
+            * value(getattr(solve, "conversion_fugitive_efficiency"))
+            / value(getattr(solve, "calorific_value"))
+            for t in getattr(solve, "grid0")
+        }
+
+        # Delivered vector over the applied hours [t]
+        delivered = sum(planned_delivered[t] for t in range(1, time_step + 1))
+
+        end_states = super().output(time_step)
+
+        return end_states, delivered, planned_delivered
+
+
+class LogisticsMPCController(MPCController):
+    """MPC controller for the logistics problem."""
+
+    def __init__(self, gurobi_seed=None):
+        super().__init__(gurobi_seed=gurobi_seed)
+        self._previous_solution = None
+
+    def build(self, data: dict):
+        """Build the model, with the ship variables continuous after the integer horizon."""
+        super().build(data)
+        integer_horizon = data.get("logistics", {}).get("integer_horizon", 504)  # h
+        for name in ("n_ship_ordered", "n_ship_sent", "n_ship_discharged"):
+            var = getattr(self.model, name)
+            for index in var:
+                if index[-1] > integer_horizon:
+                    var[index].domain = UnitInterval if var[index].domain == Binary else NonNegativeReals
+
+    def solve(self, supress: bool = True, solver="gurobi"):
+        """Solve with the previous solution, shifted one day forward, as the MIP start."""
+        if self._instance_bound and self._previous_solution is not None:
+            self._set_shifted_start()
+        result = super().solve(supress=supress, solver=solver)
+        self._previous_solution = {
+            (var.name, index): var[index].value
+            for var in self.instance.component_objects(Var)
+            for index in var
+        }
+        return result
+
+    def _set_shifted_start(self):
+        from gurobipy import GRB
+
+        for var in self.instance.component_objects(Var):
+            for index in var:
+                if var[index].fixed:
+                    continue
+                if isinstance(index, tuple):
+                    shifted = index[:-1] + (index[-1] + 24,)
+                else:
+                    shifted = index + 24
+                start = self._previous_solution.get((var.name, shifted))
+                self.solver.set_var_attr(var[index], "Start", GRB.UNDEFINED if start is None else start)
+
+    def _build_stochastic_params(self, sets_def):
+        """Build placeholder stochastic parameters, including the logistics inputs."""
+        super()._build_stochastic_params(sets_def)
+
+        # vector_delivered, spot_forecast, fundamental_price: indexed by grid0 (time steps)
+        for name in ("vector_delivered", "spot_forecast", "fundamental_price"):
+            if "grid0" in sets_def and not hasattr(self.model, name):
+                default_values = {t: 0.0 for t in sets_def["grid0"]}
+                setattr(
+                    self.model,
+                    name,
+                    Param(getattr(self.model, "grid0"), initialize=default_values, within=Any, mutable=True)
+                )
+                getattr(self.model, name).construct()
+
+        # laden_arrivals: indexed by (ships, grid1)
+        if "ships" in sets_def and "grid1" in sets_def and not hasattr(self.model, "laden_arrivals"):
+            default_values = {(s, t): 0 for s in sets_def["ships"] for t in sets_def["grid1"]}
+            setattr(
+                self.model,
+                "laden_arrivals",
+                Param(
+                    getattr(self.model, "ships"),
+                    getattr(self.model, "grid1"),
+                    initialize=default_values,
+                    within=Any,
+                    mutable=True
+                )
+            )
+            getattr(self.model, "laden_arrivals").construct()
 

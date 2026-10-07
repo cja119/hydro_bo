@@ -1,0 +1,74 @@
+parameters:
+  mean_ship_arrival_time: 7
+  std_ship_arrival_time: 0.25
+  expected_arrival_offset: 0
+  hydrogen_storage_lower_backoff: 0.2
+  hydrogen_storage_upper_backoff: 1.0
+  vector_storage_lower_backoff: 0.2
+  vector_storage_upper_backoff: 1.0
+  laden_transit_time: 19
+  ballast_transit_time: 19
+  port_time: 1
+  half_spread: 0
+  commitment: 0
+  inventory_lower: 0
+  inventory_upper: 1000
+  reference_volume: 1
+  n_berths: 1
+  ship_berthing_rate: {small: 0, medium: 0, large: 0}
+  ship_fuel_rate:                       # t carrier per day at sea
+    LH2: {small: 18.1, medium: 29.0, large: 46.4}
+    NH3: {small: 98.0, medium: 163.8, large: 276.8}
+  holding_loss_rate: {LH2: 0.002, NH3: 0}   # fraction of cargo per day held at destination
+  port_fee:                             # $ per call: 0.32 GT + 0.60 cargo t, GT = 0.7 capacity / density (LH2 0.0708, NH3 0.68 t/m3)
+    LH2: {small: 13333.4, medium: 26666.8, large: 53296.0}
+    NH3: {small: 30205.9, medium: 60411.8, large: 120823.5}
+  reconversion_efficiency: {LH2: 0.99, NH3: 0.80}
+  reconversion_cost: {LH2: 0.15, NH3: 0.59}  # $/kg H2-equivalent
+  export_jetty_capex: {LH2: 129, NH3: 81}    # $M per berth
+
+variables:
+  var1:
+    name: vector_storage
+    domain: positive_real
+    time_duration: [grid0]
+  var2:
+    name: vector_flared
+    domain: positive_real
+    time_duration: [grid0]
+  var3:
+    name: waiting_ships
+    domain: positive_real
+    time_duration: [ships, grid0]
+  var4:
+    name: ships_holding
+    domain: positive_real
+    time_duration: [ships, grid0]
+  var5:
+    name: buyer_inventory
+    domain: positive_real
+    time_duration: [grid0]
+  var6:
+    name: spot_bought
+    domain: positive_real
+    time_duration: [grid0]
+  var7:
+    name: spot_sold
+    domain: positive_real
+    time_duration: [grid0]
+  var8:
+    name: cumulative_profit
+    domain: real
+    time_duration: [grid0]
+  var9:
+    name: n_ship_ordered
+    domain: binary
+    time_duration: [ships, grid1]
+  var10:
+    name: n_ship_sent
+    domain: positive_integer
+    time_duration: [ships, grid1]
+  var11:
+    name: n_ship_discharged
+    domain: positive_integer
+    time_duration: [ships, grid1]

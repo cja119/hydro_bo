@@ -1,0 +1,66 @@
+equations:
+  eqn1:
+    name: "energy_balance"
+    domain: ["grid0"]
+  eqn2:
+    name: "hydrogen_production"
+    domain: ["grid0"]
+  eqn3:
+    name: "compression_balance"
+    domain: ["grid0"]
+  eqn4:
+    name: "influent_hydrogen_balance"
+    domain: ["grid0"]
+  eqn5:
+    name: "effluent_hydrogen_balance"
+    domain: ["grid0"]
+  eqn6:
+    name: "fuel_cell_production"
+    domain: ["grid0"]
+  eqn7:
+    name: "hydrogen_storage_balance"
+    domain: ["grid0"]
+  eqn8:
+    name: "vector_production"
+    domain: ["grid0"]
+constraints:
+  cons2:
+    name: "upper_hydrogen_storage_limit"
+    domain: ["grid0"]
+  cons5:
+    name: "lower_vector_ramping_limit"
+    domain: ["grid0"]
+  cons6:
+    name: "upper_vector_ramping_limit"
+    domain: ["grid0"]
+  cons11:
+    name: "electrolyser_production_limit"
+    domain: ["grid0"]
+  cons12:
+    name: "upper_vector_production_limit"
+    domain: ["grid0"]
+  cons13:
+    name: "active_trains_limit"
+    domain: ["grid0"]
+  cons14:
+    name: "lower_vector_production_limit"
+    domain: ["grid0"]
+  cons15:
+    name: "fuelcell_production_limit"
+    domain: ["grid0"]
+  cons16:
+    name: "compression_upper_limit"
+    domain: ["grid0"]
+  cons17:
+    name: "storage_addition_limit"
+    domain: ["grid0"]
+  cons18:
+    name: "storage_removal_limit"
+    domain: ["grid0"]
+  cons19:
+    name: "lower_hydrogen_storage_limit"
+    domain: ["grid0"]
+objectives:
+  obj1:
+    name: "hydrogen_production_maximisation"
+    sense: "max"
