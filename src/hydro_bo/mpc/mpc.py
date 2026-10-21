@@ -639,6 +639,7 @@ class MPCController:
                     set_name = f"{key}_index"
                     index_set = Set(initialize=index_set_values, ordered=True)
                     setattr(self.model, set_name, index_set)
+                    index_set.construct()  # a later dict parameter with the same keys reuses it via find_equivalent_set
                 if not hasattr(self.model, key):
                     setattr(
                         self.model, key, Param(index_set, initialize=param, within=Any, mutable=is_mutable)

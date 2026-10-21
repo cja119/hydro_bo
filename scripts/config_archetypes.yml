@@ -1,0 +1,42 @@
+# Adoption-archetype BO: design + contract factor, NPV maximisation on ContractEnv (mode-3 storage netback).
+# Used by archetype_sobol.py (PBS array), archetype_bo.py (single node per problem) and archetype_profile.py.
+#
+# A problem is (archetype, vector). Trains are fixed per problem: the fewest full-size trains reaching the target
+# conversion throughput, at least two, resized to hit it exactly (src/hydro_bo/archetypes/scenarios.py).
+
+vectors: [NH3, LH2]
+problem_archetypes: [low, medium, high]
+
+# Overrides of the default archetypes (scenarios.default_archetypes); any field may be set here.
+archetypes:
+  low:    {target_mw: 500.0,  premium: 7.0, half_spread: 0.2,   depth_days: 0.25, penalty: 9.0}
+  medium: {target_mw: 1000.0, premium: 5.0, half_spread: 0.05,  depth_days: 1.0,  penalty: 9.0}
+  high:   {target_mw: 2000.0, premium: 3.0, half_spread: 0.002, depth_days: 4.0,  penalty: 9.0}
+
+# Reference designs (capacities scaled by conversion throughput to centre the search bounds).
+reference_designs:
+  NH3: paper_results/ablation/NH3/sobol_64_CI_NONE_comb_08/NH3-sobol_64_CI_NONE_comb_08-best.yml
+  LH2: paper_results/ablation/LH2/sobol_64_CI_050_comb_14/LH2-sobol_64_CI_050_comb_14-best.yml
+
+bounds_expansion: 0.5          # capacity bounds: reference x (1 -/+ 0.5)
+contract_bounds: [0.5, 1.0]    # contract factor f
+utilisation: 0.6               # reference utilisation of conversion nameplate (contract volume X1, delivery forecast)
+min_port_cargoes: 1.2          # port storage lower bound, in small-ship cargoes
+
+evaluation:
+  n_seeds: 32                  # rollouts per design (common random numbers: seeds seed_offset .. seed_offset+n-1)
+  seed_offset: 1000            # keeps BO seeds apart from the 0-4 seeds of the earlier studies
+  min_valid: 24                # fewer valid rollouts than this -> the point is a failure
+  failure_npv_bn: -30.0        # NPV sample [USD bn] fed to the BO for a failed point
+  save_npz: false              # keep per-rollout records (about 1.4 MB each)
+
+sobol:
+  n_per_problem: 64            # Sobol points per problem (array tasks = n_per_problem x number of problems)
+  seed: 2026
+  out_dir: scripts/tmp/archetype_sobol
+
+bo:
+  iter_budget: 100
+  out_dir: scripts/tmp/archetype_bo
+  walltime_buffer_s: 2400      # stop starting new iterations this long before the job's walltime
+  # GP kernels, acquisition restarts/Sobol candidates and SQP settings come from the `nlp` block of scripts/config.yml.

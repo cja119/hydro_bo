@@ -3,7 +3,7 @@ Dynamics for the contract layers: the site production problem (weather forecast 
 and the logistics problem (ships, buyer inventory and site deliveries).
 """
 
-from math import floor
+from math import exp, floor
 
 from hydro_bo.envs.shipping.dynamics import BluePriceDynamics, Dynamics
 from hydro_bo.envs.shipping.utils import generate_weather_forecast
@@ -127,7 +127,25 @@ class LogisticsDynamics(Dynamics):
                 if (ship["size"], t) in laden_arrivals:
                     laden_arrivals[ship["size"], t] += 1
 
+        horizon_values = {}
+        if int(self._fast_data["params"].get("terminal_valuation", 0)) in (2, 3) and self._price_dynamics is not None:
+            # Storage-netback value of stock held at the start (day 0) and end (day T) of the horizon
+            last = self.results or {}
+            origin = last.get(("vector_storage", 0), 0.0) * float(self._fast_data["params"]["calorific_value"]) / 120
+            buyer = last.get(("buyer_inventory", 0), 0.0)
+            T = max(sets["grid0"]) // 24 - 1
+            for prefix, days in (("tv0", 0), ("tv", T)):
+                for key, val in self.storage_netback(days, origin, buyer).items():
+                    name = f"{prefix}_{key}"
+                    horizon_values[name] = {
+                        "name": name,
+                        "loc": "exogenous",
+                        "param": {"set": None if not isinstance(val, dict) else list(val), "initialize": val},
+                    }
+            self.horizon_values = {k: v["param"]["initialize"] for k, v in horizon_values.items()}
+
         return {
+            **horizon_values,
             "vector_delivered": {
                 "name": "vector_delivered",
                 "loc": "exogenous",
@@ -165,6 +183,63 @@ class LogisticsDynamics(Dynamics):
         if self._price_dynamics is None:
             return self._price, False
         return self._netback(self._price_dynamics.price), bool(self._price_dynamics.cap_binds())
+
+    def storage_netback(self, days, origin, buyer):
+        """Storage netback of stock held `days` ahead [$/kg H2]: the forecast netback on the expected sale date at the bid,
+        less the costs still to pay to reach the buyer, discounted at the project rate to today.
+        terminal_valuation 2: bid (1 - eps). terminal_valuation 3: marginal bid (1 - eps (1 + 2 q_spot / q_ref)), the
+        half-spread of selling one extra kg on top of the day's spot volume q_spot = (1 - f) X/30 (spot_daily_volume), each
+        location's value floored at 0 per kg (the discharge charge of a ship at sea is netted per kg landed before the floor).
+        `origin` and `buyer` are today's stock [kt H2]; they set the sell-down time at q_ref (held fixed over the horizon).
+        Returns origin (per kg in the tank), buyer (per kg in the tank), and per ship size and remaining laden days k:
+        sea (per kg landed) and sea_disc (discount on the per-ship discharge charge; 0 under mode 3, where it is netted)."""
+        p = self._fast_data["params"]
+        prices = self._price_dynamics
+        r = float(p["discount_factor"])
+        eps, q_ref = float(p["half_spread"]), float(p["reference_volume"])
+        marginal = int(p.get("terminal_valuation", 2)) == 3
+        spread = eps * (1 + 2 * float(p.get("spot_daily_volume", 0.0)) / q_ref) if marginal else eps
+        floor = (lambda x: max(x, 0.0)) if marginal else (lambda x: x)
+        h2 = float(p["calorific_value"]) / 120
+        laden, ballast, port = int(p["laden_transit_time"]), float(p["ballast_transit_time"]), float(p["port_time"])
+
+        def disc(d):
+            return exp(-r * d / 365)
+
+        def bid(d):
+            return (1 - spread) * self._netback(prices.price if d <= 0 else prices.capped_mean(d / 365))
+
+        # Origin tank: fill one large cargo, load, sail laden, discharge, sell down; the large ship pays the round trip
+        cap = float(p["ship_capacity"]["large"])
+        cargo = cap * h2 / 1000                                                           # kt H2
+        fuel_share = float(p["ship_fuel_rate"]["large"]) * (laden + ballast) / cap
+        round_trip = (float(p["ship_charter_rate"]["large"]) * (float(p["mean_ship_arrival_time"]) + laden + ballast + port) * 24
+                      + 2 * float(p["port_fee"]["large"])) / 1_000_000 / cargo           # $/kg H2
+        forecast = getattr(self, "delivery_forecast", None) or self._delivered            # t carrier per day
+        rate = sum(forecast) / len(forecast) * h2 / 1000                                   # kt H2 per day
+        fill = cargo / max(rate, 1e-9)                                                     # days
+        d_origin = days + fill + laden + port + origin / q_ref
+        values = {"origin": floor(disc(d_origin) * ((1 - fuel_share) * bid(d_origin) - round_trip))}
+
+        # At sea: remaining laden days k, then discharge and sell down one cargo
+        sea, sea_disc = {}, {}
+        for s in self._fast_data["sets"]["ships"]:
+            landed = (float(p["ship_capacity"][s]) - float(p["ship_fuel_rate"][s]) * (laden + ballast)) * h2 / 1000
+            charge = (float(p["ship_charter_rate"][s]) * (ballast + port) * 24 + float(p["port_fee"][s])) / 1_000_000 / landed
+            for k in range(laden + 1):
+                d = days + k + landed / q_ref
+                if marginal:
+                    sea[f"{s}:{k}"] = floor(disc(d) * (bid(d) - charge))
+                    sea_disc[f"{s}:{k}"] = 0.0
+                else:
+                    sea[f"{s}:{k}"] = disc(d) * bid(d)
+                    sea_disc[f"{s}:{k}"] = disc(d)
+        values.update({"sea": sea, "sea_disc": sea_disc})
+
+        # Buyer tank: sell down only (import storage and reconversion are in the netback)
+        d_buyer = days + buyer / q_ref
+        values["buyer"] = floor(disc(d_buyer) * bid(d_buyer))
+        return values
 
     def _netback(self, price):
         """Carrier price at the export terminal from a hub hydrogen price [$/kg H2-equivalent]."""

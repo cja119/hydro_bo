@@ -1,0 +1,9 @@
+#!/bin/bash
+# One-node throughput profile: 16 single-seed rollouts in flight for 50 minutes, across all six problems.
+#   qsub scripts/pbs/archetype_profile.pbs        (from the repo root)
+#PBS -N arch_profile
+#PBS -l select=1:ncpus=16:mem=16gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+source "$PBS_O_WORKDIR/scripts/pbs/env.sh"
+python scripts/archetype_profile.py --minutes 50 --ncpus "$NCPUS"

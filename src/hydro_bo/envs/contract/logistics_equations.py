@@ -3,7 +3,7 @@ Equations for the logistics problem: export storage, shipping and the buyer's in
 at daily resolution. These are implemented in a format which can be solved by pyomo.
 """
 
-from pyomo.environ import Constraint
+from pyomo.environ import Constraint, value
 
 
 def vector_storage_balance(m, t):
@@ -194,7 +194,7 @@ def daily_profit(m, t):
     eqn = 0
     eqn += m.cumulative_profit[t]
     if t != m.grid0.at(-1):
-        eqn -= m.cumulative_profit[t + 24] * 0.99999 ** 24
+        eqn -= m.cumulative_profit[t + 24] * m.daily_discount
 
     eqn += (
         sum(
@@ -283,6 +283,16 @@ def logistics_profit_target(m):
     Logistics profit target equation.
     """
     T = m.grid0.at(-1)
+    # Valuation of stock held at the start and end of the horizon (terminal_valuation):
+    #   0 - mid price, forecast at T (original)
+    #   1 - mid price, today's netback
+    #   2 - storage netback at the bid (logistics_profit_target_storage_netback)
+    #   3 - storage netback at the marginal bid on the day's spot volume, floored at 0 (values set by LogisticsDynamics)
+    valuation = int(value(m.terminal_valuation))
+    if valuation in (2, 3):
+        return logistics_profit_target_storage_netback(m)
+    terminal_price = m.spot_forecast[0] if valuation == 1 else m.spot_forecast[T]
+    bid = 1
 
     return (
         m.cumulative_profit[m.grid0.at(1)]
@@ -293,7 +303,7 @@ def logistics_profit_target(m):
             / 120
             * (
                 (1 - m.ship_fuel_rate["large"] * (m.laden_transit_time + m.ballast_transit_time) / m.ship_capacity["large"])
-                * m.spot_forecast[T]
+                * bid * terminal_price
                 - (
                     m.ship_charter_rate["large"]
                     * (m.mean_ship_arrival_time + m.laden_transit_time + m.ballast_transit_time + m.port_time)
@@ -316,13 +326,13 @@ def logistics_profit_target(m):
                     * m.calorific_value
                     / 120
                     / 1000
-                    * m.spot_forecast[T]
+                    * bid * terminal_price
                     - (m.ship_charter_rate[s] * (m.ballast_transit_time + m.port_time) * 24 + m.port_fee[s])
                     / 1_000_000
                 )
                 for s in m.ships
             )
-            + m.spot_forecast[T]
+            + bid * terminal_price
             * m.buyer_inventory[T]
         )
         - (
@@ -331,7 +341,7 @@ def logistics_profit_target(m):
             / 120
             * (
                 (1 - m.ship_fuel_rate["large"] * (m.laden_transit_time + m.ballast_transit_time) / m.ship_capacity["large"])
-                * m.spot_forecast[0]
+                * bid * m.spot_forecast[0]
                 - (
                     m.ship_charter_rate["large"]
                     * (m.mean_ship_arrival_time + m.laden_transit_time + m.ballast_transit_time + m.port_time)
@@ -352,17 +362,17 @@ def logistics_profit_target(m):
                     * m.calorific_value
                     / 120
                     / 1000
-                    * m.spot_forecast[0]
+                    * bid * m.spot_forecast[0]
                     - (m.ship_charter_rate[s] * (m.ballast_transit_time + m.port_time) * 24 + m.port_fee[s])
                     / 1_000_000
                 )
                 for s in m.ships
             )
-            + m.spot_forecast[0]
+            + bid * m.spot_forecast[0]
             * m.buyer_inventory[0]
         )
         - sum(
-            0.99999 ** t
+            m.daily_discount ** (t / 24)
             * m.half_spread
             * m.spot_forecast[t]
             * (m.spot_bought[t] ** 2 + m.spot_sold[t] ** 2)
@@ -370,3 +380,51 @@ def logistics_profit_target(m):
             for t in m.grid0
         )
     )
+
+
+def logistics_profit_target_storage_netback(m):
+    """
+    Logistics profit target with stock held at the start and end of the horizon valued at its storage netback: the bid
+    (1 - eps) at the forecast netback on the expected sale date, less the costs still to pay to reach the buyer, discounted
+    at the project rate (tv0_* for day 0, tv_* for day T, set daily by LogisticsDynamics.storage_netback). Cash flows
+    within the horizon are discounted by daily_discount = exp(-r/365) per day.
+    """
+    T = m.grid0.at(-1)
+    laden = int(value(m.laden_transit_time))
+    h2 = m.calorific_value / 120
+
+    def ship(prefix, s, k, n):
+        """Value of n ships of size s with k laden days still to sail [$M]."""
+        landed = (m.ship_capacity[s] - m.ship_fuel_rate[s] * (m.laden_transit_time + m.ballast_transit_time)) * h2 / 1000
+        charge = (m.ship_charter_rate[s] * (m.ballast_transit_time + m.port_time) * 24 + m.port_fee[s]) / 1_000_000
+        key = f"{s}:{min(max(k, 0), laden)}"
+        return n * (landed * getattr(m, f"{prefix}_sea")[key] - charge * getattr(m, f"{prefix}_sea_disc")[key])
+
+    end = (
+        m.vector_storage[T] * h2 * m.tv_origin
+        + sum(
+            ship("tv", s, 0, m.ships_holding[s, T])
+            + sum(ship("tv", s, laden - (T - t) // 24, m.n_ship_sent[s, t]) for t in range(T - (laden - 1) * 24, T + 1, 24))
+            for s in m.ships
+        )
+        + m.buyer_inventory[T] * m.tv_buyer
+    )
+    start = (
+        m.vector_storage[0] * h2 * m.tv0_origin
+        + sum(
+            ship("tv0", s, 0, m.ships_holding[s, 0])
+            + sum(ship("tv0", s, t // 24 - 1, m.laden_arrivals[s, t]) for t in m.grid1)
+            + ship("tv0", s, laden, m.n_ship_sent[s, 0])
+            for s in m.ships
+        )
+        + m.buyer_inventory[0] * m.tv0_buyer
+    )
+    spread = sum(
+        m.daily_discount ** (t / 24)
+        * m.half_spread
+        * m.spot_forecast[t]
+        * (m.spot_bought[t] ** 2 + m.spot_sold[t] ** 2)
+        / m.reference_volume
+        for t in m.grid0
+    )
+    return m.cumulative_profit[m.grid0.at(1)] + end - start - spread

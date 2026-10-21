@@ -1,0 +1,12 @@
+#!/bin/bash
+# Sobol pool: one (problem, Sobol row) per array task, all seeds in parallel on the node.
+# -J must be 0..(n_per_problem x 6 - 1); check with: python scripts/archetype_sobol.py --list
+#   qsub scripts/pbs/archetype_sobol.pbs
+# Resubmitting is safe: finished rows are skipped. Set walltime from the profile (hours per point + margin).
+#PBS -N arch_sobol
+#PBS -J 0-383
+#PBS -l select=1:ncpus=16:mem=16gb
+#PBS -l walltime=08:00:00
+#PBS -j oe
+source "$PBS_O_WORKDIR/scripts/pbs/env.sh"
+python scripts/archetype_sobol.py --ncpus "$NCPUS"

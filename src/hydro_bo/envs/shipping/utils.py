@@ -300,8 +300,12 @@ def calculate_capex_opex(
     hydrogen_storage_capacity: float,
     renewable_energy_capacity: float,
     vector_storage_capacity: float,
+    single_train_throughput: Optional[float] = None,
 ) -> Dict[str, float | int | str]:
-    """Compute CAPEX and OPEX based on capacity choices."""
+    """Compute CAPEX and OPEX based on capacity choices.
+
+    `single_train_throughput` [t carrier/h] costs each conversion train at its own size (cost scales with size^(2/3));
+    when omitted, every train is costed at the h2_plan default (full) train size."""
 
     parameters = DefaultParams().formulation_parameters
     system_duration = parameters["replacement_frequencies"]["system_duration"]
@@ -352,19 +356,23 @@ def calculate_capex_opex(
     capex["hydrogen_storage"] = hydrogen_storage_capacity * _h2storage * parameters["capital_costs"]["hydrogen_storage"][1] / 120
     opex["hydrogen_storage"] = hydrogen_storage_capacity * parameters["operating_costs"]["hydrogen_storage"][1] * _plant / 120
 
+    default_size = parameters["vector_production"]["single_train_throughput"]["NH3"] if vector == "NH3" \
+        else parameters["vector_production"]["single_train_throughput"]["LH2"][1]
+    train_size = default_size if single_train_throughput is None else float(single_train_throughput)
+
     if vector == "NH3":
         capex["vector_storage"] = vector_storage_capacity * _NH3storage * parameters["capital_costs"]["vector_storage"]["NH3"][1]
         opex["vector_storage"] = vector_storage_capacity * parameters["operating_costs"]["vector_storage"]["NH3"][1] * _plant
         capex["vector_production"] = (
             _NH3prod
             * parameters["capital_costs"]["vector_production"]["NH3"][1]
-            * (parameters["vector_production"]["single_train_throughput"]["NH3"])
+            * train_size
             ** (2 / 3)
             * conversion_trains_number
         )
         opex["vector_production"] = (
             parameters["operating_costs"]["vector_production"]["NH3"][1]
-            * parameters["vector_production"]["single_train_throughput"]["NH3"] ** (2 / 3)
+            * train_size ** (2 / 3)
             * _plant
             * conversion_trains_number
         )
@@ -375,13 +383,13 @@ def calculate_capex_opex(
         capex["vector_production"] = (
             _LH2prod
             * parameters["capital_costs"]["vector_production"]["LH2"][1]
-            * (parameters["vector_production"]["single_train_throughput"]["LH2"][1])
+            * train_size
             ** (2 / 3)
             * conversion_trains_number
         )
         opex["vector_production"] = (
             parameters["operating_costs"]["vector_production"]["LH2"][1]
-            * parameters["vector_production"]["single_train_throughput"]["LH2"][1] ** (2 / 3)
+            * train_size ** (2 / 3)
             * _plant
             * conversion_trains_number
         )

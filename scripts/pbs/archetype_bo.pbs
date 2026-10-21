@@ -1,0 +1,10 @@
+#!/bin/bash
+# BO for one problem after its Sobol rows are in. Stops cleanly before the walltime; resubmit to continue.
+#   qsub -v PROBLEM=medium-NH3 scripts/pbs/archetype_bo.pbs
+#   for p in low-NH3 low-LH2 medium-NH3 medium-LH2 high-NH3 high-LH2; do qsub -v PROBLEM=$p scripts/pbs/archetype_bo.pbs; done
+#PBS -N arch_bo
+#PBS -l select=1:ncpus=16:mem=16gb
+#PBS -l walltime=72:00:00
+#PBS -j oe
+source "$PBS_O_WORKDIR/scripts/pbs/env.sh"
+python scripts/archetype_bo.py --problem "$PROBLEM" --ncpus "$NCPUS" --walltime-h 72

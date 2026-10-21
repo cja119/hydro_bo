@@ -14,6 +14,10 @@ parameters:
   inventory_lower: 0
   inventory_upper: 1000
   reference_volume: 1
+  terminal_valuation: 0    # horizon stock: 0 mid at forecast T, 1 mid at today's netback, 2 storage netback at bid,
+                           # 3 storage netback at the marginal bid on the spot volume, floored at 0
+  spot_daily_volume: 0     # kt H2/day sold spot, (1 - f) X/30; sets the marginal bid under terminal_valuation 3
+  daily_discount: 0.9997600276   # day-to-day discount in the objective (0.99999 per hour); exp(-r/365) under storage netback
   n_berths: 1
   ship_berthing_rate: {small: 0, medium: 0, large: 0}
   ship_fuel_rate:                       # t carrier per day at sea

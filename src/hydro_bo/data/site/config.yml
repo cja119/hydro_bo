@@ -21,6 +21,7 @@ param_source:
     - vector_storage_lower_backoff
     - vector_storage_upper_backoff
     - expected_arrival_offset
+    - single_train_limit_conversion   # per-train throughput [t carrier/h]; defaults to the h2_plan value
 
   default_data:
     electrolysis_efficiency: ["efficiencies", "electrolysers", "SOFC"]

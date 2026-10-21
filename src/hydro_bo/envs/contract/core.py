@@ -6,6 +6,7 @@ solved one after the other each day.
 from __future__ import annotations
 
 import time
+from math import exp
 from pathlib import Path
 
 from pyomo.environ import value
@@ -87,6 +88,14 @@ class ContractEnv:
         )
         self._logistics_data["params"].update(contract["logistics_settings"])
         self._logistics_data["price_dynamics"].update(contract["price_settings"])
+        p = self._logistics_data["params"]
+        if int(p.get("terminal_valuation", 0)) in (2, 3):
+            # Storage netback: discount every day at the project rate; placeholders for the daily horizon-stock values
+            p["daily_discount"] = exp(-float(p["discount_factor"]) / 365)
+            keys = [f"{s}:{k}" for s in self._logistics_data["sets"]["ships"] for k in range(int(p["laden_transit_time"]) + 1)]
+            for prefix in ("tv0", "tv"):
+                p.update({f"{prefix}_origin": 0.0, f"{prefix}_buyer": 0.0,
+                          f"{prefix}_sea": {k: 0.0 for k in keys}, f"{prefix}_sea_disc": {k: 0.0 for k in keys}})
         self._logistics.build(self._logistics_data)
         self._dynamics = ContractDynamics(self._logistics_data, self._args, contract["price"])
         self._warm_up_days = self._logistics_data["contract"].get("warm_up_days", 30)
@@ -161,6 +170,10 @@ class ContractEnv:
             "obj_val": gurobi_model.ObjVal,                               # $M
             "bound_gap": gurobi_model.ObjBound - gurobi_model.ObjVal,     # $M
         })
+        hv = getattr(self._dynamics, "horizon_values", None)
+        if hv:  # storage-netback values of stock held today, for the end-of-year stock in the NPV [$/kg H2]
+            record.update({"tv0_origin": hv["tv0_origin"], "tv0_buyer": hv["tv0_buyer"],
+                           "tv0_sea": list(hv["tv0_sea"].values()), "tv0_sea_disc": list(hv["tv0_sea_disc"].values())})
         self.records.append(record)
         logger.info("contract_env.day", day=day, month=month, site_delivered_t=delivered,
                     site_solve_s=site_solve_s, logistics_solve_s=logistics_solve_s)
