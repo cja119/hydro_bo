@@ -1,6 +1,7 @@
 parameters:
   hydrogen_storage_lower_backoff: 0.2
   hydrogen_storage_upper_backoff: 1.0
+  minimum_train_throughput: 0.25    # per-train minimum load, fraction of capacity (overrides the h2_plan default 0.4)
   backoff_start: 168               # h; storage backoff band applies from here to the end of the horizon
 
 variables:

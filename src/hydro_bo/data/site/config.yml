@@ -1,7 +1,7 @@
 Time:
   grid0: 1
   grid1: 24
-  total_duration: 336
+  total_duration: 216
   forecast_horizon: 168
 
 param_source:
