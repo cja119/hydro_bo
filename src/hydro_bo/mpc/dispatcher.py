@@ -38,42 +38,93 @@ def _stagger_ray_start() -> None:
         time.sleep(delay)
 
 
-def _resolve_ray_temp_dir() -> str:
+def _resolve_ray_temp_dir(attempt: int = 1) -> str:
     """Per-process scratch dir for Ray. Kept short so the plasma-store
-    Unix socket path stays under the AF_UNIX 107-byte limit."""
+    Unix socket path stays under the AF_UNIX 107-byte limit.
+
+    `attempt` > 1 appends a suffix so a retry gets a clean session dir
+    rather than reusing a half-initialised one from the failed attempt."""
+    suffix = "ray" if attempt <= 1 else f"ray{attempt}"
     base = os.environ.get("TMPDIR") or os.environ.get("PBS_JOBFS")
     if base:
-        path = Path(base) / "ray"
+        path = Path(base) / suffix
     else:
         import hashlib
         token = os.environ.get("PBS_JOBID", "nopbs") + "-" + os.environ.get("PBS_ARRAY_INDEX", "0")
-        path = Path("/tmp") / f"ray-{hashlib.md5(token.encode()).hexdigest()[:8]}"
+        path = Path("/tmp") / f"{suffix}-{hashlib.md5(token.encode()).hexdigest()[:8]}"
     path.mkdir(parents=True, exist_ok=True)
     return str(path)
 
 
 def ensure_ray(num_cpus, **kwargs):
     """Idempotent Ray init. Must be called before JAX spins up its
-    BLAS/XLA threads — Ray forks raylet/GCS inside `ray.init()`."""
+    BLAS/XLA threads — Ray forks raylet/GCS inside `ray.init()`.
+
+    Robust against transient head-node startup timeouts ("node timed out
+    during startup / GCS overloaded") that hit PBS array tasks co-located on a
+    busy node: `_stagger_ray_start` spreads the initial boots, then `ray.init`
+    is retried a few times with a clean temp dir and jittered backoff — the
+    failure is transient (identical tasks pass or fail by luck of contention),
+    so a second attempt on a quieter moment usually succeeds. Tunables (env):
+      RAY_INIT_MAX_ATTEMPTS      total attempts (default 4)
+      RAY_INIT_BACKOFF_SECONDS   base backoff, scaled by attempt (default 20)
+      RAY_raylet_start_wait_time_s / RAY_gcs_server_request_timeout_seconds
+                                 per-attempt startup budget (forced below)
+    """
     if ray.is_initialized():
         return
     _stagger_ray_start()
-    os.environ.setdefault("RAY_gcs_server_request_timeout_seconds", "120")
-    os.environ.setdefault("RAY_raylet_start_wait_time_s", "60")
-
-    temp_dir = _resolve_ray_temp_dir()
-    init_kwargs = dict(
-        num_cpus=int(num_cpus),
-        runtime_env={"env_vars": {"PYTHONPATH": _PROJECT_ROOT}},
-        _metrics_export_port=None,
-        logging_level=logging.ERROR,
-        _temp_dir=temp_dir,
-        _plasma_directory=temp_dir,
-        object_store_memory=256 * 1024 * 1024,
-        include_dashboard=False,
+    # Assign (not setdefault): an inherited value — PBS/module envs have been
+    # seen pinning raylet wait to 30s — must not cap our startup budget.
+    os.environ["RAY_gcs_server_request_timeout_seconds"] = os.environ.get(
+        "RAY_gcs_server_request_timeout_seconds_override", "120"
     )
-    init_kwargs.update(kwargs)
-    ray.init(**init_kwargs)
+    os.environ["RAY_raylet_start_wait_time_s"] = os.environ.get(
+        "RAY_raylet_start_wait_time_s_override", "120"
+    )
+
+    from hydro_bo.utils.logging_config import get_logger
+    log = get_logger(__name__)
+
+    attempts = max(1, int(os.environ.get("RAY_INIT_MAX_ATTEMPTS", "4")))
+    backoff = float(os.environ.get("RAY_INIT_BACKOFF_SECONDS", "20"))
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        temp_dir = _resolve_ray_temp_dir(attempt)
+        init_kwargs = dict(
+            num_cpus=int(num_cpus),
+            runtime_env={"env_vars": {"PYTHONPATH": _PROJECT_ROOT}},
+            _metrics_export_port=None,
+            logging_level=logging.ERROR,
+            _temp_dir=temp_dir,
+            _plasma_directory=temp_dir,
+            object_store_memory=256 * 1024 * 1024,
+            include_dashboard=False,
+        )
+        init_kwargs.update(kwargs)
+        try:
+            ray.init(**init_kwargs)
+            if attempt > 1:
+                log.info("ensure_ray.init_ok_after_retry", attempt=attempt)
+            return
+        except Exception as exc:  # noqa: BLE001 — transient startup timeout
+            last_exc = exc
+            # Tear down any half-started state so the next attempt is clean.
+            try:
+                ray.shutdown()
+            except Exception:
+                pass
+            if attempt < attempts:
+                delay = backoff * attempt + random.uniform(0.0, backoff)
+                log.warning(
+                    "ensure_ray.init_failed_retrying",
+                    attempt=attempt,
+                    attempts=attempts,
+                    retry_in_s=round(delay, 1),
+                    error=str(exc).splitlines()[-1] if str(exc) else type(exc).__name__,
+                )
+                time.sleep(delay)
+    raise last_exc
 
 
 @contextmanager

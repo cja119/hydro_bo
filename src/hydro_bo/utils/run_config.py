@@ -147,6 +147,14 @@ class KgCfg:
     mode: str
     theta_quad_per_dim: int      # nodes per theta dim; total = n**d_theta
     z_quad_points: int           # Gauss-Hermite nodes for E_z
+    acq_pow_sobol: int           # OUTER screen budget; KG-specific (<< nlp's).
+                                 # The screen batch-evaluates KG at 2**this many
+                                 # candidates at once, and each KG eval is heavy
+                                 # (z x inner-sobol x theta x fantasy-GP), so the
+                                 # surrogate BO's nlp.acq_pow_sobol=14 (16384) OOMs.
+    screen_chunk: int            # evaluate the outer screen this many candidates
+                                 # at a time, bounding peak memory regardless of
+                                 # 2**acq_pow_sobol (0/None => one shot).
     inner_pow_sobol: int         # inner screen budget (deliberately << outer)
     inner_n_restarts: int
     inner_sqp_max_iter: int
@@ -299,6 +307,8 @@ def _resolve_kg(k: Optional[dict]) -> Optional[KgCfg]:
         mode=mode,
         theta_quad_per_dim=int(k.get("theta_quad_per_dim", 5)),
         z_quad_points=int(k.get("z_quad_points", 9)),
+        acq_pow_sobol=int(k.get("acq_pow_sobol", 10)),
+        screen_chunk=int(k.get("screen_chunk", 128)),
         inner_pow_sobol=int(k.get("inner_pow_sobol", 8)),
         inner_n_restarts=int(k.get("inner_n_restarts", 1)),
         inner_sqp_max_iter=int(k.get("inner_sqp_max_iter", 20)),

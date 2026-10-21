@@ -20,7 +20,11 @@ import numpy as np
 from scipy.stats.qmc import Sobol
 
 from hydro_bo.opt.bayesopt import ConstrainedBayesopt, MeanVarBayesopt
-from hydro_bo.opt.solvers import ConstrainedMixedIntNLP, MixedIntNLP
+from hydro_bo.opt.solvers import (
+    ConstrainedMixedIntNLP,
+    MemoizedMixedIntNLP,
+    MixedIntNLP,
+)
 from hydro_bo.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -125,7 +129,16 @@ class KnowledgeGradientBayesopt(MeanVarBayesopt):
     `MeanVarBayesopt`, not `ConstrainedBayesopt`.
     """
 
-    def __init__(self, *args, d_theta: int, kg_args: dict, **kwargs):
+    # KG's solver (MemoizedMixedIntNLP) and acquisition jits are stable and
+    # reused across iterations, so the per-iteration cache wipe must be OFF —
+    # otherwise the expensive polish compile would be thrown away every iter.
+    _clear_caches_each_iter = False
+
+    def __init__(self, *args, d_theta: int, kg_args: dict, screen_chunk=None, **kwargs):
+        # `screen_chunk` bounds the Sobol-screen batch width in the outer solver
+        # (KG per-candidate cost is heavy, so a full-width screen OOMs). Popped
+        # here so it doesn't reach the base BO constructor.
+        self.screen_chunk = int(screen_chunk) if screen_chunk else None
         super().__init__(*args, **kwargs)
         self.d_theta = int(d_theta)
         if self.d_theta <= 0:
@@ -160,10 +173,11 @@ class KnowledgeGradientBayesopt(MeanVarBayesopt):
         an exact Hessian would have to be formed through the nested inner
         solves, which is the cost the limited-memory update avoids.
         """
-        return MixedIntNLP(
+        return MemoizedMixedIntNLP(
             cat_vars=self.cat_vars,
             seed=seed,
             pow_sobol=self.pow_sobol,
             n_restarts=self.n_restarts,
             sqp_config=self.sqp_config,
+            screen_chunk=self.screen_chunk,
         )

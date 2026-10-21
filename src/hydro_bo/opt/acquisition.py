@@ -29,56 +29,52 @@ from hydro_bo.opt.solvers import (
 # --------------------------------------------------------------------- #
 
 
-def _build_mu(gp_mu_state, scaling, round_info, mu_kernel_kind):
-    """Returns a jitted callable mu(X) -> (mean, var) in objective units.
+def _kg_mu(X, gp_mu_state, scaling, round_info, mu_kernel_kind):
+    """mu(X) -> (mean, var) in objective units.
 
-    Not jitted itself: a jitted function cannot return a Python callable.
+    Pure: the GP state rides in as an ARGUMENT rather than being captured in
+    a per-iteration closure, so this composes into a single top-level jit
+    (`_kg_callables`) that is reused across BO iterations instead of the
+    surrogate being re-jitted every time the acquisition is rebuilt.
     """
-    mu_y, sigma_y, _, _, _ = scaling
-
-    def mu_and_var(X):
-        mu_s, var_mu_s = _predict(
-            gp_mu_state["params"], gp_mu_state["X"], gp_mu_state["L"],
-            gp_mu_state["alpha"], gp_mu_state["mean"], gp_mu_state["mask"],
-            X, round_info, mu_kernel_kind,
-        )
-        return mu_s * sigma_y + mu_y, var_mu_s * sigma_y**2
-
-    return jax.jit(mu_and_var)
+    mu_y, sigma_y = scaling[0], scaling[1]
+    mu_s, var_mu_s = _predict(
+        gp_mu_state["params"], gp_mu_state["X"], gp_mu_state["L"],
+        gp_mu_state["alpha"], gp_mu_state["mean"], gp_mu_state["mask"],
+        X, round_info, mu_kernel_kind,
+    )
+    return mu_s * sigma_y + mu_y, var_mu_s * sigma_y**2
 
 
-def _build_beta(gp_mu_state, gp_log_var_state, scaling, round_info,
-                lv_kernel_kind, mu_kernel_kind):
-    """Returns a jitted callable beta(X_prime, x_cand, var_cand) -> (n,).
+def _kg_beta(X_prime, x_cand, var_cand, gp_mu_state, gp_log_var_state,
+             scaling, round_info, lv_kernel_kind, mu_kernel_kind):
+    """beta(X_prime, x_cand, var_cand) -> (n,), GP state threaded as args.
 
         beta = k_n((x',theta'), (x,theta)) / sqrt(sigma_f^2 + sigma_eps^2)
 
-    Numerator is the *posterior* covariance between the prime points and
-    the candidate; both denominator terms are evaluated at the CANDIDATE,
-    which is where the hypothetical observation is taken. The
-    heteroscedastic sigma_eps^2 comes from the log-variance GP.
+    Numerator is the *posterior* covariance between the prime points and the
+    candidate; both denominator terms are evaluated at the CANDIDATE, where
+    the hypothetical observation is taken. The heteroscedastic sigma_eps^2
+    comes from the log-variance GP. Pure, for the same reuse reason as
+    `_kg_mu`.
     """
     _, sigma_y, mu_lv, sigma_lv, _ = scaling
+    lv_s, var_lv_s = _predict(
+        gp_log_var_state["params"], gp_log_var_state["X"],
+        gp_log_var_state["L"], gp_log_var_state["alpha"],
+        gp_log_var_state["mean"], gp_log_var_state["mask"],
+        x_cand[None, :], round_info, lv_kernel_kind,
+    )
+    m_lv = lv_s[0] * sigma_lv + mu_lv
+    v_lv = var_lv_s[0] * sigma_lv**2
+    noise = jnp.exp(m_lv + 0.5 * v_lv)          # E[exp(log var)]
 
-    def beta(X_prime, x_cand, var_cand):
-        lv_s, var_lv_s = _predict(
-            gp_log_var_state["params"], gp_log_var_state["X"],
-            gp_log_var_state["L"], gp_log_var_state["alpha"],
-            gp_log_var_state["mean"], gp_log_var_state["mask"],
-            x_cand[None, :], round_info, lv_kernel_kind,
-        )
-        m_lv = lv_s[0] * sigma_lv + mu_lv
-        v_lv = var_lv_s[0] * sigma_lv**2
-        noise = jnp.exp(m_lv + 0.5 * v_lv)          # E[exp(log var)]
+    cov = _predict_covariance(
+        gp_mu_state["params"], gp_mu_state["X"], gp_mu_state["L"],
+        gp_mu_state["mask"], X_prime, x_cand, round_info, mu_kernel_kind,
+    ) * sigma_y**2
 
-        cov = _predict_covariance(
-            gp_mu_state["params"], gp_mu_state["X"], gp_mu_state["L"],
-            gp_mu_state["mask"], X_prime, x_cand, round_info, mu_kernel_kind,
-        ) * sigma_y**2
-
-        return cov / jnp.sqrt(jnp.clip(var_cand + noise, 1e-12, None))
-
-    return jax.jit(beta)
+    return cov / jnp.sqrt(jnp.clip(var_cand + noise, 1e-12, None))
 
 
 def _kg_prime_points(x_new, quad_points):
@@ -598,6 +594,109 @@ def _outer_integral_index(x_cand, inner_obj, z_nodes, z_weights, x_prime_set):
     return jnp.sum(z_weights * vals)
 
 
+# Process-level cache of compiled KG callables. A KG run rebuilds the
+# acquisition every BO iteration; without this each rebuild re-jits the whole
+# surrogate+inner-solve program. Keying on the run-constant structure (only the
+# GP state changes iteration-to-iteration, and it is now threaded as an
+# argument, not closed over) lets every rebuild reuse ONE compiled program.
+# One KG run per process, so the closed-over constant arrays (theta grid, Sobol
+# clouds, z nodes) are identical for the cache's whole lifetime.
+_KG_FN_CACHE: dict = {}
+
+
+def _sqp_key(cfg):
+    """Hashable digest of an (unhashable, mutable) SQPConfig for cache keys."""
+    import dataclasses
+    return dataclasses.astuple(cfg) if dataclasses.is_dataclass(cfg) else (id(cfg),)
+
+
+def _kg_callables(key, consts):
+    """Return (value, batch) jitted callables of signature
+    `f(x_cand, gp_mu_state, gp_log_var_state, scaling)`, closing over the
+    run-constant `consts`. Memoised on `key` so repeated acquisition builds
+    within a run reuse one compiled program (see `_KG_FN_CACHE`)."""
+    cached = _KG_FN_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    theta_vals = consts["theta_vals"]
+    quad_weights = consts["quad_weights"]
+    z_nodes = consts["z_nodes"]
+    z_weights = consts["z_weights"]
+    cloud = consts["cloud"]
+    lb = consts["lb"]
+    ub = consts["ub"]
+    combos = consts["combos"]
+    cat_idx = consts["cat_idx"]
+    x_prime_set = consts["x_prime_set"]
+    round_info = consts["round_info"]
+    mu_kernel_kind = consts["mu_kernel_kind"]
+    lv_kernel_kind = consts["lv_kernel_kind"]
+    mode = consts["mode"]
+    sqp_config = consts["sqp_config"]
+    inner_n_restarts = consts["inner_n_restarts"]
+
+    def _make_value(inner_mode):
+        """KG value whose inner `max_x' E_theta'[mu_{n+1}]` uses `inner_mode`:
+
+          "index_set" — CHEAP: max over the fixed `x_prime_set` design cloud.
+                        A_i, B_i are z-independent, computed once; each z-node is
+                        then just `max_i(A_i + z B_i)`. No inner SQP.
+          "strict"    — a real inner MIP+SQP argmax per z-node (via mip_solve).
+
+        The screen ranks 1000s of outer candidates, so it uses the index_set
+        inner (SQP-free); the polish runs the configured mode at only the
+        ~n_restarts starts. This is the whole point — never screen over SQP
+        inners.
+        """
+        def value(x_cand, gp_mu_state, gp_log_var_state, scaling):
+            mu = lambda X: _kg_mu(X, gp_mu_state, scaling, round_info, mu_kernel_kind)
+            beta = lambda Xp, xc, vc: _kg_beta(
+                Xp, xc, vc, gp_mu_state, gp_log_var_state, scaling,
+                round_info, lv_kernel_kind, mu_kernel_kind,
+            )
+            _, var_c = mu(x_cand[None, :])
+            var_cand = var_c[0]
+
+            if inner_mode == "index_set":
+                A, B = _kg_ab(x_prime_set, x_cand, var_cand, mu, beta,
+                              theta_vals, quad_weights)
+                vals = jax.vmap(lambda z: _kg_index_value(A, B, z))(z_nodes)
+                return jnp.sum(z_weights * vals)
+
+            def solve_inner(z):
+                def neg(x_full):
+                    return -_theta_integral(
+                        x_full, x_cand, var_cand, mu, beta, z,
+                        theta_vals, quad_weights,
+                    )
+                x_best, _ = mip_solve(
+                    neg, cloud, combos, cat_idx, lb, ub, sqp_config,
+                    n_restarts=inner_n_restarts,
+                )
+                return x_best
+
+            x_stars = jax.vmap(solve_inner)(z_nodes)
+            x_stars = jax.lax.stop_gradient(x_stars)
+            vals = jax.vmap(
+                lambda xs, z: _theta_integral(
+                    xs, x_cand, var_cand, mu, beta, z, theta_vals, quad_weights,
+                )
+            )(x_stars, z_nodes)
+            return jnp.sum(z_weights * vals)
+        return value
+
+    # Single-point value (polish / `evaluate`) honours the configured mode;
+    # the batched screen is ALWAYS the SQP-free index_set inner.
+    value_polish = _make_value(mode)
+    value_screen = _make_value("index_set")
+
+    value_jit = jax.jit(value_polish)
+    batch_jit = jax.jit(jax.vmap(value_screen, in_axes=(0, None, None, None)))
+    _KG_FN_CACHE[key] = (value_jit, batch_jit)
+    return value_jit, batch_jit
+
+
 class KnowledgeGradient(AcquisitionFunction):
     """Parametric knowledge gradient over the joint space [x | theta].
 
@@ -648,7 +747,7 @@ class KnowledgeGradient(AcquisitionFunction):
         self.d_theta = int(d_theta)
         self.d_design = self.d_total - self.d_theta
 
-        # Scaling tuple consumed by _build_mu / _build_beta. lam is carried
+        # Scaling tuple consumed by _kg_mu / _kg_beta. lam is carried
         # for signature compatibility only; KG does not use it.
         self.scaling = (
             jnp.asarray(dataset._mu_y, dtype=jnp.float64),
@@ -660,21 +759,18 @@ class KnowledgeGradient(AcquisitionFunction):
 
         self.gp_mu_state = gp_mu.state()
         self.gp_log_var_state = gp_log_var.state()
-        self.state_args = (self.gp_mu_state,)
+        # `state_args` is populated below, after the run-constant pieces exist.
         # `BaseBayesopt._suggest_next` logs the EI incumbent. KG has no
         # incumbent (it scores information, not improvement over a best),
         # so expose NaN rather than fork the shared BO loop.
         self._g_best = jnp.asarray(jnp.nan, dtype=jnp.float64)
 
-        self.mu = _build_mu(
-            self.gp_mu_state, self.scaling, self.round_info, self.mu_kernel_kind,
-        )
-        self.beta = _build_beta(
-            self.gp_mu_state, self.gp_log_var_state, self.scaling,
-            self.round_info, self.lv_kernel_kind, self.mu_kernel_kind,
-        )
+        # `_inner_obj` now holds ONLY the theta' quadrature (mu/beta are
+        # threaded through the jitted value fn as GP-state args, not baked into
+        # this object). Kept for `_theta_vals` / `_quad_weights` and the shape
+        # that parametric.py logs.
         self._inner_obj = KnowledgeGradientInner(
-            self.mu, self.beta, self.round_info, self.quad_per_dim, self.d_theta,
+            None, None, self.round_info, self.quad_per_dim, self.d_theta,
         )
 
         # Integer dims belong to the design block only.
@@ -693,53 +789,71 @@ class KnowledgeGradient(AcquisitionFunction):
         self._x_prime_set = sobol_cloud(
             self.d_design, self.index_set_pow, self.seed + 1,
         )
-        self._value = jax.jit(self._kg_value)
-        self._batch = jax.jit(jax.vmap(self._kg_value))
 
-    # ---- inner solve ----
+        # Per-iteration varying state, threaded as trailing args of the jitted
+        # callables (mirrors ExpectedImprovement.state_args). Everything else is
+        # run-constant and closed over inside `_kg_callables`.
+        self.state_args = (self.gp_mu_state, self.gp_log_var_state, self.scaling)
 
-    def _solve_inner(self, x_cand, var_cand, z):
-        """argmax_x' E_theta'[mu_{n+1}] for one Hermite node."""
-        def neg(x_full):
-            return -self._inner_obj.value(x_full, x_cand, var_cand, z)
-
-        x_best, _ = mip_solve(
-            neg, self._cloud, self.combos, self.cat_idx,
-            self._lb, self._ub,
-            self.sqp_config_inner or DEFAULT_SQP_CONFIG,
-            n_restarts=self.inner_n_restarts,
+        sqp_config = self.sqp_config_inner or DEFAULT_SQP_CONFIG
+        consts = {
+            "theta_vals": self._inner_obj._theta_vals,
+            "quad_weights": self._inner_obj._quad_weights,
+            "z_nodes": self._z_nodes,
+            "z_weights": self._z_weights,
+            "cloud": self._cloud,
+            "lb": self._lb,
+            "ub": self._ub,
+            "combos": self.combos,
+            "cat_idx": self.cat_idx,
+            "x_prime_set": self._x_prime_set,
+            "round_info": self.round_info,
+            "mu_kernel_kind": self.mu_kernel_kind,
+            "lv_kernel_kind": self.lv_kernel_kind,
+            "mode": self.mode,
+            "sqp_config": sqp_config,
+            "inner_n_restarts": self.inner_n_restarts,
+        }
+        # Structural key: identifies the compiled program's constants. Only the
+        # GP state varies iteration-to-iteration and it is an ARGUMENT, so the
+        # same key (hence the same compiled callables) recurs every iteration.
+        key = (
+            self.round_info, self.mu_kernel_kind, self.lv_kernel_kind, self.mode,
+            self.cat_idx, int(self.inner_n_restarts),
+            tuple(self.combos.shape), tuple(self._cloud.shape),
+            tuple(self._z_nodes.shape), tuple(self._x_prime_set.shape),
+            tuple(self._inner_obj._theta_vals.shape), int(self.d_red),
+            _sqp_key(sqp_config),
         )
-        return x_best
-
-    def _kg_value(self, x_cand):
-        if self.mode == "index_set":
-            return _outer_integral_index(
-                x_cand, self._inner_obj, self._z_nodes, self._z_weights,
-                self._x_prime_set,
-            )
-        return _outer_integral(
-            x_cand, self._inner_obj, self._z_nodes, self._z_weights,
-            self._solve_inner,
-        )
+        # `_value`: single-point, configured-mode inner (strict) — used by the
+        # outer SQP polish (`neg_acq_fn`) and `evaluate`. `_batch`: the batched
+        # screen, always the SQP-free index_set inner — used by `acq_batch_fn`.
+        self._value, self._batch = _kg_callables(key, consts)
 
     # ---- AcquisitionFunction contract ----
 
     def evaluate(self, x_theta_new):
-        return self._value(jnp.asarray(x_theta_new, dtype=jnp.float64).ravel())
+        return self._value(
+            jnp.asarray(x_theta_new, dtype=jnp.float64).ravel(), *self.state_args
+        )
 
     def neg_acq_fn(self):
+        # Fresh wrapper is fine: it just forwards to the memoised, stable
+        # `_value` (same object every iteration) with GP state passed as args,
+        # so it is behaviourally identical each iteration. The memoised solver
+        # captures one of these once and reuses it.
         value = self._value
 
-        def neg(x, *_state):
-            return -value(x).reshape(())
+        def neg(x, gp_mu_state, gp_log_var_state, scaling):
+            return -value(x, gp_mu_state, gp_log_var_state, scaling).reshape(())
 
         return neg
 
     def acq_batch_fn(self):
         batch = self._batch
 
-        def f(x_batch, *_state):
-            return batch(x_batch)
+        def f(x_batch, gp_mu_state, gp_log_var_state, scaling):
+            return batch(x_batch, gp_mu_state, gp_log_var_state, scaling)
 
         return f
 

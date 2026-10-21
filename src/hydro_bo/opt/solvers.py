@@ -91,11 +91,18 @@ class NLPBase:
         pow_sobol: int = 14,
         n_restarts: int = 5,
         sqp_config: Optional[SQPConfig] = None,
+        screen_chunk: Optional[int] = None,
     ):
         self.seed = int(seed)
         self.pow_sobol = int(pow_sobol)
         self.n_restarts = int(n_restarts)
         self.sqp_config = sqp_config or DEFAULT_SQP_CONFIG
+        # Evaluate the Sobol screen in chunks of this many candidates so peak
+        # memory (both the compiled batch graph and its run) is bounded
+        # regardless of `2**pow_sobol`. None => one shot (fine for cheap EI;
+        # KG sets it because each candidate eval is heavy — inner MIP solves
+        # over theta x z — so a full-width batch OOMs).
+        self.screen_chunk = int(screen_chunk) if screen_chunk else None
 
     def maximise(self, acq: 'AcquisitionFunction') -> tuple[np.ndarray, float]:
         import time as _time
@@ -106,13 +113,31 @@ class NLPBase:
         combos_np = np.asarray(combos, dtype=float).reshape(len(combos), len(cat_idx))
         C, R = combos_np.shape[0], self.n_restarts
 
+        # Stage logging: the screen and the SQP polish can each take minutes
+        # (compile + run), and previously nothing was logged between
+        # `kg_acquisition_built` and the final `acq_optimise_timing`, so a long
+        # acquisition looked like a hang. These bracket each stage so you can
+        # see which one you're in and how long it took.
+        n_cand = C * (2 ** self.pow_sobol)
+        logger.info(
+            "acq_screen_start", solver=type(self).__name__,
+            n_candidates=n_cand, n_combos=C, sobol_pow=self.pow_sobol,
+            screen_chunk=self.screen_chunk,
+        )
         t_screen = _time.perf_counter()
         starts, screen_scores = self._screen(acq, D_red, cat_idx, combos_np)
         screen_seconds = _time.perf_counter() - t_screen
+        logger.info(
+            "acq_screen_done", screen_seconds=round(float(screen_seconds), 1),
+        )
 
+        logger.info("acq_solve_start", n_starts=C * R)
         t_sqp = _time.perf_counter()
         states = self._solve(acq, cat_idx, starts, combos_np, D_red)
         sqp_seconds = _time.perf_counter() - t_sqp
+        logger.info(
+            "acq_solve_done", sqp_seconds=round(float(sqp_seconds), 1),
+        )
 
         conv = np.asarray(states.converged).reshape(C, R)
         f_val = np.asarray(states.f_val).reshape(C, R)
@@ -171,12 +196,24 @@ class NLPBase:
         cand_j = jnp.asarray(candidates, dtype=jnp.float64)
         batch_fn = acq.acq_batch_fn()
         state = acq.state_args
+        chunk = self.screen_chunk
 
         starts, scores = [], []
         for combo in combos_np:
             ints = jnp.asarray(combo, dtype=jnp.float64)
             x_full = _insert(cand_j, ints, cat_idx)
-            raw = np.asarray(_pmap_batch_eval(batch_fn, x_full, *state))
+            if chunk and int(x_full.shape[0]) > chunk:
+                # Bounded-memory screen: evaluate in fixed-size slices and
+                # stitch. batch_fn compiles once for the `chunk` shape and is
+                # reused for every full slice (a smaller trailing slice adds at
+                # most one extra compile).
+                parts = [
+                    np.asarray(_pmap_batch_eval(batch_fn, x_full[i:i + chunk], *state))
+                    for i in range(0, int(x_full.shape[0]), chunk)
+                ]
+                raw = np.concatenate(parts)
+            else:
+                raw = np.asarray(_pmap_batch_eval(batch_fn, x_full, *state))
             adj = self._rescore(acq, raw, x_full)
             top = np.argsort(adj)[-self.n_restarts :]
             starts.append(candidates[top])
@@ -217,9 +254,11 @@ class MixedIntNLP(NLPBase):
         pow_sobol: int = 14,
         n_restarts: int = 5,
         sqp_config: Optional[SQPConfig] = None,
+        screen_chunk: Optional[int] = None,
     ):
         super().__init__(
-            seed=seed, pow_sobol=pow_sobol, n_restarts=n_restarts, sqp_config=sqp_config
+            seed=seed, pow_sobol=pow_sobol, n_restarts=n_restarts,
+            sqp_config=sqp_config, screen_chunk=screen_chunk,
         )
         self.cat_vars = [(int(i), [float(v) for v in vals]) for i, vals in cat_vars]
 
@@ -230,6 +269,104 @@ class MixedIntNLP(NLPBase):
         order = sorted(range(len(idxs)), key=lambda i: idxs[i])
         cat = tuple(int(idxs[i]) for i in order)
         return cat, list(product(*[list(vals[i]) for i in order]))
+
+
+# Module-level caches of compiled screen/solve callables for MemoizedMixedIntNLP.
+# Keyed on the STABLE acquisition callable identity + structure, so every BO
+# iteration reuses ONE compiled program (GP state is passed as an argument).
+_MEMO_SOLVE_CACHE: dict = {}
+
+
+def _sqp_digest(cfg):
+    import dataclasses
+    return dataclasses.astuple(cfg) if dataclasses.is_dataclass(cfg) else (id(cfg),)
+
+
+class MemoizedMixedIntNLP(MixedIntNLP):
+    """MixedIntNLP whose screen and polish-solve jits are compiled ONCE and
+    reused across BO iterations, instead of a fresh `jax.jit(closure)` per
+    iteration.
+
+    This is the "compile at the top level, pass state to the reused program"
+    pattern (as EI/surrogate already do for their module-level jits), applied to
+    the outer SQP solve — where, for KG, that compile is minutes and dominates.
+
+    Two preconditions, both satisfied by the KG path:
+      * the acquisition returns STABLE `neg`/`batch` callables (see
+        `KnowledgeGradient.neg_acq_fn` / `acq_batch_fn`), so the cache key
+        (their `id`) is constant across iterations;
+      * the BO loop does NOT call `jax.clear_caches()` each iteration
+        (`KnowledgeGradientBayesopt._clear_caches_each_iter = False`), which
+        would otherwise wipe the reused compile.
+
+    Unconstrained only (KG). GP state rides in as the `state` argument.
+    """
+
+    def _screen(self, acq, D_red, cat_idx, combos_np):
+        # The acquisition's `batch` is itself a stable jitted vmap; call it
+        # directly (no fresh per-iteration pmap) so it compiles once per chunk
+        # shape and is reused every iteration.
+        sampler = Sobol(d=D_red, scramble=True, seed=self.seed)
+        candidates = sampler.random(2 ** self.pow_sobol)
+        cand_j = jnp.asarray(candidates, dtype=jnp.float64)
+        batch_fn = acq.acq_batch_fn()
+        state = acq.state_args
+        chunk = self.screen_chunk
+
+        starts, scores = [], []
+        for combo in combos_np:
+            ints = jnp.asarray(combo, dtype=jnp.float64)
+            x_full = _insert(cand_j, ints, cat_idx)
+            if chunk and int(x_full.shape[0]) > chunk:
+                parts = [
+                    np.asarray(batch_fn(x_full[i:i + chunk], *state))
+                    for i in range(0, int(x_full.shape[0]), chunk)
+                ]
+                raw = np.concatenate(parts)
+            else:
+                raw = np.asarray(batch_fn(x_full, *state))
+            adj = self._rescore(acq, raw, x_full)
+            top = np.argsort(adj)[-self.n_restarts :]
+            starts.append(candidates[top])
+            scores.append(adj[top])
+        return np.stack(starts), np.stack(scores)
+
+    def _solve(self, acq, cat_idx, starts, combos_np, D_red):
+        state = acq.state_args
+        cfg = self.sqp_config
+        C = int(combos_np.shape[0])
+
+        # Key on the CONSTANT structure only. `cfg` never changes (closed over,
+        # so it needn't be hashable) and `neg` is behaviourally identical every
+        # iteration (forwards to the stable memoised value with state as args),
+        # so the solve is built ONCE on the first miss and reused thereafter.
+        key = (_sqp_digest(cfg), tuple(cat_idx), int(D_red), C, int(self.n_restarts))
+        solve_jit = _MEMO_SOLVE_CACHE.get(key)
+        if solve_jit is None:
+            if self._constraint(acq, cat_idx) is not None:
+                raise NotImplementedError(
+                    "MemoizedMixedIntNLP is for unconstrained (KG) solves only."
+                )
+            neg = acq.neg_acq_fn()        # captured once; forwards to stable value
+            lb = jnp.zeros(D_red, dtype=jnp.float64)
+            ub = jnp.ones(D_red, dtype=jnp.float64)
+
+            def per_combo_fn(starts_j, combos_j, state):
+                def solve_cell(x0, ints):
+                    neg_obj = lambda xc: neg(
+                        _insert(xc, ints, cat_idx), *state
+                    ).reshape(())
+                    return run_sqp(neg_obj, x0, lb, ub, cfg)
+                per_restart = jax.vmap(solve_cell, in_axes=(0, None))
+                per_combo = jax.vmap(per_restart, in_axes=(0, 0))
+                return per_combo(starts_j, combos_j)
+
+            solve_jit = jax.jit(per_combo_fn)
+            _MEMO_SOLVE_CACHE[key] = solve_jit
+
+        starts_j = jnp.asarray(starts, dtype=jnp.float64)
+        combos_j = jnp.asarray(combos_np, dtype=jnp.float64)
+        return solve_jit(starts_j, combos_j, state)
 
 
 class ConstrainedMixedIntNLP(MixedIntNLP):
@@ -246,6 +383,7 @@ class ConstrainedMixedIntNLP(MixedIntNLP):
         pow_sobol: int = 14,
         n_restarts: int = 5,
         sqp_config: Optional[SQPConfig] = None,
+        screen_chunk: Optional[int] = None,
     ):
         super().__init__(
             cat_vars=cat_vars,
@@ -253,6 +391,7 @@ class ConstrainedMixedIntNLP(MixedIntNLP):
             pow_sobol=pow_sobol,
             n_restarts=n_restarts,
             sqp_config=sqp_config,
+            screen_chunk=screen_chunk,
         )
         self.l1_penalty = float(l1_penalty)
 

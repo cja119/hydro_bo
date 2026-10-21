@@ -52,6 +52,11 @@ class BaseBayesopt(ABC):
       dataset   : last built Dataset (None until first fit).
     """
 
+    # Default solver rebuilds a fresh jit'd closure each iteration, so the
+    # compile cache is wiped every iteration (see `_suggest_next`). Subclasses
+    # whose solver/acquisition jits are stable and reused (KG) set this False.
+    _clear_caches_each_iter: bool = True
+
     def __init__(
         self,
         f: Callable,
@@ -265,9 +270,13 @@ class BaseBayesopt(ABC):
         )
 
         del acq, solver
-        # The SQP factory rebuilds a fresh jit'd closure each iter, so
-        # the compile cache grows without bound. 
-        jax.clear_caches()
+        # The default SQP factory rebuilds a fresh jit'd closure each iter, so
+        # the compile cache grows without bound — hence this per-iteration wipe.
+        # Subclasses whose solver/acquisition jits are STABLE and reused (KG,
+        # via MemoizedMixedIntNLP + stable neg/batch) set this False so the
+        # reused, expensive compile is NOT thrown away every iteration.
+        if self._clear_caches_each_iter:
+            jax.clear_caches()
         gc.collect()
 
         return x_orig

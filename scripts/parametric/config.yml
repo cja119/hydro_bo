@@ -5,9 +5,10 @@
 # the GP is fit on the joint input, and each iteration optimises the
 # design at a Sobol-drawn theta node rather than maximising over theta.
 #
-# `planning_dir` points at the IDC planning solve so the reference model
-# is not regenerated — run `python scripts/idc/planning_model.py NH3`
-# once and both flavours share it.
+# `planning_dir` points at the shared planning solve under scripts/tmp so
+# the reference model is not regenerated — run
+# `python scripts/general/planning_model.py NH3` once and every flavour
+# (idc, parametric) reads the same <vector>-Chile.yml.
 
 general:
   vector:           NH3
@@ -28,7 +29,7 @@ general:
   dynamic_price:    false
   stdev_penalty:    0.5
   log_level:        DEBUG
-  planning_dir:     ../idc/tmp/planning   # shared with the IDC runs
+  planning_dir:     ../tmp/planning       # shared reference model, not per-flavour
 
 # BO design dims. Omit this block to search all 13 PARAM_KEYS (the IDC
 # space). Here we search the capacity design only: the MPC tuning knobs
@@ -67,6 +68,17 @@ kg:
   mode:                        strict
   theta_quad_per_dim:          5
   z_quad_points:               9
+  acq_pow_sobol:               10       # 2**10 = 1024 OUTER screen candidates.
+                                        # KG-specific: the screen evaluates all
+                                        # 2**this at once and each KG eval is heavy,
+                                        # so nlp.acq_pow_sobol=14 (16384) OOMs even
+                                        # at 128 GB. 1024 seeds the 4 restarts amply.
+  screen_chunk:                16       # evaluate the outer screen this many
+                                        # candidates at a time. STRICT-mode KG is
+                                        # ~1.5 GB/candidate (z x combos x inner_sobol
+                                        # x theta cross-cov materialised), so peak
+                                        # screen RAM ~= chunk * 1.5 GB. 16 -> ~24 GB.
+                                        # Raise for speed if RAM allows; 0 = one shot.
   inner_pow_sobol:             6        # 2**6 = 64
   inner_n_restarts:            1
   inner_sqp_max_iter:          20
@@ -84,12 +96,15 @@ sobol:
 
 nlp:
   acq_pow_sobol:        14
-  acq_n_restarts:       4
+  acq_n_restarts:       1        # was 4 — outer polish restarts per int-combo.
+                                 # KG cost is ~linear in this (each cell re-solves
+                                 # the full inner problem every outer step).
   pad_initial:          512
   gp_lbfgs_max_iter:    300
   n_devices:            16
   blas_threads:         1
-  sqp_max_iter:         20
+  sqp_max_iter:         10        # outer polish SQP steps (FIXED-length scan,
+                                  # no early exit) — ~10 to converge here.
   sqp_tol_stationarity: 1e-4
   sqp_tol_feasibility:  1e-4
   sqp_use_exact_hessian: false
