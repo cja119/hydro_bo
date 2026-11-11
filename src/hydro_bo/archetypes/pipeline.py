@@ -76,8 +76,8 @@ def evaluate_point(cfg: dict, problem: Problem, x: np.ndarray, ncpus: int, npz_d
     npv = np.array([r["npv"] for r in runs], dtype=float) / 1000.0
     valid = np.isfinite(npv)
     n_valid = int(valid.sum())
-    failed = n_valid < int(e["min_valid"])
-    samples = np.array([float(e["failure_npv_bn"])]) if failed else npv[valid]
+    failed = n_valid < int(e["min_valid"])                 # reporting only; the BO uses the feasibility GP
+    samples = npv   # full per-seed array (NaN for failed rollouts) — what the BO observes (feasibility k/N + valid-seed NPV GP)
     return {
         "problem": problem.key, "archetype": problem.archetype.__dict__, "vector": problem.vector,
         "trains": problem.trains, "train_size": problem.train_size,

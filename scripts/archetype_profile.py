@@ -77,7 +77,7 @@ def main():
     mem.start()
     t0 = time.time()
     deadline = t0 + args.minutes * 60
-    done, running, k = [], {}, 0
+    done, running, k = [], {}, 0        # running: Future -> (problem key, start time)
     with ProcessPoolExecutor(max_workers=ncpus, mp_context=get_context("spawn")) as pool:
         while True:
             while time.time() < deadline and len(running) < ncpus:

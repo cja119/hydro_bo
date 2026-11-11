@@ -12,9 +12,10 @@ from __future__ import annotations
 import logging
 import math
 import os
+import queue
+import signal
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
 from pathlib import Path
 
@@ -29,6 +30,51 @@ LOGISTICS_DATA = ROOT / "src" / "hydro_bo" / "data" / "logistics"
 TANK_CARGOES = 1.5          # buyer tank upper limit, in cargoes of the largest ship
 Z, SIGMA_T_DAYS, DAYS_PER_MONTH = 2.0, 0.66, 30.0   # buyer tank lower limit (arrival-time cover), as the contract studies
 LEGACY_PRICE = 5.0          # ContractEnv's fixed price, used only when price dynamics are off
+
+# Flat monthly delivery forecast: the reference-design stage-4 mean daily delivery, scaled by
+# the binding capacity ratio. Replaces the old 60%-of-nameplate value, which understated
+# reference delivery ~22% (the reference sits at ~77-78% of nameplate). The profile is flat on
+# purpose — the stage-4 monthly shape was weather-start noise, not seasonality.
+REF_MEAN_DELIVERY = {"NH3": 12624.0, "LH2": 2103.0}     # t carrier/day, reference-design stage-4 mean
+REF_RE_CAPACITY = {"NH3": 1825.49, "LH2": 2061.56}      # reference renewable_energy_capacity
+REF_EL_CAPACITY = {"NH3": 19855.02, "LH2": 19331.56}    # reference electrolyser_capacity
+
+
+class _RolloutTimeout(Exception):
+    """Raised by the SIGALRM handler when one rollout exceeds the wall cap."""
+
+
+def _raise_rollout_timeout(signum, frame):
+    raise _RolloutTimeout()
+
+
+_ROLLOUT_CAP_S = None
+HARD_CAP_GRACE_S = 300          # parent SIGKILLs a worker this long after its soft cap should have fired
+
+
+def rollout_cap_s() -> int:
+    """Per-rollout wall cap [s] from config_archetypes.yml (evaluation.rollout_cap_s); 0 disables.
+    The 300 s per-solve Gurobi TimeLimit does NOT bound a whole rollout (a pathological design has
+    many solves that each hit it -> hours). This caps the single-seed rollout so such a design
+    returns a failed result quickly instead, which the BO feasibility model then learns from."""
+    global _ROLLOUT_CAP_S
+    if _ROLLOUT_CAP_S is None:
+        try:
+            import yaml
+            cfg = yaml.safe_load(open(ROOT / "scripts" / "config_archetypes.yml"))
+            _ROLLOUT_CAP_S = int(float((cfg.get("evaluation") or {}).get("rollout_cap_s", 0)) or 0)
+        except Exception:
+            _ROLLOUT_CAP_S = 0
+    return _ROLLOUT_CAP_S
+
+
+def std_ship_arrival_time() -> float:
+    """Std [days] of each ship's daily arrival-time perturbation, from the STD_SHIP_ARRIVAL_TIME env
+    var (default 0.0 = deterministic arrivals). The archetype `contract_settings` has pinned this to 0
+    since commit 022b6a3, overriding the 0.25 default in data/variables.yml; the env var restores it
+    for an A/B run without editing code. Read from the environment (not the config file) so it is a
+    per-job value the PBS script sets and spawn workers inherit, independent of --config."""
+    return float(os.environ.get("STD_SHIP_ARRIVAL_TIME", 0.0) or 0.0)
 
 
 def _deep_set(target: dict, updates: dict) -> None:
@@ -58,11 +104,11 @@ def contract_settings(design: dict, problem: Problem, lp: dict) -> dict:
     return {
         "commitment": commitment,
         "half_spread": a.half_spread,
-        "reference_volume": a.depth_days * x1 / 30,
+        "reference_volume": a.q_ref_days * x1 / 30,
         "inventory_upper": TANK_CARGOES * large_cargo,
         "inventory_lower": Z * SIGMA_T_DAYS * commitment / DAYS_PER_MONTH,
         "expected_arrival_offset": 0,
-        "std_ship_arrival_time": 0,
+        "std_ship_arrival_time": std_ship_arrival_time(),
         "terminal_valuation": 3,
         "spot_daily_volume": (1 - f) * x1 / 30,
     }
@@ -94,6 +140,17 @@ def record_of(env, records: list) -> dict:
     return data
 
 
+def monthly_delivery_forecast(design: dict, problem: Problem) -> list[float]:
+    """Flat 12-month delivery forecast [t carrier/day]: the reference-design stage-4 mean daily
+    delivery scaled by the binding capacity ratio (renewables / electrolyser / conversion).
+    r_conv is problem.scale — conversion capacity after the train map."""
+    v = problem.vector
+    r_re = float(design["renewable_energy_capacity"]) / REF_RE_CAPACITY[v]
+    r_el = float(design["electrolyser_capacity"]) / REF_EL_CAPACITY[v]
+    r_conv = problem.scale
+    return [REF_MEAN_DELIVERY[v] * min(r_re, r_el, r_conv)] * 12
+
+
 def build_env(design: dict, problem: Problem, seed: int):
     """A built ContractEnv (site + logistics MPCs constructed, nothing run) for one design, archetype and seed."""
     from hydro_bo import ShippingEnv
@@ -109,9 +166,12 @@ def build_env(design: dict, problem: Problem, seed: int):
     with env as e:
         _deep_set(e, env_args["config"])
         e["seed"] = int(seed)
+        # Forecast padding: planning omits wind_forecast_mean on purpose, so the site MPC pads its
+        # wind forecast beyond the horizon with the data's climatological mean (not the fixed
+        # reference-design wind_forecast_mean) — a deliberate archetype change.
         e["mpc"]["planning_model"] = planning
         e["contract"]["logistics_settings"] = contract_settings(design, problem, lp)
-        e["contract"]["monthly_delivery"] = [problem.reference_delivery_t_per_day()] * 12
+        e["contract"]["monthly_delivery"] = monthly_delivery_forecast(design, problem)
         e["contract"]["price"] = LEGACY_PRICE
         e["contract"]["price_settings"] = {"premium": a.premium, "penalty": a.penalty}
     return env
@@ -122,7 +182,12 @@ def run_seed(design: dict, problem: Problem, seed: int, save_npz: str | None = N
     from hydro_bo.utils.logging_config import configure_logging
 
     t0 = time.perf_counter()
+    cap = rollout_cap_s()
+    prev_handler = None
     try:
+        if cap > 0:                       # SIGALRM works: run_seed runs in the worker's main thread
+            prev_handler = signal.signal(signal.SIGALRM, _raise_rollout_timeout)
+            signal.alarm(cap)
         configure_logging(level=logging.WARNING, log_file=os.devnull, tee_stderr=False, package_level=logging.WARNING)
         env = build_env(design, problem, seed)
         done = False
@@ -136,20 +201,86 @@ def run_seed(design: dict, problem: Problem, seed: int, save_npz: str | None = N
         m = rollout_metrics(d, costs)
         m.update({"seed": int(seed), "wall_s": time.perf_counter() - t0, "error": None})
         return m
+    except _RolloutTimeout:  # exceeded the per-rollout wall cap -> a failed seed (NaN) for the BO
+        return {"seed": int(seed), "npv": math.nan, "wall_s": time.perf_counter() - t0,
+                "error": f"rollout_cap_{cap}s"}
     except Exception as exc:  # a failed solve or a bad design: reported, never raised into the pool
         return {"seed": int(seed), "npv": math.nan, "wall_s": time.perf_counter() - t0,
                 "error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc(limit=8)}
+    finally:
+        if prev_handler is not None:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, prev_handler)
 
 
-def _run_seed_star(args):
-    return run_seed(*args)
+def _seed_worker(result_q, seed: int, args) -> None:
+    """Child entry point: run one seed, put (seed, result) on the queue. Runs in the child's main
+    thread, so run_seed's SIGALRM soft cap still works. A child-side crash is reported, never left
+    to hang the parent (which would otherwise block on the queue forever)."""
+    try:
+        result_q.put((seed, run_seed(*args)))
+    except BaseException as exc:
+        result_q.put((seed, {"seed": int(seed), "npv": math.nan, "wall_s": 0.0,
+                             "error": f"worker_crash: {type(exc).__name__}: {exc}"}))
 
 
 def evaluate(design: dict, problem: Problem, seeds, ncpus: int, save_dir: str | None = None) -> list[dict]:
-    """Run `seeds` of one design on `ncpus` processes; results in seed order."""
+    """Run `seeds` of one design on up to `ncpus` worker processes; results in seed order.
+
+    One `spawn` process per seed (single-threaded Gurobi each). `spawn`, not `fork`:
+    gurobipy is not fork-safe. The conda gurobipy loads because `env.sh` resets
+    PYTHONPATH (dropping the Gurobi module's 3.11 gurobipy), which the workers inherit.
+
+    Two-level wall cap. run_seed's in-process SIGALRM (`rollout_cap_s`) handles a rollout stuck
+    between solves. But SIGALRM can't break a single Gurobi optimize() stuck in C past its
+    TimeLimit, and one such seed would block the whole point (the result needs every seed) and
+    burn the job's walltime. So the parent here hard-SIGKILLs any worker still alive
+    HARD_CAP_GRACE_S after its soft cap: that seed becomes a failed (NaN) rollout and the rest of
+    the point completes normally. A dynamic scheduler keeps all `ncpus` busy as seeds finish.
+    """
     seeds = [int(s) for s in seeds]
-    jobs = [(design, problem, s, None if save_dir is None else str(Path(save_dir) / f"seed_{s}.npz")) for s in seeds]
+    job = {s: (design, problem, s, None if save_dir is None else str(Path(save_dir) / f"seed_{s}.npz")) for s in seeds}
     if ncpus <= 1:
-        return [run_seed(*j) for j in jobs]
-    with ProcessPoolExecutor(max_workers=min(ncpus, len(jobs)), mp_context=get_context("spawn")) as pool:
-        return list(pool.map(_run_seed_star, jobs))
+        return [run_seed(*job[s]) for s in seeds]
+
+    soft = rollout_cap_s()
+    hard = soft + HARD_CAP_GRACE_S if soft > 0 else 0       # 0 -> no hard cap (relies on the children finishing)
+    ctx = get_context("spawn")
+    results: dict[int, dict] = {}
+    running: dict[int, tuple] = {}                          # seed -> (process, monotonic start)
+    todo = list(seeds)
+
+    # A Manager queue (not a bare ctx.Queue): it lives in its own process, so SIGKILLing a stuck
+    # worker cannot corrupt it — a plain Queue can be left broken if a process is killed mid-use.
+    with ctx.Manager() as manager:
+        result_q = manager.Queue()
+
+        def launch(s: int) -> None:
+            p = ctx.Process(target=_seed_worker, args=(result_q, s, job[s]))
+            p.start()
+            running[s] = (p, time.monotonic())
+
+        for _ in range(min(ncpus, len(todo))):
+            launch(todo.pop(0))
+        while running:
+            try:
+                s, res = result_q.get(timeout=5.0)
+                if s in running:                           # ignore a late put from an already-killed child
+                    running.pop(s)[0].join()
+                    results[s] = res
+                    if todo:
+                        launch(todo.pop(0))
+            except queue.Empty:
+                pass
+            if hard:                                       # SIGKILL any rollout past the hard wall
+                now = time.monotonic()
+                for s, (p, t0) in list(running.items()):
+                    if now - t0 > hard:
+                        p.kill()
+                        p.join()
+                        running.pop(s, None)
+                        results[s] = {"seed": s, "npv": math.nan, "wall_s": now - t0,
+                                      "error": f"rollout_hardcap_{hard}s"}
+                        if todo:
+                            launch(todo.pop(0))
+    return [results[s] for s in seeds]

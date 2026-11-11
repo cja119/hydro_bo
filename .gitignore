@@ -19,3 +19,8 @@ test*.py
 **/*.log
 **/*.csv
 paper_results/contract/*
+*.e*
+*.o*
+*.txt
+scripts/pbs/*
+**/*.pbs

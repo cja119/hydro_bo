@@ -8,10 +8,12 @@ vectors: [NH3, LH2]
 problem_archetypes: [low, medium, high]
 
 # Overrides of the default archetypes (scenarios.default_archetypes); any field may be set here.
+# target_mw sets the hub conversion scale per archetype (the market-SIZE channel); premium/half_spread/
+# q_ref_days are the market price/liquidity channels. So archetypes vary scale AND market together.
 archetypes:
-  low:    {target_mw: 500.0,  premium: 7.0, half_spread: 0.2,   depth_days: 0.25, penalty: 9.0}
-  medium: {target_mw: 1000.0, premium: 5.0, half_spread: 0.05,  depth_days: 1.0,  penalty: 9.0}
-  high:   {target_mw: 2000.0, premium: 3.0, half_spread: 0.002, depth_days: 4.0,  penalty: 9.0}
+  low:    {target_mw: 500.0,  premium: 7.0, half_spread: 0.2,   q_ref_days: 0.25, penalty: 9.0}
+  medium: {target_mw: 1000.0, premium: 5.0, half_spread: 0.05,  q_ref_days: 1.0,  penalty: 9.0}
+  high:   {target_mw: 2000.0, premium: 3.0, half_spread: 0.002, q_ref_days: 4.0,  penalty: 9.0}
 
 # Reference designs (capacities scaled by conversion throughput to centre the search bounds).
 reference_designs:
@@ -26,12 +28,14 @@ min_port_cargoes: 1.2          # port storage lower bound, in small-ship cargoes
 evaluation:
   n_seeds: 32                  # rollouts per design (common random numbers: seeds seed_offset .. seed_offset+n-1)
   seed_offset: 1000            # keeps BO seeds apart from the 0-4 seeds of the earlier studies
-  min_valid: 24                # fewer valid rollouts than this -> the point is a failure
-  failure_npv_bn: -30.0        # NPV sample [USD bn] fed to the BO for a failed point
+  min_valid: 24                # reporting only: fewer valid rollouts than this -> the point is flagged failed
+  failure_npv_bn: -30.0        # legacy; unused (samples_bn is now the full per-seed array, NaN for failed)
+  rollout_cap_s: 4500          # per-rollout wall cap [s] (75 min): spares legit ~50-60 min rollouts, kills the >hr
+                               # pathologies; 2 waves x 75 min = 2.5 h < the 3 h Sobol job walltime, so every point writes
   save_npz: false              # keep per-rollout records (about 1.4 MB each)
 
 sobol:
-  n_per_problem: 64            # Sobol points per problem (array tasks = n_per_problem x number of problems)
+  n_per_problem: 128           # Sobol points per problem (2^7, the balanced net for the 7-D search; prefix-stable, so rows 0-63 are reused)
   seed: 2026
   out_dir: scripts/tmp/archetype_sobol
 
@@ -39,4 +43,8 @@ bo:
   iter_budget: 100
   out_dir: scripts/tmp/archetype_bo
   walltime_buffer_s: 2400      # stop starting new iterations this long before the job's walltime
+  # Feasibility (ConstrainedBayesopt): BinomialGP on (valid seeds / n_seeds); chance bound P(seed valid) > p_targ.
+  p_targ: 0.9                  # feasibility probability target
+  z_sc: 1.6449                 # Phi^-1(0.95): lower 95% band of the latent must clear the target
+  l1_penalty: 50.0             # Sobol-screen L1 hinge weight against feasibility shortfall
   # GP kernels, acquisition restarts/Sobol candidates and SQP settings come from the `nlp` block of scripts/config.yml.

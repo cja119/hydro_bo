@@ -39,7 +39,7 @@ def main():
         print(f"{n * len(probs)} array tasks: {len(probs)} problems x {n} Sobol rows (PBS -J 0-{n * len(probs) - 1})")
         for i, p in enumerate(probs):
             print(f"  [{i * n}-{(i + 1) * n - 1}] {p.key}: {p.trains} trains x {p.train_size:.3f} t/h, nu {p.archetype.premium},"
-                  f" eps {p.archetype.half_spread}, depth {p.archetype.depth_days} d")
+                  f" eps {p.archetype.half_spread}, q_ref {p.archetype.q_ref_days} d")
             for k, (lo, hi) in zip(SEARCH_KEYS, p.bounds()):
                 print(f"      {k:<28} [{lo:12.3f}, {hi:12.3f}]")
         return

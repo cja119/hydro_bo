@@ -57,7 +57,7 @@ class Archetype:
     target_mw: float          # export conversion throughput [MW, H2 LHV]
     premium: float            # green premium nu [USD/kg]
     half_spread: float        # spot half-spread eps [-]
-    depth_days: float         # market depth q_ref in days of the hub's own reference output [-]
+    q_ref_days: float         # spot reference volume q_ref, in days of the hub's own reference output [-] (NOT market size)
     penalty: float = 9.0      # cap on the premium in the spot price [USD/kg]
 
 
@@ -114,9 +114,9 @@ class Problem:
 
 def default_archetypes() -> dict[str, Archetype]:
     return {
-        "low": Archetype("low", target_mw=500.0, premium=7.0, half_spread=0.2, depth_days=0.25),
-        "medium": Archetype("medium", target_mw=1000.0, premium=5.0, half_spread=0.05, depth_days=1.0),
-        "high": Archetype("high", target_mw=2000.0, premium=3.0, half_spread=0.002, depth_days=4.0),
+        "low": Archetype("low", target_mw=500.0, premium=7.0, half_spread=0.2, q_ref_days=0.25),
+        "medium": Archetype("medium", target_mw=1000.0, premium=5.0, half_spread=0.05, q_ref_days=1.0),
+        "high": Archetype("high", target_mw=2000.0, premium=3.0, half_spread=0.002, q_ref_days=4.0),
     }
 
 

@@ -1,5 +1,8 @@
 """Single-node Bayesian optimisation of one archetype problem (design capacities + contract factor), maximising mean
-NPV (MeanVarBayesopt with lambda = 0; the log-variance GP models the seed noise).
+NPV subject to a seed-feasibility chance constraint (ConstrainedBayesopt, lambda = 0 so the objective is the mean NPV;
+the log-variance GP models the seed noise). A Polya-Gamma BinomialGP on valid-seeds/n_seeds adds the constraint: the
+acquisition maximises expected improvement subject to a latent chance bound (the lower z_sc band of the feasibility GP,
+mu - z_sc*sigma, must clear logit(p_targ)), enforced inside the SQP — NOT a multiplicative EI x P(feasible) penalty.
 
 The BO is seeded with every Sobol result of the problem and every earlier BO iteration found on disk, then proposes one
 point at a time and evaluates it on all seeds in parallel. Each iteration is written as soon as it finishes
@@ -39,6 +42,18 @@ def best_observed(results: list[dict]) -> dict | None:
     return max(ok, key=lambda r: r["mean_npv_bn"]) if ok else None
 
 
+def _full_samples(r: dict) -> np.ndarray:
+    """Full per-seed NPV array [bn] with NaN for failed seeds, rebuilt from per_seed so it works for
+    both the new full `samples_bn` and older collapsed result files. The feasibility GP reads
+    (finite count, total) from this; the NPV GP uses only the finite subset."""
+    ps = r.get("per_seed")
+    if ps:
+        return np.asarray(
+            [float(s["npv"]) / 1000.0 if s.get("npv") is not None and np.isfinite(float(s["npv"])) else np.nan
+             for s in ps], dtype=float)
+    return np.asarray(r["samples_bn"], dtype=float)
+
+
 def main():
     a = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     a.add_argument("--problem", required=True, help="e.g. low-NH3, medium-LH2")
@@ -46,6 +61,9 @@ def main():
     a.add_argument("--ncpus", type=int, default=None)
     a.add_argument("--walltime-h", type=float, default=None, help="job walltime (default: WALLTIME_S env or none)")
     a.add_argument("--iters", type=int, default=None, help="override bo.iter_budget (total BO iterations)")
+    a.add_argument("--out-dir", default=None,
+                   help="override bo.out_dir (BO iteration output); Sobol seeds still load from sobol.out_dir. "
+                        "Use a fresh dir for a re-run under changed dynamics so it does not resume the old iterations")
     args = a.parse_args()
     t_start = time.time()
     cfg = load_config(args.config)
@@ -53,29 +71,39 @@ def main():
     ncpus = args.ncpus or ncpus_default()
     budget = args.iters if args.iters is not None else int(cfg["bo"]["iter_budget"])
     walltime, buffer = _walltime_s(args), float(cfg["bo"]["walltime_buffer_s"])
-    sobol_dir, bo_dir = ROOT / cfg["sobol"]["out_dir"], ROOT / cfg["bo"]["out_dir"]
+    sobol_dir = ROOT / cfg["sobol"]["out_dir"]
+    bo_dir = ROOT / (args.out_dir if args.out_dir is not None else cfg["bo"]["out_dir"])
 
     from hydro_bo.utils.jax_threads import configure_jax_threads
     from hydro_bo.utils.run_config import load_config as load_run_config
     run_cfg = load_run_config(ROOT / "scripts" / "config.yml", vector_override=problem.vector, num_devices_override=ncpus)
     configure_jax_threads(run_cfg.nlp.n_devices, run_cfg.nlp.blas_threads)
-    from hydro_bo.opt import MeanVarBayesopt  # noqa: E402  (jax import after the thread configuration)
+    from hydro_bo.opt import ConstrainedBayesopt  # noqa: E402  (jax import after the thread configuration)
 
     def _no_direct_eval(x):
         raise RuntimeError("archetype_bo drives evaluation itself")
 
     bounds = problem.bounds()
     nlp = run_cfg.nlp
-    bo = MeanVarBayesopt(
+    bcfg = cfg["bo"]
+    bo = ConstrainedBayesopt(
         f=_no_direct_eval, bounds=bounds, n_initial_points=0, iter_limit=0, lam=0.0,
         n_restarts=nlp.acq_n_restarts, pow_sobol=nlp.acq_pow_sobol, seed=int(cfg["sobol"]["seed"]), cat_vars=(),
         sqp_config=nlp.to_sqp_config(), pad_initial=nlp.pad_initial, gp_lbfgs_max_iter=nlp.gp_lbfgs_max_iter,
         gp_mu_kernel=nlp.gp_mu_kernel, gp_log_var_kernel=nlp.gp_log_var_kernel,
+        # Feasibility: BinomialGP on (valid seeds, total seeds) per point. The acquisition maximises
+        # EI on the NPV GP subject to a latent chance constraint (lower z_sc band of the feasibility
+        # GP, mu - z_sc*sigma, must clear logit(p_targ)), enforced inside the SQP — NOT an
+        # EI x P(feasible) product. The NPV GP is fit on each point's valid-seed samples only
+        # (NaN seeds excluded) — no -30 bn sentinel.
+        p_targ=float(bcfg.get("p_targ", 0.9)), z_sc=float(bcfg.get("z_sc", 1.6449)),
+        l1_penalty=float(bcfg.get("l1_penalty", 50.0)),
+        gp_bin_kernel=nlp.gp_bin_kernel, gp_bin_label_smoothing=nlp.gp_bin_label_smoothing,
     )
     sobol = load_results([sobol_dir], problem.key)
     done = load_results([bo_dir], problem.key)
     for r in sobol + done:
-        bo.observe(np.asarray(r["x"], dtype=float), np.asarray(r["samples_bn"], dtype=float))
+        bo.observe(np.asarray(r["x"], dtype=float), _full_samples(r))
     print(f"{problem.key}: {len(sobol)} Sobol + {len(done)} earlier BO points loaded; budget {budget}; ncpus {ncpus}",
           flush=True)
     if len(sobol) + len(done) < 2:
@@ -95,7 +123,7 @@ def main():
         result = evaluate_point(cfg, problem, x, ncpus, npz_dir=bo_dir / problem.key / f"iter_{k + 1:04d}")
         result.update({"source": "bo", "iteration": k + 1, "acquisition_s": acq_s, "pbs_jobid": os.environ.get("PBS_JOBID")})
         write_json(bo_dir / problem.key / f"iter_{k + 1:04d}.json", result)
-        bo.observe(x, np.asarray(result["samples_bn"], dtype=float))
+        bo.observe(x, _full_samples(result))
         eval_times.append(result["eval_wall_s"])
         k += 1
         best = best_observed(sobol + load_results([bo_dir], problem.key))
